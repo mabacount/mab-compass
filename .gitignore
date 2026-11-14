@@ -1,0 +1,39 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Production build outputs
+dist/
+dist-ssr/
+build/
+
+# Rust / Tauri build artifacts
+src-tauri/target/
+src-tauri/gen/
+*.exe
+*.dll
+*.pdb
+*.lib
+*.rlib
+*.exp
+
+# Agent state and scratch dirs
+.agents/
+.gemini/
+
+# Editor / OS files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+*.local
+*.log
+
+# Env
+.env
+.env.local
+.env.*.local

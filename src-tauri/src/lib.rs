@@ -1,0 +1,1777 @@
+pub mod db;
+pub mod file_extractor;
+pub mod llm;
+pub mod mab_focus_sync;
+pub mod mcp_tools;
+pub mod models;
+pub mod projector;
+pub mod vault_manager;
+
+fn format_turn_badge(mcp_ops: &[String], envelope_badge: &str, transport_label: &str) -> String {
+    if !mcp_ops.is_empty() {
+        let mcp_part = format!("🛠 MCP: {}", mcp_ops.join(" • "));
+        if envelope_badge.trim().is_empty() || envelope_badge == "بدون تغییر گراف" {
+            mcp_part
+        } else {
+            format!("{} • {}", mcp_part, envelope_badge)
+        }
+    } else if transport_label == "PROSE_FALLBACK" && envelope_badge == "بدون تغییر گراف" {
+        "💬 پاسخ مستقیم مدل".to_string()
+    } else {
+        envelope_badge.to_string()
+    }
+}
+
+use db::{queries::*, schema::init_database};
+use file_extractor::extract_text_from_base64;
+use llm::{prompts::*, router::*};
+use mab_focus_sync::synchronize_with_mab_focus;
+use models::*;
+use projector::{excel_writer::export_client_xlsx, markdown_writer::sync_all_project_projections};
+use rusqlite::Connection;
+use std::fs;
+use std::path::PathBuf;
+use std::sync::Mutex;
+use tauri::{Manager, State};
+use vault_manager::{archive_onboarding_document, archive_raw_user_input};
+
+pub struct AppState {
+    pub db: Mutex<Connection>,
+    pub app_data_dir: PathBuf,
+}
+
+fn derive_title_from_content(raw_title: &str, content: &str, fallback: &str) -> String {
+    let t = raw_title.trim();
+    if !t.is_empty() {
+        return t.to_string();
+    }
+    let first_line = content
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    if first_line.is_empty() {
+        return fallback.to_string();
+    }
+    let clipped: String = first_line.chars().take(48).collect();
+    if first_line.chars().count() > 48 {
+        format!("{}…", clipped.trim())
+    } else {
+        clipped
+    }
+}
+
+fn format_vault_user_summary(
+    effective_title: &str,
+    original_filename: Option<&str>,
+    detected_format: Option<&str>,
+    extracted_text: &str,
+) -> String {
+    let char_count = extracted_text.chars().count();
+    if let (Some(fname), Some(fmt)) = (original_filename, detected_format) {
+        format!(
+            "📄 فایل «{}» ارسال و استخراج شد ({} • {} کاراکتر).",
+            fname, fmt, char_count
+        )
+    } else if char_count <= 500 {
+        format!("📝 متن ارسالی «{}»:\n{}", effective_title, extracted_text.trim())
+    } else {
+        let preview: String = extracted_text.trim().chars().take(420).collect();
+        format!(
+            "📝 متن ارسالی «{}» ({} کاراکتر):\n{}…",
+            effective_title, char_count, preview
+        )
+    }
+}
+
+#[tauri::command]
+fn cmd_get_db_data_version(state: State<'_, AppState>) -> Result<i64, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    conn.query_row("PRAGMA data_version", [], |r| r.get::<_, i64>(0))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn cmd_get_dashboard(state: State<'_, AppState>) -> Result<DashboardState, String> {
+    let mut conn = state.db.lock().map_err(|e| e.to_string())?;
+    if let Ok(s) = get_settings(&conn) {
+        if s.auto_sync_mab_focus {
+            let _ = synchronize_with_mab_focus(&mut conn);
+        }
+    }
+    let dash = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
+    let _ = sync_all_project_projections(&dash, None, None);
+    Ok(dash)
+}
+
+#[tauri::command]
+fn cmd_switch_project(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<DashboardState, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    conn.execute(
+        "UPDATE projects SET is_active = CASE WHEN id = ?1 THEN 1 ELSE 0 END",
+        [&project_id],
+    )
+    .map_err(|e| e.to_string())?;
+    let dash = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
+    let _ = sync_all_project_projections(&dash, None, None);
+    Ok(dash)
+}
+
+#[tauri::command]
+fn cmd_create_project(
+    state: State<'_, AppState>,
+    id_code: String,
+    name: String,
+) -> Result<DashboardState, String> {
+    let mut conn = state.db.lock().map_err(|e| e.to_string())?;
+    create_new_project(&conn, &id_code, &name).map_err(|e| e.to_string())?;
+    let _ = synchronize_with_mab_focus(&mut conn);
+    let dash = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
+    let _ = sync_all_project_projections(&dash, None, None);
+    Ok(dash)
+}
+
+#[tauri::command]
+fn cmd_create_chat_session(
+    state: State<'_, AppState>,
+    project_id: Option<String>,
+    channel: String,
+    title: Option<String>,
+) -> Result<DashboardState, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    create_chat_session(&conn, project_id.as_deref(), &channel, title.as_deref())
+        .map_err(|e| e.to_string())?;
+    get_dashboard_state(&conn).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn cmd_switch_chat_session(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<DashboardState, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    switch_chat_session(&conn, &session_id).map_err(|e| e.to_string())?;
+    let dash = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
+    let _ = sync_all_project_projections(&dash, None, None);
+    Ok(dash)
+}
+
+#[tauri::command]
+fn cmd_delete_chat_session(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<DashboardState, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    delete_chat_session(&conn, &session_id).map_err(|e| e.to_string())?;
+    get_dashboard_state(&conn).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn cmd_commit_user_chat_message(
+    state: State<'_, AppState>,
+    channel: String,
+    session_id: Option<String>,
+    message_text: String,
+) -> Result<CommittedChatTurn, String> {
+    if message_text.trim().is_empty() {
+        return Err("پیام خالی است.".into());
+    }
+    let norm_ch = normalize_chat_channel(&channel);
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let d = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
+    let pid = d.active_project.id.clone();
+    let workspace_path = d.active_project.workspace_path.clone();
+
+    let (arch_tag, source_type) = if norm_ch == "VAULT" {
+        ("vault_dialogue", "VAULT_CHAT")
+    } else {
+        ("user_chat", "USER_CHAT")
+    };
+    let archived_path = archive_raw_user_input(&workspace_path, arch_tag, &message_text)?;
+    let (resolved_sid, raw_event_id, user_message_id) = commit_user_chat_turn(
+        &conn,
+        &pid,
+        session_id.as_deref(),
+        norm_ch,
+        &message_text,
+        Some(&archived_path),
+        source_type,
+    )
+    .map_err(|e| e.to_string())?;
+
+    let updated = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
+    Ok(CommittedChatTurn {
+        dashboard: updated,
+        session_id: resolved_sid,
+        raw_event_id,
+        user_message_id,
+        archived_path,
+    })
+}
+
+#[tauri::command]
+async fn cmd_run_assistant_turn(
+    state: State<'_, AppState>,
+    channel: String,
+    session_id: String,
+    message_text: String,
+    archived_path: String,
+    raw_event_id: Option<i64>,
+    user_message_id: i64,
+) -> Result<AssistantTurnOutcome, String> {
+    let norm_ch = normalize_chat_channel(&channel).to_string();
+    let (
+        pid,
+        settings,
+        open_tasks,
+        active_decisions,
+        active_sops,
+        knowledge_docs,
+        copilot_history,
+        vault_history,
+        fts_hits,
+    ) = {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        let d = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
+        let hits = search_raw_events_fts(&conn, &d.active_project.id, &message_text)
+            .unwrap_or_default();
+        let filtered_copilot: Vec<ChatMessage> = d
+            .chat_history
+            .iter()
+            .filter(|m| m.id != user_message_id)
+            .cloned()
+            .collect();
+        let filtered_vault: Vec<ChatMessage> = d
+            .vault_chat_history
+            .iter()
+            .filter(|m| m.id != user_message_id)
+            .cloned()
+            .collect();
+        (
+            d.active_project.id.clone(),
+            d.settings.clone(),
+            d.open_tasks.clone(),
+            d.active_decisions.clone(),
+            d.active_sops.clone(),
+            d.knowledge_docs.clone(),
+            filtered_copilot,
+            filtered_vault,
+            hits,
+        )
+    };
+
+    let prompt = if norm_ch == "VAULT" {
+        build_vault_chat_prompt(
+            &pid,
+            &message_text,
+            &vault_history,
+            &open_tasks,
+            &active_decisions,
+            &active_sops,
+            &knowledge_docs,
+            &fts_hits,
+        )
+    } else {
+        build_copilot_chat_prompt(
+            &pid,
+            &message_text,
+            &copilot_history,
+            &vault_history,
+            &open_tasks,
+            &active_decisions,
+            &active_sops,
+            &knowledge_docs,
+            &fts_hits,
+        )
+    };
+
+    let (mcp_sys_prompt, mcp_user_prompt) = build_mcp_tool_turn_prompts(
+        &pid,
+        &norm_ch,
+        &message_text,
+        if norm_ch == "VAULT" { &vault_history } else { &copilot_history },
+        &open_tasks,
+        &active_decisions,
+        &active_sops,
+        &knowledge_docs,
+        &fts_hits,
+        None,
+    );
+
+    let llm_cfg = LlmConfig::from(&settings);
+    let source_origin = if norm_ch == "VAULT" {
+        "VAULT_CHAT"
+    } else {
+        "USER_CHAT"
+    };
+    match run_copilot_turn(
+        &state.db,
+        state.app_data_dir.clone(),
+        &llm_cfg,
+        &pid,
+        raw_event_id,
+        source_origin,
+        &mcp_sys_prompt,
+        &mcp_user_prompt,
+        &prompt,
+    )
+    .await
+    {
+        Ok(turn) => {
+            let envelope = turn.envelope;
+            let mut conn = state.db.lock().map_err(|e| e.to_string())?;
+            let env_badge = if !envelope.mutations.is_empty() || turn.mcp_ops_executed.is_empty() {
+                apply_copilot_envelope_with_event(
+                    &mut conn,
+                    &pid,
+                    &message_text,
+                    Some(&archived_path),
+                    source_origin,
+                    &envelope,
+                    raw_event_id,
+                )
+                .map_err(|e| e.to_string())?
+            } else {
+                "بدون تغییر گراف".to_string()
+            };
+            let badge = format_turn_badge(&turn.mcp_ops_executed, &env_badge, &turn.transport_label);
+
+            append_assistant_chat_message(
+                &conn,
+                &pid,
+                &session_id,
+                &norm_ch,
+                "ASSISTANT",
+                &envelope.conversational_reply,
+                Some(&archived_path),
+                &badge,
+                &envelope.clarifying_questions,
+            )
+            .map_err(|e| e.to_string())?;
+
+            let _ = complete_pending_items_for_user_msg(&conn, user_message_id, None);
+
+            let updated_dash = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
+            sync_all_project_projections(
+                &updated_dash,
+                envelope.meeting_title.as_deref(),
+                envelope.meeting_summary_markdown.as_deref(),
+            )?;
+
+            Ok(AssistantTurnOutcome {
+                dashboard: updated_dash,
+                assistant_error: None,
+            })
+        }
+        Err(err) => {
+            let notice = format!(
+                "⚠️ پیام شما با موفقیت در حافظه و آرشیو پروژه ذخیره شد، اما پاسخ هوش مصنوعی دریافت نشد:\n{}",
+                err
+            );
+            let conn = state.db.lock().map_err(|e| e.to_string())?;
+            let sys_id = append_assistant_chat_message(
+                &conn,
+                &pid,
+                &session_id,
+                &norm_ch,
+                "SYSTEM",
+                &notice,
+                Some(&archived_path),
+                "ثبت در حافظه • خطای موتور هوش مصنوعی",
+                &[],
+            )
+            .ok();
+            let preview: String = message_text
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .unwrap_or(&message_text)
+                .chars()
+                .take(72)
+                .collect();
+            let _ = enqueue_pending_ai_item(
+                &conn,
+                &pid,
+                &session_id,
+                &norm_ch,
+                Some(user_message_id),
+                sys_id,
+                None,
+                raw_event_id,
+                &preview,
+                source_origin,
+                Some(&archived_path),
+                Some(&err),
+            );
+            let updated_dash = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
+            Ok(AssistantTurnOutcome {
+                dashboard: updated_dash,
+                assistant_error: Some(err),
+            })
+        }
+    }
+}
+
+fn strip_raw_input_frontmatter(raw: &str) -> String {
+    let normalized = raw.replace("\r\n", "\n");
+    if let Some(after_start) = normalized.strip_prefix("---\n") {
+        if let Some(end_idx) = after_start.find("\n---\n") {
+            return after_start[end_idx + "\n---\n".len()..].trim().to_string();
+        }
+    }
+    normalized.trim().to_string()
+}
+
+fn strip_knowledge_archive_header(raw: &str) -> String {
+    let normalized = raw.replace("\r\n", "\n");
+    let marker = "## متن کامل سند اصلی\n";
+    if let Some(idx) = normalized.find(marker) {
+        return normalized[idx + marker.len()..].trim().to_string();
+    }
+    normalized.trim().to_string()
+}
+
+#[tauri::command]
+async fn cmd_retry_system_message(
+    state: State<'_, AppState>,
+    system_message_id: i64,
+) -> Result<AssistantTurnOutcome, String> {
+    let (
+        ctx,
+        settings,
+        open_tasks,
+        active_decisions,
+        active_sops,
+        knowledge_docs,
+        copilot_history,
+        vault_history,
+        fts_hits,
+        recovered_text,
+    ) = {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        let ctx = get_retry_context_for_system_message(&conn, system_message_id)
+            .map_err(|e| format!("پیام کاربر متناظر برای ارسال مجدد یافت نشد: {}", e))?;
+
+        if !ctx.session_id.is_empty() {
+            let _ = switch_chat_session(&conn, &ctx.session_id);
+        }
+        let d = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
+
+        let recovered_text = ctx
+            .user_archived_path
+            .as_deref()
+            .and_then(|p| fs::read_to_string(p).ok())
+            .map(|content| strip_raw_input_frontmatter(&content))
+            .filter(|s| !s.is_empty())
+            .or_else(|| ctx.raw_content.clone().filter(|s| !s.trim().is_empty()))
+            .unwrap_or_else(|| ctx.user_message_text.clone());
+
+        let hits = search_raw_events_fts(&conn, &ctx.project_id, &recovered_text)
+            .unwrap_or_default();
+
+        let filtered_copilot: Vec<ChatMessage> = d
+            .chat_history
+            .iter()
+            .filter(|m| m.id != ctx.user_message_id && m.id != system_message_id)
+            .cloned()
+            .collect();
+        let filtered_vault: Vec<ChatMessage> = d
+            .vault_chat_history
+            .iter()
+            .filter(|m| m.id != ctx.user_message_id && m.id != system_message_id)
+            .cloned()
+            .collect();
+
+        (
+            ctx,
+            d.settings.clone(),
+            d.open_tasks.clone(),
+            d.active_decisions.clone(),
+            d.active_sops.clone(),
+            d.knowledge_docs.clone(),
+            filtered_copilot,
+            filtered_vault,
+            hits,
+            recovered_text,
+        )
+    };
+
+    let is_vault_doc = ctx.channel == "VAULT"
+        && ctx.raw_source_type.as_deref() == Some("DOC_ONBOARDING");
+
+    let prompt = if is_vault_doc {
+        let derived_title = derive_title_from_content("", &recovered_text, "سند بازیابی‌شده");
+        build_document_onboarding_prompt(
+            &ctx.project_id,
+            &derived_title,
+            "ONBOARDING_FILE",
+            "recovered_doc.md",
+            &recovered_text,
+            &vault_history,
+            &open_tasks,
+            &active_decisions,
+        )
+    } else if ctx.channel == "VAULT" {
+        build_vault_chat_prompt(
+            &ctx.project_id,
+            &recovered_text,
+            &vault_history,
+            &open_tasks,
+            &active_decisions,
+            &active_sops,
+            &knowledge_docs,
+            &fts_hits,
+        )
+    } else {
+        build_copilot_chat_prompt(
+            &ctx.project_id,
+            &recovered_text,
+            &copilot_history,
+            &vault_history,
+            &open_tasks,
+            &active_decisions,
+            &active_sops,
+            &knowledge_docs,
+            &fts_hits,
+        )
+    };
+
+    let doc_meta_owned = if is_vault_doc {
+        Some((
+            derive_title_from_content("", &recovered_text, "سند بازیابی‌شده"),
+            "ONBOARDING_FILE".to_string(),
+            "recovered_doc.md".to_string(),
+        ))
+    } else {
+        None
+    };
+    let doc_meta_ref = doc_meta_owned
+        .as_ref()
+        .map(|(t, dt, f)| (t.as_str(), dt.as_str(), f.as_str()));
+
+    let (mcp_sys_prompt, mcp_user_prompt) = build_mcp_tool_turn_prompts(
+        &ctx.project_id,
+        &ctx.channel,
+        &recovered_text,
+        if ctx.channel == "VAULT" { &vault_history } else { &copilot_history },
+        &open_tasks,
+        &active_decisions,
+        &active_sops,
+        &knowledge_docs,
+        &fts_hits,
+        doc_meta_ref,
+    );
+
+    let llm_cfg = LlmConfig::from(&settings);
+    let source_origin = ctx.raw_source_type.as_deref().unwrap_or(
+        if ctx.channel == "VAULT" {
+            "VAULT_CHAT"
+        } else {
+            "USER_CHAT"
+        },
+    );
+    match run_copilot_turn(
+        &state.db,
+        state.app_data_dir.clone(),
+        &llm_cfg,
+        &ctx.project_id,
+        ctx.raw_event_id,
+        source_origin,
+        &mcp_sys_prompt,
+        &mcp_user_prompt,
+        &prompt,
+    )
+    .await
+    {
+        Ok(turn) => {
+            let envelope = turn.envelope;
+            let mut conn = state.db.lock().map_err(|e| e.to_string())?;
+            let env_badge = if !envelope.mutations.is_empty() || turn.mcp_ops_executed.is_empty() {
+                apply_copilot_envelope_with_event(
+                    &mut conn,
+                    &ctx.project_id,
+                    &recovered_text,
+                    ctx.user_archived_path.as_deref(),
+                    source_origin,
+                    &envelope,
+                    ctx.raw_event_id,
+                )
+                .map_err(|e| e.to_string())?
+            } else {
+                "بدون تغییر گراف".to_string()
+            };
+            let badge = format_turn_badge(&turn.mcp_ops_executed, &env_badge, &turn.transport_label);
+
+            let items_count = (envelope.mutations.len() + turn.mcp_ops_executed.len()) as i32;
+            let matched_doc_id = find_unanalyzed_knowledge_doc_id(
+                &conn,
+                &ctx.project_id,
+                ctx.system_archived_path.as_deref(),
+                &ctx.user_message_text,
+            );
+            if let Some(doc_id) = matched_doc_id {
+                let new_summary = envelope
+                    .executive_doc_summary
+                    .clone()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| envelope.conversational_reply.clone());
+                let new_kp = get_knowledge_document_by_id(&conn, doc_id).and_then(|doc| {
+                    let dash_proj = get_dashboard_state_for_project(&conn, Some(&ctx.project_id)).ok()?;
+                    archive_onboarding_document(
+                        &dash_proj.active_project.workspace_path,
+                        &doc.title,
+                        &recovered_text,
+                        &new_summary,
+                    )
+                    .ok()
+                });
+                let _ = update_knowledge_doc_analysis(
+                    &conn,
+                    doc_id,
+                    &new_summary,
+                    items_count,
+                    new_kp.as_deref(),
+                );
+            }
+
+            let _ = delete_system_chat_message(&conn, system_message_id);
+
+            append_assistant_chat_message(
+                &conn,
+                &ctx.project_id,
+                &ctx.session_id,
+                &ctx.channel,
+                "ASSISTANT",
+                &envelope.conversational_reply,
+                ctx.user_archived_path.as_deref(),
+                &badge,
+                &envelope.clarifying_questions,
+            )
+            .map_err(|e| e.to_string())?;
+
+            let _ = complete_pending_items_for_user_msg(&conn, ctx.user_message_id, matched_doc_id);
+
+            let updated_dash = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
+            sync_all_project_projections(
+                &updated_dash,
+                envelope.meeting_title.as_deref(),
+                envelope.meeting_summary_markdown.as_deref(),
+            )?;
+
+            Ok(AssistantTurnOutcome {
+                dashboard: updated_dash,
+                assistant_error: None,
+            })
+        }
+        Err(err) => {
+            let notice = format!(
+                "⚠️ پیام شما در حافظه و آرشیو پروژه ذخیره است، اما در ارسال مجدد به هوش مصنوعی خطا رخ داد:\n{}",
+                err
+            );
+            let conn = state.db.lock().map_err(|e| e.to_string())?;
+            let _ = update_system_chat_message(&conn, system_message_id, &notice);
+            let matched_doc_id = find_unanalyzed_knowledge_doc_id(
+                &conn,
+                &ctx.project_id,
+                ctx.system_archived_path.as_deref(),
+                &ctx.user_message_text,
+            );
+            let preview: String = ctx
+                .user_message_text
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .unwrap_or(&ctx.user_message_text)
+                .chars()
+                .take(72)
+                .collect();
+            let _ = enqueue_pending_ai_item(
+                &conn,
+                &ctx.project_id,
+                &ctx.session_id,
+                &ctx.channel,
+                Some(ctx.user_message_id),
+                Some(system_message_id),
+                matched_doc_id,
+                ctx.raw_event_id,
+                &preview,
+                source_origin,
+                ctx.user_archived_path.as_deref(),
+                Some(&err),
+            );
+            let updated_dash = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
+            Ok(AssistantTurnOutcome {
+                dashboard: updated_dash,
+                assistant_error: Some(err),
+            })
+        }
+    }
+}
+
+#[tauri::command]
+fn cmd_commit_user_file_message(
+    state: State<'_, AppState>,
+    channel: String,
+    session_id: Option<String>,
+    original_filename: String,
+    content_base64: String,
+    user_note: String,
+    title: Option<String>,
+    doc_type: Option<String>,
+) -> Result<CommittedFileTurn, String> {
+    let extracted = extract_text_from_base64(&original_filename, &content_base64)?;
+    let norm_ch = normalize_chat_channel(&channel).to_string();
+    let effective_title = derive_title_from_content(
+        title.as_deref().unwrap_or(""),
+        &original_filename,
+        &original_filename,
+    );
+    let effective_doc_type = match doc_type.as_deref().map(str::trim) {
+        Some(dt) if !dt.is_empty() && dt != "ONBOARDING_FILE" => dt.to_string(),
+        _ => extracted.detected_format.clone(),
+    };
+
+    let display_user_msg = if norm_ch == "VAULT" {
+        format_vault_user_summary(
+            &effective_title,
+            Some(&original_filename),
+            Some(&extracted.detected_format),
+            &extracted.text,
+        )
+    } else if user_note.trim().is_empty() {
+        format!(
+            "📎 فایل ضمیمه: «{}» ({} • {} کاراکتر)",
+            original_filename,
+            extracted.detected_format,
+            extracted.text.chars().count()
+        )
+    } else {
+        format!(
+            "{}\n📎 ضمیمه: «{}» ({} • {} کاراکتر)",
+            user_note.trim(),
+            original_filename,
+            extracted.detected_format,
+            extracted.text.chars().count()
+        )
+    };
+
+    let combined_prompt_text = if user_note.trim().is_empty() {
+        format!(
+            "فایل ضمیمه‌شده: {} (فرمت: {})\n\n{}",
+            original_filename, extracted.detected_format, extracted.text
+        )
+    } else {
+        format!(
+            "یادداشت کاربر: {}\n\nفایل ضمیمه‌شده: {} (فرمت: {})\n\n{}",
+            user_note.trim(),
+            original_filename,
+            extracted.detected_format,
+            extracted.text
+        )
+    };
+
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let d = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
+    let pid = d.active_project.id.clone();
+    let workspace_path = d.active_project.workspace_path.clone();
+
+    let archived_path = archive_raw_user_input(
+        &workspace_path,
+        if norm_ch == "VAULT" { "vault_file" } else { "copilot_file" },
+        &combined_prompt_text,
+    )?;
+
+    let (resolved_sid, raw_event_id, user_message_id) = commit_user_chat_turn(
+        &conn,
+        &pid,
+        session_id.as_deref(),
+        &norm_ch,
+        &display_user_msg,
+        Some(&archived_path),
+        if norm_ch == "VAULT" { "DOC_ONBOARDING" } else { "COPILOT_FILE" },
+    )
+    .map_err(|e| e.to_string())?;
+
+    let updated = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
+    Ok(CommittedFileTurn {
+        dashboard: updated,
+        session_id: resolved_sid,
+        raw_event_id,
+        user_message_id,
+        archived_path,
+        extracted_text: extracted.text,
+        combined_prompt_text,
+        detected_format: extracted.detected_format,
+        effective_title,
+        effective_filename: original_filename,
+        doc_type: effective_doc_type,
+    })
+}
+
+#[tauri::command]
+fn cmd_commit_vault_text_message(
+    state: State<'_, AppState>,
+    session_id: Option<String>,
+    title: String,
+    doc_type: String,
+    original_filename: String,
+    content: String,
+) -> Result<CommittedFileTurn, String> {
+    if content.trim().is_empty() {
+        return Err("محتوای ارسالی خالی است.".into());
+    }
+    let effective_title = derive_title_from_content(&title, &content, &original_filename);
+    let effective_filename = if original_filename.trim().is_empty() {
+        format!("{}.md", vault_manager::sanitize_filename(&effective_title))
+    } else {
+        original_filename
+    };
+    let display_user_msg = format_vault_user_summary(&effective_title, None, None, &content);
+
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let d = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
+    let pid = d.active_project.id.clone();
+    let workspace_path = d.active_project.workspace_path.clone();
+
+    let archived_path = archive_raw_user_input(&workspace_path, "vault_text", &content)?;
+    let (resolved_sid, raw_event_id, user_message_id) = commit_user_chat_turn(
+        &conn,
+        &pid,
+        session_id.as_deref(),
+        "VAULT",
+        &display_user_msg,
+        Some(&archived_path),
+        "DOC_ONBOARDING",
+    )
+    .map_err(|e| e.to_string())?;
+
+    let updated = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
+    Ok(CommittedFileTurn {
+        dashboard: updated,
+        session_id: resolved_sid,
+        raw_event_id,
+        user_message_id,
+        archived_path,
+        extracted_text: content.clone(),
+        combined_prompt_text: content,
+        detected_format: doc_type.clone(),
+        effective_title,
+        effective_filename,
+        doc_type,
+    })
+}
+
+#[tauri::command]
+async fn cmd_run_file_assistant_turn(
+    state: State<'_, AppState>,
+    channel: String,
+    session_id: String,
+    raw_event_id: i64,
+    user_message_id: i64,
+    effective_title: String,
+    effective_filename: String,
+    doc_type: String,
+    extracted_text: String,
+    combined_prompt_text: String,
+) -> Result<AssistantTurnOutcome, String> {
+    let norm_ch = normalize_chat_channel(&channel).to_string();
+    let (
+        pid,
+        workspace_path,
+        settings,
+        open_tasks,
+        active_decisions,
+        active_sops,
+        knowledge_docs,
+        copilot_history,
+        vault_history,
+    ) = {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        let d = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
+        let filtered_copilot: Vec<ChatMessage> = d
+            .chat_history
+            .iter()
+            .filter(|m| m.id != user_message_id)
+            .cloned()
+            .collect();
+        let filtered_vault: Vec<ChatMessage> = d
+            .vault_chat_history
+            .iter()
+            .filter(|m| m.id != user_message_id)
+            .cloned()
+            .collect();
+        (
+            d.active_project.id.clone(),
+            d.active_project.workspace_path.clone(),
+            d.settings.clone(),
+            d.open_tasks.clone(),
+            d.active_decisions.clone(),
+            d.active_sops.clone(),
+            d.knowledge_docs.clone(),
+            filtered_copilot,
+            filtered_vault,
+        )
+    };
+
+    let prompt = if norm_ch == "VAULT" {
+        build_document_onboarding_prompt(
+            &pid,
+            &effective_title,
+            &doc_type,
+            &effective_filename,
+            &extracted_text,
+            &vault_history,
+            &open_tasks,
+            &active_decisions,
+        )
+    } else {
+        build_copilot_chat_prompt(
+            &pid,
+            &combined_prompt_text,
+            &copilot_history,
+            &vault_history,
+            &open_tasks,
+            &active_decisions,
+            &active_sops,
+            &knowledge_docs,
+            &[],
+        )
+    };
+
+    let (mcp_sys_prompt, mcp_user_prompt) = build_mcp_tool_turn_prompts(
+        &pid,
+        &norm_ch,
+        if norm_ch == "VAULT" { &extracted_text } else { &combined_prompt_text },
+        if norm_ch == "VAULT" { &vault_history } else { &copilot_history },
+        &open_tasks,
+        &active_decisions,
+        &active_sops,
+        &knowledge_docs,
+        &[],
+        Some((&effective_title, &doc_type, &effective_filename)),
+    );
+
+    let llm_cfg = LlmConfig::from(&settings);
+    let source_origin = if norm_ch == "VAULT" { "DOC_ONBOARDING" } else { "COPILOT_FILE" };
+    match run_copilot_turn(
+        &state.db,
+        state.app_data_dir.clone(),
+        &llm_cfg,
+        &pid,
+        Some(raw_event_id),
+        source_origin,
+        &mcp_sys_prompt,
+        &mcp_user_prompt,
+        &prompt,
+    )
+    .await
+    {
+        Ok(turn) => {
+            let envelope = turn.envelope;
+            let summary = envelope
+                .executive_doc_summary
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| envelope.conversational_reply.clone());
+
+            let knowledge_path = archive_onboarding_document(
+                &workspace_path,
+                &effective_title,
+                &extracted_text,
+                &summary,
+            )?;
+
+            let mut conn = state.db.lock().map_err(|e| e.to_string())?;
+            let items_count = (envelope.mutations.len() + turn.mcp_ops_executed.len()) as i32;
+            let env_badge = if !envelope.mutations.is_empty() || turn.mcp_ops_executed.is_empty() {
+                apply_copilot_envelope_with_event(
+                    &mut conn,
+                    &pid,
+                    &combined_prompt_text,
+                    Some(&knowledge_path),
+                    source_origin,
+                    &envelope,
+                    Some(raw_event_id),
+                )
+                .map_err(|e| e.to_string())?
+            } else {
+                "بدون تغییر گراف".to_string()
+            };
+            let badge = format_turn_badge(&turn.mcp_ops_executed, &env_badge, &turn.transport_label);
+
+            let inserted_doc_id = insert_knowledge_doc_record(
+                &conn,
+                &pid,
+                &effective_title,
+                &doc_type,
+                &effective_filename,
+                &knowledge_path,
+                &summary,
+                items_count,
+            )
+            .ok();
+
+            append_assistant_chat_message(
+                &conn,
+                &pid,
+                &session_id,
+                &norm_ch,
+                "ASSISTANT",
+                &envelope.conversational_reply,
+                Some(&knowledge_path),
+                &badge,
+                &envelope.clarifying_questions,
+            )
+            .map_err(|e| e.to_string())?;
+
+            let _ = complete_pending_items_for_user_msg(&conn, user_message_id, inserted_doc_id);
+
+            let updated = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
+            sync_all_project_projections(
+                &updated,
+                envelope.meeting_title.as_deref(),
+                envelope.meeting_summary_markdown.as_deref(),
+            )?;
+
+            Ok(AssistantTurnOutcome {
+                dashboard: updated,
+                assistant_error: None,
+            })
+        }
+        Err(err) => {
+            let fallback_summary: String = extracted_text.chars().take(260).collect();
+            let knowledge_path = archive_onboarding_document(
+                &workspace_path,
+                &effective_title,
+                &extracted_text,
+                &format!("آرشیو خام بدون تحلیل مدل (خطای موقت مدل): {}", fallback_summary),
+            )
+            .ok();
+
+            let conn = state.db.lock().map_err(|e| e.to_string())?;
+            let kdoc_id = if let Some(kp) = &knowledge_path {
+                insert_knowledge_doc_record(
+                    &conn,
+                    &pid,
+                    &effective_title,
+                    &doc_type,
+                    &effective_filename,
+                    kp,
+                    "متن فایل استخراج و در حافظه پروژه آرشیو شد (تحلیل هوشمند به دلیل خطای مدل انجام نشد).",
+                    0,
+                )
+                .ok()
+            } else {
+                None
+            };
+            let notice = format!(
+                "⚠️ محتوای «{}» استخراج شد و بلافاصله در حافظه و آرشیو پروژه ذخیره گردید، اما تحلیل مدل انجام نشد:\n{}",
+                effective_filename, err
+            );
+            let sys_id = append_assistant_chat_message(
+                &conn,
+                &pid,
+                &session_id,
+                &norm_ch,
+                "SYSTEM",
+                &notice,
+                knowledge_path.as_deref(),
+                "ذخیره در حافظه • خطای موتور هوش مصنوعی",
+                &[],
+            )
+            .ok();
+            let user_arch = get_user_chat_message_by_id(&conn, user_message_id)
+                .and_then(|(_, arch)| arch);
+            let _ = enqueue_pending_ai_item(
+                &conn,
+                &pid,
+                &session_id,
+                &norm_ch,
+                Some(user_message_id),
+                sys_id,
+                kdoc_id,
+                Some(raw_event_id),
+                &format!("📎 {}", effective_filename),
+                source_origin,
+                user_arch.as_deref().or(knowledge_path.as_deref()),
+                Some(&err),
+            );
+            let updated = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
+            Ok(AssistantTurnOutcome {
+                dashboard: updated,
+                assistant_error: Some(err),
+            })
+        }
+    }
+}
+
+#[tauri::command]
+fn cmd_quick_complete_step(
+    state: State<'_, AppState>,
+    task_id: String,
+    pomos_spent: i32,
+) -> Result<DashboardState, String> {
+    let mut conn = state.db.lock().map_err(|e| e.to_string())?;
+    let dash_before = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
+    quick_complete_task(&mut conn, &dash_before.active_project.id, &task_id, pomos_spent)
+        .map_err(|e| e.to_string())?;
+    let dash_after = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
+    let _ = sync_all_project_projections(&dash_after, None, None);
+    Ok(dash_after)
+}
+
+#[tauri::command]
+async fn cmd_send_copilot_message(
+    state: State<'_, AppState>,
+    message_text: String,
+) -> Result<DashboardState, String> {
+    let committed = cmd_commit_user_chat_message(
+        state.clone(),
+        "COPILOT".to_string(),
+        None,
+        message_text.clone(),
+    )?;
+    let outcome = cmd_run_assistant_turn(
+        state,
+        "COPILOT".to_string(),
+        committed.session_id,
+        message_text,
+        committed.archived_path,
+        Some(committed.raw_event_id),
+        committed.user_message_id,
+    )
+    .await?;
+    if let Some(err) = outcome.assistant_error {
+        return Err(err);
+    }
+    Ok(outcome.dashboard)
+}
+
+#[tauri::command]
+async fn cmd_send_copilot_file_message(
+    state: State<'_, AppState>,
+    original_filename: String,
+    content_base64: String,
+    user_note: String,
+) -> Result<DashboardState, String> {
+    let committed = cmd_commit_user_file_message(
+        state.clone(),
+        "COPILOT".to_string(),
+        None,
+        original_filename,
+        content_base64,
+        user_note,
+        None,
+        None,
+    )?;
+    let outcome = cmd_run_file_assistant_turn(
+        state,
+        "COPILOT".to_string(),
+        committed.session_id,
+        committed.raw_event_id,
+        committed.user_message_id,
+        committed.effective_title,
+        committed.effective_filename,
+        committed.doc_type,
+        committed.extracted_text,
+        committed.combined_prompt_text,
+    )
+    .await?;
+    if let Some(err) = outcome.assistant_error {
+        return Err(err);
+    }
+    Ok(outcome.dashboard)
+}
+
+#[tauri::command]
+async fn cmd_ingest_onboarding_document(
+    state: State<'_, AppState>,
+    title: String,
+    doc_type: String,
+    original_filename: String,
+    content: String,
+) -> Result<DashboardState, String> {
+    let committed = cmd_commit_vault_text_message(
+        state.clone(),
+        None,
+        title,
+        doc_type,
+        original_filename,
+        content,
+    )?;
+    let outcome = cmd_run_file_assistant_turn(
+        state,
+        "VAULT".to_string(),
+        committed.session_id,
+        committed.raw_event_id,
+        committed.user_message_id,
+        committed.effective_title,
+        committed.effective_filename,
+        committed.doc_type,
+        committed.extracted_text,
+        committed.combined_prompt_text,
+    )
+    .await?;
+    if let Some(err) = outcome.assistant_error {
+        return Err(err);
+    }
+    Ok(outcome.dashboard)
+}
+
+#[tauri::command]
+async fn cmd_ingest_onboarding_file(
+    state: State<'_, AppState>,
+    title: String,
+    doc_type: String,
+    original_filename: String,
+    content_base64: String,
+) -> Result<DashboardState, String> {
+    let committed = cmd_commit_user_file_message(
+        state.clone(),
+        "VAULT".to_string(),
+        None,
+        original_filename,
+        content_base64,
+        String::new(),
+        Some(title),
+        Some(doc_type),
+    )?;
+    let outcome = cmd_run_file_assistant_turn(
+        state,
+        "VAULT".to_string(),
+        committed.session_id,
+        committed.raw_event_id,
+        committed.user_message_id,
+        committed.effective_title,
+        committed.effective_filename,
+        committed.doc_type,
+        committed.extracted_text,
+        committed.combined_prompt_text,
+    )
+    .await?;
+    if let Some(err) = outcome.assistant_error {
+        return Err(err);
+    }
+    Ok(outcome.dashboard)
+}
+
+#[tauri::command]
+async fn cmd_send_vault_chat_message(
+    state: State<'_, AppState>,
+    message_text: String,
+) -> Result<DashboardState, String> {
+    let committed = cmd_commit_user_chat_message(
+        state.clone(),
+        "VAULT".to_string(),
+        None,
+        message_text.clone(),
+    )?;
+    let outcome = cmd_run_assistant_turn(
+        state,
+        "VAULT".to_string(),
+        committed.session_id,
+        message_text,
+        committed.archived_path,
+        Some(committed.raw_event_id),
+        committed.user_message_id,
+    )
+    .await?;
+    if let Some(err) = outcome.assistant_error {
+        return Err(err);
+    }
+    Ok(outcome.dashboard)
+}
+
+#[tauri::command]
+async fn cmd_fetch_live_models(
+    provider: String,
+    local_endpoint: String,
+    gemini_api_key: String,
+) -> Result<LiveModelsResponse, String> {
+    Ok(fetch_live_models(&provider, &local_endpoint, &gemini_api_key).await)
+}
+
+#[tauri::command]
+fn cmd_sync_mab_focus_now(
+    state: State<'_, AppState>,
+) -> Result<(SyncReport, DashboardState), String> {
+    let mut conn = state.db.lock().map_err(|e| e.to_string())?;
+    let report = synchronize_with_mab_focus(&mut conn)?;
+    let dash = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
+    let _ = sync_all_project_projections(&dash, None, None);
+    Ok((report, dash))
+}
+
+#[tauri::command]
+fn cmd_save_settings(
+    state: State<'_, AppState>,
+    new_settings: AppSettings,
+) -> Result<DashboardState, String> {
+    if !new_settings.vault_root_path.trim().is_empty() {
+        let _ = fs::create_dir_all(&new_settings.vault_root_path);
+    }
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    update_settings(&conn, &new_settings).map_err(|e| e.to_string())?;
+    get_dashboard_state(&conn).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn cmd_export_excel_report(state: State<'_, AppState>) -> Result<String, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let dash = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
+    let _ = sync_all_project_projections(&dash, None, None);
+    let out = PathBuf::from(&dash.active_project.workspace_path)
+        .join("07_client_reports")
+        .join(format!("{}_Timesheet_Report.xlsx", dash.active_project.id));
+    export_client_xlsx(&out, &dash.active_project.name, &dash.recent_logs)?;
+    Ok(out.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn cmd_undo_last(state: State<'_, AppState>) -> Result<DashboardState, String> {
+    let mut conn = state.db.lock().map_err(|e| e.to_string())?;
+    let dash = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
+    undo_last_mutation(&mut conn, &dash.active_project.id).map_err(|e| e.to_string())?;
+    let updated = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
+    sync_all_project_projections(&updated, None, None)?;
+    Ok(updated)
+}
+
+#[tauri::command]
+async fn cmd_check_llm_connection(
+    state: State<'_, AppState>,
+) -> Result<LlmConnectionStatus, String> {
+    let llm_cfg = {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        let settings = get_settings(&conn).map_err(|e| e.to_string())?;
+        LlmConfig::from(&settings)
+    };
+    Ok(check_llm_connectivity(&llm_cfg).await)
+}
+
+#[tauri::command]
+fn cmd_scan_unprocessed_queue(state: State<'_, AppState>) -> Result<DashboardState, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let _ = sync_unprocessed_items_into_queue(&conn);
+    get_dashboard_state(&conn).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn cmd_dismiss_pending_queue_item(
+    state: State<'_, AppState>,
+    queue_id: i64,
+) -> Result<DashboardState, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    dismiss_pending_queue_item(&conn, queue_id).map_err(|e| e.to_string())?;
+    get_dashboard_state(&conn).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn cmd_process_pending_queue_item(
+    state: State<'_, AppState>,
+    queue_id: i64,
+) -> Result<PendingQueueProcessOutcome, String> {
+    let prep = {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        let item = get_pending_queue_item(&conn, queue_id)
+            .map_err(|e| format!("آیتم صف انتظار یافت نشد: {}", e))?;
+
+        if item.status == "DONE" || item.status == "DISMISSED" {
+            let dash = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
+            return Ok(PendingQueueProcessOutcome {
+                dashboard: dash,
+                processed: false,
+                error: None,
+            });
+        }
+
+        let _ = set_pending_item_processing(&conn, queue_id);
+        let target_dash = get_dashboard_state_for_project(&conn, Some(&item.project_id))
+            .map_err(|e| e.to_string())?;
+
+        let raw_row = item
+            .raw_event_id
+            .and_then(|eid| get_raw_event_content_by_id(&conn, eid));
+        let user_row = item
+            .user_message_id
+            .and_then(|uid| get_user_chat_message_by_id(&conn, uid));
+        let doc_row = item
+            .knowledge_doc_id
+            .and_then(|did| get_knowledge_document_by_id(&conn, did));
+
+        let read_archived = |path_str: &str| -> Option<String> {
+            let raw = fs::read_to_string(path_str).ok()?;
+            let normalized = path_str.replace('\\', "/");
+            let cleaned = if normalized.contains("/01_knowledge_archive/") {
+                strip_knowledge_archive_header(&raw)
+            } else {
+                strip_raw_input_frontmatter(&raw)
+            };
+            if cleaned.trim().is_empty() {
+                None
+            } else {
+                Some(cleaned)
+            }
+        };
+
+        let recovered_text = item
+            .archived_path
+            .as_deref()
+            .and_then(read_archived)
+            .or_else(|| {
+                user_row
+                    .as_ref()
+                    .and_then(|(_, arch)| arch.as_deref())
+                    .and_then(read_archived)
+            })
+            .or_else(|| raw_row.as_ref().map(|(_, c)| c.clone()).filter(|s| !s.trim().is_empty()))
+            .or_else(|| doc_row.as_ref().and_then(|d| read_archived(&d.archived_path)))
+            .or_else(|| {
+                user_row
+                    .as_ref()
+                    .map(|(txt, _)| txt.clone())
+                    .filter(|s| !s.trim().is_empty())
+            })
+            .unwrap_or_else(|| item.title_preview.clone());
+
+        let is_vault_channel = item.channel.eq_ignore_ascii_case("VAULT");
+        let effective_session_id = if !item.session_id.trim().is_empty() {
+            item.session_id.clone()
+        } else if is_vault_channel {
+            target_dash.active_vault_session_id.clone()
+        } else {
+            target_dash.active_copilot_session_id.clone()
+        };
+
+        let session_msgs = query_messages_for_session_public(
+            &conn,
+            &item.project_id,
+            &effective_session_id,
+            is_vault_channel,
+        )
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|m| {
+            Some(m.id) != item.user_message_id && Some(m.id) != item.system_message_id
+        })
+        .collect::<Vec<_>>();
+
+        let (copilot_history, vault_history) = if is_vault_channel {
+            (target_dash.chat_history.clone(), session_msgs)
+        } else {
+            (session_msgs, target_dash.vault_chat_history.clone())
+        };
+
+        let fts_hits = search_raw_events_fts(&conn, &item.project_id, &recovered_text)
+            .unwrap_or_default();
+
+        (
+            item,
+            effective_session_id,
+            target_dash,
+            raw_row,
+            doc_row,
+            recovered_text,
+            copilot_history,
+            vault_history,
+            fts_hits,
+        )
+    };
+
+    let (
+        item,
+        effective_session_id,
+        target_dash,
+        raw_row,
+        doc_row,
+        recovered_text,
+        copilot_history,
+        vault_history,
+        fts_hits,
+    ) = prep;
+
+    let norm_ch = normalize_chat_channel(&item.channel).to_string();
+    let source_origin = raw_row
+        .as_ref()
+        .map(|(st, _)| st.clone())
+        .unwrap_or_else(|| item.source_type.clone());
+    let is_doc_turn = doc_row.is_some()
+        || source_origin == "DOC_ONBOARDING"
+        || source_origin == "COPILOT_FILE";
+
+    let doc_meta_owned = if is_doc_turn {
+        let title = doc_row
+            .as_ref()
+            .map(|d| d.title.clone())
+            .unwrap_or_else(|| derive_title_from_content("", &recovered_text, "سند در صف انتظار"));
+        let dtype = doc_row
+            .as_ref()
+            .map(|d| d.doc_type.clone())
+            .unwrap_or_else(|| "ONBOARDING_FILE".to_string());
+        let fname = doc_row
+            .as_ref()
+            .map(|d| d.original_filename.clone())
+            .unwrap_or_else(|| "queued_doc.md".to_string());
+        Some((title, dtype, fname))
+    } else {
+        None
+    };
+    let doc_meta_ref = doc_meta_owned
+        .as_ref()
+        .map(|(t, dt, f)| (t.as_str(), dt.as_str(), f.as_str()));
+
+    let prompt = if let Some((ref t, ref dt, ref f)) = doc_meta_owned {
+        if norm_ch == "VAULT" {
+            build_document_onboarding_prompt(
+                &item.project_id,
+                t,
+                dt,
+                f,
+                &recovered_text,
+                &vault_history,
+                &target_dash.open_tasks,
+                &target_dash.active_decisions,
+            )
+        } else {
+            build_copilot_chat_prompt(
+                &item.project_id,
+                &recovered_text,
+                &copilot_history,
+                &vault_history,
+                &target_dash.open_tasks,
+                &target_dash.active_decisions,
+                &target_dash.active_sops,
+                &target_dash.knowledge_docs,
+                &fts_hits,
+            )
+        }
+    } else if norm_ch == "VAULT" {
+        build_vault_chat_prompt(
+            &item.project_id,
+            &recovered_text,
+            &vault_history,
+            &target_dash.open_tasks,
+            &target_dash.active_decisions,
+            &target_dash.active_sops,
+            &target_dash.knowledge_docs,
+            &fts_hits,
+        )
+    } else {
+        build_copilot_chat_prompt(
+            &item.project_id,
+            &recovered_text,
+            &copilot_history,
+            &vault_history,
+            &target_dash.open_tasks,
+            &target_dash.active_decisions,
+            &target_dash.active_sops,
+            &target_dash.knowledge_docs,
+            &fts_hits,
+        )
+    };
+
+    let (mcp_sys_prompt, mcp_user_prompt) = build_mcp_tool_turn_prompts(
+        &item.project_id,
+        &norm_ch,
+        &recovered_text,
+        if norm_ch == "VAULT" {
+            &vault_history
+        } else {
+            &copilot_history
+        },
+        &target_dash.open_tasks,
+        &target_dash.active_decisions,
+        &target_dash.active_sops,
+        &target_dash.knowledge_docs,
+        &fts_hits,
+        doc_meta_ref,
+    );
+
+    let llm_cfg = LlmConfig::from(&target_dash.settings);
+    match run_copilot_turn(
+        &state.db,
+        state.app_data_dir.clone(),
+        &llm_cfg,
+        &item.project_id,
+        item.raw_event_id,
+        &source_origin,
+        &mcp_sys_prompt,
+        &mcp_user_prompt,
+        &prompt,
+    )
+    .await
+    {
+        Ok(turn) => {
+            let envelope = turn.envelope;
+            let mut conn = state.db.lock().map_err(|e| e.to_string())?;
+            let env_badge = if !envelope.mutations.is_empty() || turn.mcp_ops_executed.is_empty() {
+                apply_copilot_envelope_with_event(
+                    &mut conn,
+                    &item.project_id,
+                    &recovered_text,
+                    item.archived_path.as_deref(),
+                    &source_origin,
+                    &envelope,
+                    item.raw_event_id,
+                )
+                .map_err(|e| e.to_string())?
+            } else {
+                "بدون تغییر گراف".to_string()
+            };
+            let badge =
+                format_turn_badge(&turn.mcp_ops_executed, &env_badge, &turn.transport_label);
+
+            let items_count = (envelope.mutations.len() + turn.mcp_ops_executed.len()) as i32;
+            if let Some(doc_id) = item.knowledge_doc_id {
+                let summary = envelope
+                    .executive_doc_summary
+                    .clone()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| envelope.conversational_reply.clone());
+                let title_for_doc = doc_row
+                    .as_ref()
+                    .map(|d| d.title.as_str())
+                    .unwrap_or("سند پردازش‌شده");
+                let new_kp = archive_onboarding_document(
+                    &target_dash.active_project.workspace_path,
+                    title_for_doc,
+                    &recovered_text,
+                    &summary,
+                )
+                .ok();
+                let _ = update_knowledge_doc_analysis(
+                    &conn,
+                    doc_id,
+                    &summary,
+                    items_count,
+                    new_kp.as_deref(),
+                );
+            }
+
+            if let Some(sys_id) = item.system_message_id {
+                let _ = delete_system_chat_message(&conn, sys_id);
+            }
+
+            append_assistant_chat_message(
+                &conn,
+                &item.project_id,
+                &effective_session_id,
+                &norm_ch,
+                "ASSISTANT",
+                &envelope.conversational_reply,
+                item.archived_path.as_deref(),
+                &badge,
+                &envelope.clarifying_questions,
+            )
+            .map_err(|e| e.to_string())?;
+
+            let _ = mark_pending_item_done(&conn, queue_id);
+            if let Some(uid) = item.user_message_id {
+                let _ = complete_pending_items_for_user_msg(&conn, uid, item.knowledge_doc_id);
+            }
+
+            if let Ok(proj_dash) = get_dashboard_state_for_project(&conn, Some(&item.project_id)) {
+                let _ = sync_all_project_projections(
+                    &proj_dash,
+                    envelope.meeting_title.as_deref(),
+                    envelope.meeting_summary_markdown.as_deref(),
+                );
+            }
+
+            let updated_dash = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
+            Ok(PendingQueueProcessOutcome {
+                dashboard: updated_dash,
+                processed: true,
+                error: None,
+            })
+        }
+        Err(err) => {
+            let conn = state.db.lock().map_err(|e| e.to_string())?;
+            let _ = record_pending_item_failure(&conn, queue_id, &err);
+            if let Some(sys_id) = item.system_message_id {
+                let notice = format!(
+                    "⚠️ پیام شما در صف انتظار و آرشیو پروژه ذخیره است، اما در ارسال خودکار به هوش مصنوعی خطا رخ داد:\n{}",
+                    err
+                );
+                let _ = update_system_chat_message(&conn, sys_id, &notice);
+            }
+            let updated_dash = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
+            Ok(PendingQueueProcessOutcome {
+                dashboard: updated_dash,
+                processed: false,
+                error: Some(err),
+            })
+        }
+    }
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .setup(|app| {
+            let app_data_dir = app
+                .path()
+                .app_data_dir()
+                .expect("Failed to resolve AppData");
+            fs::create_dir_all(&app_data_dir).expect("Failed to create AppData directory");
+            let db_path = app_data_dir.join("mab_compass_v2.sqlite");
+
+            let default_vault = dirs::document_dir()
+                .unwrap_or_else(|| app_data_dir.clone())
+                .join("MabOS_Projects_Vault");
+            fs::create_dir_all(&default_vault).expect("Failed to create default vault directory");
+
+            let mut conn =
+                init_database(&db_path, &default_vault).expect("Failed to init SQLite v2");
+
+            if let Ok(settings) = get_settings(&conn) {
+                if settings.auto_sync_mab_focus {
+                    let _ = synchronize_with_mab_focus(&mut conn);
+                }
+            }
+            if let Ok(dash) = get_dashboard_state(&conn) {
+                let _ = sync_all_project_projections(&dash, None, None);
+            }
+
+            app.manage(AppState {
+                db: Mutex::new(conn),
+                app_data_dir,
+            });
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            cmd_get_db_data_version,
+            cmd_get_dashboard,
+            cmd_switch_project,
+            cmd_create_project,
+            cmd_quick_complete_step,
+            cmd_create_chat_session,
+            cmd_switch_chat_session,
+            cmd_delete_chat_session,
+            cmd_commit_user_chat_message,
+            cmd_run_assistant_turn,
+            cmd_retry_system_message,
+            cmd_commit_user_file_message,
+            cmd_commit_vault_text_message,
+            cmd_run_file_assistant_turn,
+            cmd_send_copilot_message,
+            cmd_send_copilot_file_message,
+            cmd_ingest_onboarding_document,
+            cmd_ingest_onboarding_file,
+            cmd_send_vault_chat_message,
+            cmd_fetch_live_models,
+            cmd_sync_mab_focus_now,
+            cmd_save_settings,
+            cmd_export_excel_report,
+            cmd_undo_last,
+            cmd_check_llm_connection,
+            cmd_scan_unprocessed_queue,
+            cmd_dismiss_pending_queue_item,
+            cmd_process_pending_queue_item
+        ])
+        .run(tauri::generate_context!())
+        .expect("Error running Mab-Compass Tauri v2 application");
+}

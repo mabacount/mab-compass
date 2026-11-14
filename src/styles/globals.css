@@ -1,0 +1,287 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  /* === Anytype-Grade Obsidian Surfaces === */
+  --mab-bg-base: #0D0E11;
+  --mab-bg-sidebar: #131418;
+  --mab-bg-surface: #18191E;
+  --mab-bg-hover: #202229;
+  --mab-bg-elevated: #252732;
+  --mab-bg-active: #2D303D;
+  --mab-border-subtle: rgba(255, 255, 255, 0.07);
+  --mab-border-input: rgba(255, 255, 255, 0.10);
+  --mab-border-input-hover: rgba(255, 255, 255, 0.18);
+
+  /* === Refined Semantic Colors === */
+  --mab-color-focus: #3B82F6;
+  --mab-color-break: #10B981;
+  --mab-color-overtime: #F59E0B;
+  --mab-color-draft: #F59E0B;
+  --mab-color-edited: #8B5CF6;
+  --mab-color-danger: #F43F5E;
+
+  /* === Text Hierarchy === */
+  --mab-text-primary: #F3F4F6;
+  --mab-text-secondary: #9CA3AF;
+  --mab-text-muted: #646675;
+  --mab-text-on-accent: #FFFFFF;
+
+  /* === Alpha Tints & Soft Glows === */
+  --mab-tint-focus-12: rgba(59, 130, 246, 0.10);
+  --mab-tint-focus-24: rgba(59, 130, 246, 0.20);
+  --mab-border-focus-47: rgba(59, 130, 246, 0.35);
+
+  --mab-tint-break-12: rgba(16, 185, 129, 0.10);
+  --mab-border-break-47: rgba(16, 185, 129, 0.35);
+
+  --mab-tint-warning-10: rgba(245, 158, 11, 0.08);
+  --mab-tint-warning-14: rgba(245, 158, 11, 0.14);
+  --mab-border-warning-47: rgba(245, 158, 11, 0.35);
+
+  --mab-tint-edited-12: rgba(139, 92, 246, 0.10);
+  --mab-tint-edited-16: rgba(139, 92, 246, 0.15);
+  --mab-border-edited-47: rgba(139, 92, 246, 0.35);
+
+  --mab-tint-danger-10: rgba(244, 63, 94, 0.08);
+  --mab-tint-danger-16: rgba(244, 63, 94, 0.14);
+  --mab-border-danger-47: rgba(244, 63, 94, 0.35);
+
+  /* === Typography === */
+  --mab-font-sans: 'Vazirmatn', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --mab-font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+
+  /* === Chrome Dimensions === */
+  --mab-titlebar-height: 46px;
+  --mab-header-height: 46px;
+  --mab-rail-collapsed-width: 64px;
+  --mab-rail-extended-width: 256px;
+}
+
+@layer base {
+  html {
+    color-scheme: dark;
+    direction: rtl;
+    font-family: var(--mab-font-sans);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  body {
+    margin: 0;
+    background-color: var(--mab-bg-base);
+    color: var(--mab-text-primary);
+    font-family: var(--mab-font-sans);
+    overflow: hidden;
+    user-select: none;
+  }
+
+  ::selection {
+    background-color: rgba(59, 130, 246, 0.35);
+    color: #FFFFFF;
+  }
+}
+
+@layer components {
+  /* Anytype Card: Smooth rounded corners, ultra-subtle border, elevation on hover */
+  .mab-card {
+    background-color: var(--mab-bg-surface);
+    border: 1px solid var(--mab-border-subtle);
+    border-radius: 14px;
+    box-shadow: 0 2px 8px -2px rgba(0, 0, 0, 0.3);
+    transition: border-color 160ms ease, box-shadow 160ms ease;
+  }
+
+  .mab-card-interactive {
+    background-color: var(--mab-bg-surface);
+    border: 1px solid var(--mab-border-subtle);
+    border-radius: 14px;
+    box-shadow: 0 2px 8px -2px rgba(0, 0, 0, 0.3);
+    transition: all 160ms ease;
+  }
+
+  .mab-card-interactive:hover {
+    border-color: rgba(255, 255, 255, 0.14);
+    background-color: var(--mab-bg-hover);
+  }
+
+  /* Anytype Sleek Input */
+  .mab-input {
+    background-color: var(--mab-bg-base);
+    border: 1px solid var(--mab-border-input);
+    border-radius: 10px;
+    color: var(--mab-text-primary);
+    transition: border-color 140ms ease, box-shadow 140ms ease, background-color 140ms ease;
+  }
+
+  .mab-input:hover {
+    border-color: var(--mab-border-input-hover);
+  }
+
+  .mab-input:focus,
+  .mab-input:focus-within {
+    outline: none;
+    border-color: var(--mab-color-focus);
+    box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.18);
+  }
+
+  /* Tactile Modern Buttons */
+  .mab-btn-primary {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    border-radius: 10px;
+    background-color: var(--mab-color-focus);
+    color: #FFFFFF;
+    font-weight: 600;
+    padding: 7px 14px;
+    font-size: 12.5px;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3), inset 0 1px 0 rgba(255, 255, 255, 0.15);
+    transition: all 140ms ease;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+  }
+
+  .mab-btn-primary:hover {
+    filter: brightness(1.1);
+    transform: translateY(-0.5px);
+  }
+
+  .mab-btn-primary:active {
+    transform: translateY(0.5px);
+    filter: brightness(0.95);
+  }
+
+  .mab-btn-success {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    border-radius: 10px;
+    background-color: var(--mab-color-break);
+    color: #FFFFFF;
+    font-weight: 600;
+    padding: 7px 14px;
+    font-size: 12.5px;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3), inset 0 1px 0 rgba(255, 255, 255, 0.15);
+    transition: all 140ms ease;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+  }
+
+  .mab-btn-success:hover {
+    filter: brightness(1.1);
+    transform: translateY(-0.5px);
+  }
+
+  .mab-btn-ghost {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    border-radius: 10px;
+    background-color: rgba(255, 255, 255, 0.03);
+    border: 1px solid var(--mab-border-subtle);
+    color: var(--mab-text-secondary);
+    font-weight: 500;
+    padding: 6px 12px;
+    font-size: 12px;
+    transition: all 140ms ease;
+  }
+
+  .mab-btn-ghost:hover {
+    background-color: rgba(255, 255, 255, 0.07);
+    color: var(--mab-text-primary);
+    border-color: rgba(255, 255, 255, 0.12);
+  }
+
+  /* Badges */
+  .mab-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 7px;
+    border-radius: 6px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+  }
+
+  .mab-badge-edited {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 8px;
+    border-radius: 6px;
+    background-color: var(--mab-tint-edited-16);
+    border: 1px solid var(--mab-border-edited-47);
+    color: #C4B5FD;
+    font-family: var(--mab-font-mono);
+    font-size: 11px;
+    font-weight: 600;
+    direction: ltr;
+    unicode-bidi: isolate;
+  }
+
+  /* Custom Clean Window Titlebar Controls */
+  .mab-titlebar-btn {
+    width: 44px;
+    height: 100%;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--mab-text-muted);
+    background: transparent;
+    border: none;
+    transition: background-color 120ms ease, color 120ms ease;
+  }
+
+  .mab-titlebar-btn:hover {
+    background-color: rgba(255, 255, 255, 0.07);
+    color: var(--mab-text-primary);
+  }
+
+  .mab-titlebar-btn-close:hover {
+    background-color: #E11D48;
+    color: #FFFFFF;
+  }
+}
+
+@layer utilities {
+  .bidi-ltr {
+    direction: ltr;
+    unicode-bidi: isolate;
+  }
+
+  .font-timer {
+    font-family: var(--mab-font-mono);
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum" 1;
+    direction: ltr;
+    unicode-bidi: isolate;
+  }
+
+  .tauri-no-drag {
+    -webkit-app-region: no-drag;
+  }
+
+  .tauri-drag {
+    -webkit-app-region: drag;
+  }
+}
+
+/* Anytype Refined Ultra-slim Scrollbars */
+::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.12);
+  border-radius: 9999px;
+  transition: background 150ms ease;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.25);
+}
