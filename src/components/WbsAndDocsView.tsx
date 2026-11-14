@@ -55,16 +55,16 @@ export function WbsAndDocsView({ dash, onQuickComplete }: WbsAndDocsViewProps) {
   return (
     <div className="flex flex-col gap-3.5 h-full min-h-0">
       {/* Top Anytype Database Header: Segmented Tabs & Search */}
-      <div className="mab-card p-3 flex items-center justify-between gap-3 flex-wrap shrink-0">
+      <div className="mab-card p-3 flex items-center justify-between gap-3 flex-wrap shrink-0 border-mab-border">
         {/* Segmented Tabs */}
-        <div className="flex items-center gap-1 bg-[#121316] p-1 rounded-xl border border-white/[0.06] overflow-x-auto">
+        <div className="flex items-center gap-1 bg-mab-base/80 p-1 rounded-xl border border-mab-border overflow-x-auto">
           <button
             type="button"
             onClick={() => setActiveTab("ALL_TASKS")}
             className={`px-3 py-1.5 rounded-lg text-[12px] font-medium transition flex items-center gap-1.5 shrink-0 ${
               activeTab === "ALL_TASKS"
-                ? "bg-white/[0.1] text-white font-semibold shadow-sm"
-                : "text-mab-text-secondary hover:text-white"
+                ? "bg-white/[0.08] text-white font-medium border border-white/[0.1] shadow-sm"
+                : "text-mab-text-secondary hover:text-white border border-transparent"
             }`}
           >
             <Layers className="w-3.5 h-3.5 text-blue-400" />
@@ -79,8 +79,8 @@ export function WbsAndDocsView({ dash, onQuickComplete }: WbsAndDocsViewProps) {
             onClick={() => setActiveTab("DECISIONS")}
             className={`px-3 py-1.5 rounded-lg text-[12px] font-medium transition flex items-center gap-1.5 shrink-0 ${
               activeTab === "DECISIONS"
-                ? "bg-white/[0.1] text-white font-semibold shadow-sm"
-                : "text-mab-text-secondary hover:text-white"
+                ? "bg-white/[0.08] text-white font-medium border border-white/[0.1] shadow-sm"
+                : "text-mab-text-secondary hover:text-white border border-transparent"
             }`}
           >
             <FileText className="w-3.5 h-3.5 text-purple-400" />
@@ -95,8 +95,8 @@ export function WbsAndDocsView({ dash, onQuickComplete }: WbsAndDocsViewProps) {
             onClick={() => setActiveTab("SOPS")}
             className={`px-3 py-1.5 rounded-lg text-[12px] font-medium transition flex items-center gap-1.5 shrink-0 ${
               activeTab === "SOPS"
-                ? "bg-white/[0.1] text-white font-semibold shadow-sm"
-                : "text-mab-text-secondary hover:text-white"
+                ? "bg-white/[0.08] text-white font-medium border border-white/[0.1] shadow-sm"
+                : "text-mab-text-secondary hover:text-white border border-transparent"
             }`}
           >
             <BookOpen className="w-3.5 h-3.5 text-emerald-400" />
@@ -111,8 +111,8 @@ export function WbsAndDocsView({ dash, onQuickComplete }: WbsAndDocsViewProps) {
             onClick={() => setActiveTab("LOGS")}
             className={`px-3 py-1.5 rounded-lg text-[12px] font-medium transition flex items-center gap-1.5 shrink-0 ${
               activeTab === "LOGS"
-                ? "bg-white/[0.1] text-white font-semibold shadow-sm"
-                : "text-mab-text-secondary hover:text-white"
+                ? "bg-white/[0.08] text-white font-medium border border-white/[0.1] shadow-sm"
+                : "text-mab-text-secondary hover:text-white border border-transparent"
             }`}
           >
             <Clock className="w-3.5 h-3.5 text-amber-400" />
@@ -143,7 +143,7 @@ export function WbsAndDocsView({ dash, onQuickComplete }: WbsAndDocsViewProps) {
             {filteredTasks.map((t) => (
               <div
                 key={t.id}
-                className="mab-card p-3.5 hover:bg-white/[0.03] transition flex items-center justify-between gap-3 flex-wrap sm:flex-nowrap group"
+                className="mab-card p-3.5 hover:bg-mab-hover/60 transition flex items-center justify-between gap-3 flex-wrap sm:flex-nowrap group"
               >
                 <div className="min-w-0 space-y-1">
                   <div className="flex items-center gap-2 flex-wrap">
@@ -214,7 +214,7 @@ export function WbsAndDocsView({ dash, onQuickComplete }: WbsAndDocsViewProps) {
             {filteredDecisions.map((d) => (
               <div
                 key={d.id}
-                className="mab-card p-4 space-y-2 hover:bg-white/[0.03] transition"
+                className="mab-card p-4 space-y-2 hover:bg-mab-hover/60 transition"
               >
                 <div className="flex items-center justify-between gap-2">
                   <div className="flex items-center gap-2">
@@ -249,7 +249,7 @@ export function WbsAndDocsView({ dash, onQuickComplete }: WbsAndDocsViewProps) {
             {filteredSops.map((s) => (
               <div
                 key={s.id}
-                className="mab-card p-4 space-y-2 hover:bg-white/[0.03] transition"
+                className="mab-card p-4 space-y-2 hover:bg-mab-hover/60 transition"
               >
                 <div className="flex items-center justify-between gap-2">
                   <span className="px-2 py-0.5 rounded-md bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 font-mono text-[10.5px] font-bold">
@@ -279,7 +279,7 @@ export function WbsAndDocsView({ dash, onQuickComplete }: WbsAndDocsViewProps) {
             {filteredLogs.map((l) => (
               <div
                 key={l.id}
-                className="mab-card p-3.5 space-y-1.5 hover:bg-white/[0.03] transition text-[12.5px]"
+                className="mab-card p-3.5 space-y-1.5 hover:bg-mab-hover/60 transition text-[12.5px]"
               >
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2">
@@ -311,3 +311,5 @@ export function WbsAndDocsView({ dash, onQuickComplete }: WbsAndDocsViewProps) {
     </div>
   );
 }
+
+export default WbsAndDocsView;

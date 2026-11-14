@@ -16,6 +16,8 @@ import {
   CompassApi,
   LiveModelsResponse,
 } from "../lib/tauri_api";
+import { MabSelect } from "./ui/MabSelect";
+import { MabCheckbox } from "./ui/MabCheckbox";
 
 interface SettingsViewProps {
   settingsForm: AppSettings;
@@ -23,6 +25,21 @@ interface SettingsViewProps {
   onSave: () => void;
   onQuickSaveSettings?: (next: AppSettings) => void;
 }
+
+const LLM_PROVIDER_OPTIONS = [
+  {
+    value: "AGY_CLI",
+    label: "Google Antigravity CLI (agy) — اتصال خودکار به حساب فعال",
+  },
+  {
+    value: "GEMINI_REST",
+    label: "Google AI Studio API (Gemini REST) — با کلید اختصاصی",
+  },
+  {
+    value: "LOCAL_OPENAI",
+    label: "Local LM Studio (آفلاین محلی روی پورت سیستم)",
+  },
+];
 
 export function SettingsView({
   settingsForm,
@@ -125,6 +142,17 @@ export function SettingsView({
       ? "/v1beta/models (Gemini API)"
       : "agy models (Antigravity CLI)";
 
+  // Build model options for MabSelect
+  const modelOptions = [
+    ...(hasSavedFallback
+      ? [{ value: selectedModel, label: `${selectedModel} (ذخیره‌شده فعلی)` }]
+      : []),
+    ...liveModels.map((m) => ({
+      value: m.id,
+      label: `${m.label}${m.details ? ` — ${m.details}` : ""}`,
+    })),
+  ];
+
   return (
     <div className="max-w-3xl mx-auto space-y-4 pb-8 select-text">
       {/* Header title */}
@@ -158,8 +186,8 @@ export function SettingsView({
       </div>
 
       {/* 1. LLM Model Configuration */}
-      <div className="mab-card p-5 space-y-4">
-        <div className="flex items-center gap-2 border-b border-white/[0.06] pb-3">
+      <div className="mab-card p-5 space-y-4 border-mab-border">
+        <div className="flex items-center gap-2 border-b border-mab-border pb-3">
           <Cpu className="w-4 h-4 text-purple-400" />
           <h3 className="text-[14px] font-bold text-white">
             موتور هوش مصنوعی و مدل فعال
@@ -170,30 +198,20 @@ export function SettingsView({
           <label className="text-[12px] font-semibold text-white/80">
             سرویس‌دهنده هوش مصنوعی:
           </label>
-          <select
+          <MabSelect
             value={settingsForm.active_llm_provider}
-            onChange={(e) =>
+            onChange={(val) =>
               onChange({
                 ...settingsForm,
-                active_llm_provider: e.target.value,
+                active_llm_provider: val,
               })
             }
-            className="w-full mab-input px-3 py-2 text-[12.5px] bg-[#141519]"
-          >
-            <option value="AGY_CLI">
-              Google Antigravity CLI (agy) — اتصال خودکار به حساب فعال
-            </option>
-            <option value="GEMINI_REST">
-              Google AI Studio API (Gemini REST) — با کلید اختصاصی
-            </option>
-            <option value="LOCAL_OPENAI">
-              Local LM Studio (آفلاین محلی روی پورت سیستم)
-            </option>
-          </select>
+            options={LLM_PROVIDER_OPTIONS}
+          />
         </div>
 
         {/* Live Model Selection Box */}
-        <div className="p-4 rounded-xl bg-white/[0.02] border border-white/[0.06] space-y-3">
+        <div className="p-4 rounded-xl bg-white/[0.02] border border-mab-border space-y-3">
           <div className="flex items-center justify-between gap-2 flex-wrap">
             <div className="flex items-center gap-2">
               <span className="text-[12.5px] font-semibold text-white">
@@ -208,7 +226,7 @@ export function SettingsView({
               type="button"
               onClick={() => void handleFetchModels()}
               disabled={isFetching}
-              className="px-3 py-1 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.08] text-white/80 text-[11.5px] font-medium flex items-center gap-1.5 transition disabled:opacity-50"
+              className="px-3 py-1 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] border border-mab-border text-white/80 text-[11.5px] font-medium flex items-center gap-1.5 transition disabled:opacity-50"
             >
               <RefreshCw
                 className={`w-3.5 h-3.5 text-blue-400 ${
@@ -219,27 +237,17 @@ export function SettingsView({
             </button>
           </div>
 
-          <select
+          <MabSelect
             value={selectedModel}
-            onChange={(e) => setModelForProvider(activeProvider, e.target.value)}
-            className="w-full mab-input px-3 py-2 text-[12.5px] font-mono bidi-ltr bg-[#141519]"
-          >
-            {liveModels.length === 0 && !hasSavedFallback && (
-              <option value="">
-                مدلی یافت نشد — روی دکمه بروزرسانی کلیک کنید
-              </option>
-            )}
-            {hasSavedFallback && (
-              <option value={selectedModel}>
-                {selectedModel} (ذخیره‌شده فعلی)
-              </option>
-            )}
-            {liveModels.map((m) => (
-              <option key={m.id} value={m.id}>
-                {m.label} {m.details ? ` — ${m.details}` : ""}
-              </option>
-            ))}
-          </select>
+            onChange={(val) => setModelForProvider(activeProvider, val)}
+            options={modelOptions}
+            placeholder={
+              liveModels.length === 0 && !hasSavedFallback
+                ? "مدلی یافت نشد — روی دکمه بروزرسانی کلیک کنید"
+                : "انتخاب مدل هوش مصنوعی..."
+            }
+            dir="ltr"
+          />
 
           {activeLive && (
             <div
@@ -261,7 +269,7 @@ export function SettingsView({
           )}
 
           {activeProvider === "AGY_CLI" && !activeLive?.live_fetched && (
-            <div className="pt-2 border-t border-white/[0.06] flex items-center gap-2 flex-wrap">
+            <div className="pt-2 border-t border-mab-border flex items-center gap-2 flex-wrap">
               <span className="text-[11.5px] text-white/50">پیشنهاد سریع:</span>
               <button
                 type="button"
@@ -348,8 +356,8 @@ export function SettingsView({
       </div>
 
       {/* 2. Project Directory & Mab-Focus Integration */}
-      <div className="mab-card p-5 space-y-4">
-        <div className="flex items-center gap-2 border-b border-white/[0.06] pb-3">
+      <div className="mab-card p-5 space-y-4 border-mab-border">
+        <div className="flex items-center gap-2 border-b border-mab-border pb-3">
           <FolderGit2 className="w-4 h-4 text-blue-400" />
           <h3 className="text-[14px] font-bold text-white">
             دایرکتوری پروژه‌ها و اتصال با Mab-Focus
@@ -397,32 +405,25 @@ export function SettingsView({
           </p>
         </div>
 
-        {/* Auto-Sync Toggle Item */}
-        <label className="flex items-center gap-3 p-3 rounded-xl bg-white/[0.02] hover:bg-white/[0.04] border border-white/[0.06] transition cursor-pointer select-none">
-          <input
-            type="checkbox"
+        {/* Auto-Sync Toggle Item with MabCheckbox */}
+        <div className="p-3.5 rounded-xl bg-white/[0.02] hover:bg-mab-hover/60 border border-mab-border transition">
+          <MabCheckbox
             checked={settingsForm.auto_sync_mab_focus}
-            onChange={(e) =>
+            onChange={(checked) =>
               onChange({
                 ...settingsForm,
-                auto_sync_mab_focus: e.target.checked,
+                auto_sync_mab_focus: checked,
               })
             }
-            className="w-4 h-4 rounded accent-blue-500"
+            label="همگام‌سازی خودکار دوطرفه در زمان اجرای برنامه"
+            description="پروژه‌ها به‌صورت دوطرفه و نشست‌های تمرکز به‌صورت یک‌طرفه از Mab-Focus سینک می‌شوند."
+            className="w-full"
           />
-          <div className="text-[12.5px]">
-            <span className="font-semibold text-white block">
-              همگام‌سازی خودکار دوطرفه در زمان اجرای برنامه
-            </span>
-            <span className="text-[11px] text-mab-text-muted block mt-0.5">
-              پروژه‌ها به‌صورت دوطرفه و نشست‌های تمرکز به‌صورت یک‌طرفه از Mab-Focus سینک می‌شوند.
-            </span>
-          </div>
-        </label>
+        </div>
       </div>
 
       {/* 3. Storage Info */}
-      <div className="mab-card p-4 flex items-center justify-between text-[11.5px] text-white/50">
+      <div className="mab-card p-4 flex items-center justify-between text-[11.5px] text-white/50 border-mab-border">
         <div className="flex items-center gap-2">
           <HardDrive className="w-3.5 h-3.5 text-white/40" />
           <span>پایگاه داده محلی SQLite با استاندارد اکوسیستم فعال است</span>
@@ -432,3 +433,5 @@ export function SettingsView({
     </div>
   );
 }
+
+export default SettingsView;

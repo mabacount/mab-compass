@@ -51,7 +51,7 @@ export function HeaderBar({
           type="button"
           onClick={onToggleSidebar}
           title={isSidebarCollapsed ? "باز کردن نوار کناری (Ctrl+B)" : "جمع‌کردن نوار کناری"}
-          className="w-7 h-7 rounded-md bg-white/[0.04] border border-white/[0.08] text-mab-text-secondary hover:text-white hover:bg-white/[0.08] hover:border-white/[0.15] flex items-center justify-center transition shrink-0"
+          className="w-7 h-7 rounded-md bg-white/[0.03] border border-mab-border text-mab-text-secondary hover:text-white hover:bg-white/[0.08] hover:border-white/[0.15] flex items-center justify-center transition shrink-0"
         >
           {isSidebarCollapsed ? (
             <PanelRightOpen className="w-3.5 h-3.5" />
@@ -62,8 +62,8 @@ export function HeaderBar({
 
         {/* Space Avatar & Breadcrumbs */}
         <div className="flex items-center gap-2 min-w-0">
-          <div className="w-5 h-5 rounded-[6px] bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center shadow-sm shrink-0">
-            <Compass className="w-3 h-3 text-white" />
+          <div className="w-6 h-6 rounded-lg bg-white/[0.05] border border-white/[0.08] flex items-center justify-center shadow-sm shrink-0">
+            <Compass className="w-3.5 h-3.5 text-blue-400" />
           </div>
 
           <div className="flex items-center gap-1.5 min-w-0">
@@ -77,8 +77,8 @@ export function HeaderBar({
           </div>
 
           {/* Open/Closed Tasks Pill */}
-          <div className="hidden lg:flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-white/[0.03] border border-white/[0.07] font-timer text-[11px] text-mab-text-secondary shrink-0">
-            <span className="w-1.5 h-1.5 rounded-full bg-mab-focus" />
+          <div className="hidden lg:flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-white/[0.03] border border-mab-border font-timer text-[11px] text-mab-text-secondary shrink-0">
+            <span className="w-1.5 h-1.5 rounded-full bg-blue-500" />
             <span className="font-semibold text-white/90">{dash.open_tasks.length}</span>
             <span>گام باز</span>
             <span className="text-white/20">|</span>
@@ -120,10 +120,10 @@ export function HeaderBar({
           title={connectionStatus?.message || "بررسی وضعیت مدل هوش مصنوعی"}
           className={`px-2.5 py-1 rounded-full border text-[11px] font-medium inline-flex items-center gap-1.5 transition ${
             isCheckingConnection
-              ? "bg-white/[0.04] border-white/[0.08] text-mab-text-muted"
+              ? "bg-white/[0.04] border-mab-border text-mab-text-muted"
               : isConnected
-              ? "bg-emerald-500/10 border-emerald-500/25 text-emerald-400 hover:bg-emerald-500/15"
-              : "bg-rose-500/10 border-rose-500/25 text-rose-400 hover:bg-rose-500/15"
+              ? "bg-emerald-500/10 border-emerald-500/25 text-emerald-400 hover:bg-emerald-500/20"
+              : "bg-rose-500/10 border-rose-500/25 text-rose-400 hover:bg-rose-500/20"
           }`}
         >
           {isCheckingConnection ? (
@@ -151,7 +151,7 @@ export function HeaderBar({
           onClick={onSyncMabFocus}
           disabled={isSyncing}
           title="همگام‌سازی لاگ‌ها و وضعیت با اپلیکیشن Mab-Focus"
-          className="px-2.5 py-1 rounded-full bg-white/[0.04] border border-white/[0.08] text-mab-text-secondary hover:text-white hover:bg-white/[0.08] text-[11px] font-medium flex items-center gap-1.5 transition disabled:opacity-50"
+          className="px-2.5 py-1 rounded-full bg-white/[0.04] border border-mab-border text-mab-text-secondary hover:text-white hover:bg-white/[0.08] text-[11px] font-medium flex items-center gap-1.5 transition disabled:opacity-50"
         >
           <RefreshCw
             className={`w-3 h-3 text-blue-400 ${isSyncing ? "animate-spin" : ""}`}
@@ -159,12 +159,12 @@ export function HeaderBar({
           <span className="hidden sm:inline">{isSyncing ? "سینک..." : "سینک با Focus"}</span>
         </button>
 
-        {/* Export Excel Button */}
+        {/* Export Excel Button (Refined Anytype ghost pill with subtle emerald tint) */}
         <button
           type="button"
           onClick={onExportExcel}
           title="تولید شیت گزارش خروجی اکسل کارفرما"
-          className="px-2.5 py-1 rounded-full bg-emerald-600/90 hover:bg-emerald-500 text-white text-[11px] font-semibold flex items-center gap-1.5 shadow-sm transition"
+          className="px-2.5 py-1 rounded-full bg-emerald-500/10 hover:bg-emerald-500/20 border border-emerald-500/25 text-emerald-400 text-[11px] font-medium flex items-center gap-1.5 transition"
         >
           <FileSpreadsheet className="w-3.5 h-3.5" />
           <span className="hidden md:inline">اکسل کارفرما</span>
@@ -173,8 +173,8 @@ export function HeaderBar({
         {/* Separator before window controls */}
         <div className="w-[1px] h-4 bg-white/[0.1] mx-0.5" />
 
-        {/* Native Frameless Window Controls */}
-        <div dir="ltr" className="flex items-center h-[46px] -mr-2 sm:-mr-3">
+        {/* Native Frameless Window Controls - RTL alignment bug fixed with -ml-2 sm:-ml-3 */}
+        <div dir="ltr" className="flex items-center h-[46px] -ml-2 sm:-ml-3">
           <button
             type="button"
             onClick={() => appWindow.minimize()}
@@ -204,3 +204,5 @@ export function HeaderBar({
     </header>
   );
 }
+
+export default HeaderBar;

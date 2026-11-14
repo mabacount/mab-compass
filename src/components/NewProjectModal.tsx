@@ -26,10 +26,10 @@ export function NewProjectModal({ open, onClose, onCreate }: NewProjectModalProp
       onClick={onClose}
     >
       <div
-        className="bg-[#18191E] border border-white/[0.1] w-full max-w-[440px] p-6 space-y-4 rounded-2xl shadow-mab-modal"
+        className="bg-mab-surface border border-mab-border w-full max-w-[440px] p-6 space-y-4 rounded-2xl shadow-2xl"
         onClick={(e) => e.stopPropagation()}
       >
-        <div className="flex items-center justify-between border-b border-white/[0.06] pb-3">
+        <div className="flex items-center justify-between border-b border-mab-border pb-3">
           <div className="flex items-center gap-2">
             <div className="w-7 h-7 rounded-lg bg-blue-500/15 border border-blue-500/30 flex items-center justify-center text-blue-400">
               <FolderPlus className="w-4 h-4" />
@@ -77,7 +77,7 @@ export function NewProjectModal({ open, onClose, onCreate }: NewProjectModalProp
           </div>
         </div>
 
-        <div className="flex justify-end gap-2 pt-3 border-t border-white/[0.06]">
+        <div className="flex justify-end gap-2 pt-3 border-t border-mab-border">
           <button
             type="button"
             onClick={onClose}
@@ -98,3 +98,5 @@ export function NewProjectModal({ open, onClose, onCreate }: NewProjectModalProp
     </div>
   );
 }
+
+export default NewProjectModal;

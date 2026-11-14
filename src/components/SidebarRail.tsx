@@ -94,7 +94,7 @@ export function SidebarRail({
   ];
 
   /* -------------------------------------------------------------------------- */
-  /* Collapsed Rail (Width 64px)                                                 */
+  /* Collapsed Rail (Width 60px)                                                 */
   /* -------------------------------------------------------------------------- */
   if (isCollapsed) {
     return (
@@ -105,12 +105,12 @@ export function SidebarRail({
             type="button"
             onClick={onToggleCollapse}
             title="باز کردن نوار کناری"
-            className="w-9 h-9 rounded-lg bg-white/[0.04] border border-white/[0.08] text-mab-text-secondary hover:text-white hover:bg-white/[0.08] flex items-center justify-center transition"
+            className="w-9 h-9 rounded-lg bg-white/[0.03] border border-mab-border text-mab-text-secondary hover:text-white hover:bg-white/[0.08] flex items-center justify-center transition"
           >
             <PanelRightOpen className="w-4 h-4" />
           </button>
 
-          <div className="w-7 border-t border-white/[0.08]" />
+          <div className="w-7 border-t border-mab-border" />
 
           {/* Navigation view icons */}
           <nav className="flex flex-col items-center gap-1.5 w-full">
@@ -140,7 +140,7 @@ export function SidebarRail({
             })}
           </nav>
 
-          <div className="w-7 border-t border-white/[0.08]" />
+          <div className="w-7 border-t border-mab-border" />
 
           {/* Projects avatar list */}
           <div className="flex flex-col items-center gap-1.5 w-full">
@@ -153,7 +153,7 @@ export function SidebarRail({
                 className={`w-9 h-9 rounded-lg font-mono text-[10.5px] font-bold flex items-center justify-center transition ${
                   p.is_active
                     ? "bg-white/[0.1] border border-white/[0.2] text-white shadow-sm"
-                    : "bg-white/[0.02] border border-white/[0.06] text-mab-text-muted hover:text-white hover:bg-white/[0.05]"
+                    : "bg-white/[0.02] border border-mab-border text-mab-text-muted hover:text-white hover:bg-white/[0.05]"
                 }`}
               >
                 {p.id.slice(0, 3)}
@@ -174,7 +174,7 @@ export function SidebarRail({
         {/* Bottom memory dot */}
         <div
           title={`${dash.raw_events_count} رویداد در حافظه SQLite`}
-          className="w-9 h-9 rounded-lg bg-white/[0.02] border border-white/[0.06] flex flex-col items-center justify-center text-blue-400/80"
+          className="w-9 h-9 rounded-lg bg-white/[0.02] border border-mab-border flex flex-col items-center justify-center text-blue-400/80"
         >
           <Database className="w-3.5 h-3.5" />
           <span className="font-timer text-[8.5px] font-bold text-white/50">
@@ -194,14 +194,14 @@ export function SidebarRail({
         {/* Workspace Brand / Header */}
         <div className="px-1 py-0.5 flex items-center justify-between shrink-0 gap-2">
           <div className="flex items-center gap-2 min-w-0">
-            <div className="w-6 h-6 rounded-md bg-gradient-to-br from-blue-500 via-indigo-500 to-purple-600 flex items-center justify-center shadow-sm text-white shrink-0">
+            <div className="w-6 h-6 rounded-lg bg-white/[0.05] border border-white/[0.08] flex items-center justify-center shadow-sm text-blue-400 shrink-0">
               <Compass className="w-3.5 h-3.5" />
             </div>
             <div className="min-w-0 flex items-center gap-1.5">
               <span className="font-bold text-[13px] text-white tracking-tight truncate">
                 Mab-Compass
               </span>
-              <span className="px-1.5 py-0.5 rounded-full bg-white/[0.06] border border-white/[0.08] text-[9.5px] font-mono text-white/60">
+              <span className="px-1.5 py-0.5 rounded-full bg-white/[0.05] border border-mab-border text-[9.5px] font-mono text-white/60">
                 v2.0
               </span>
             </div>
@@ -228,8 +228,8 @@ export function SidebarRail({
                 onClick={() => onSelectTab(item.id)}
                 className={`w-full flex items-center justify-between px-2.5 py-2 rounded-lg text-[12.5px] transition group ${
                   selected
-                    ? "bg-white/[0.08] text-white font-semibold shadow-sm"
-                    : "text-mab-text-secondary hover:bg-white/[0.04] hover:text-white"
+                    ? "bg-white/[0.08] text-white font-medium border border-white/[0.1] shadow-sm"
+                    : "text-mab-text-secondary hover:bg-white/[0.04] hover:text-white border border-transparent"
                 }`}
               >
                 <div className="flex items-center gap-2.5 min-w-0">
@@ -258,7 +258,7 @@ export function SidebarRail({
           })}
         </nav>
 
-        <div className="border-t border-white/[0.06]" />
+        <div className="border-t border-mab-border" />
 
         {/* Section 2: Projects & Nested Chat History */}
         <div className="space-y-1.5 flex-1 min-h-0 flex flex-col">
@@ -284,12 +284,12 @@ export function SidebarRail({
 
               return (
                 <div key={p.id} className="space-y-0.5">
-                  {/* Project Row */}
+                  {/* Project Row with clean Anytype subtle highlight */}
                   <div
                     className={`w-full flex items-center justify-between rounded-lg transition ${
                       p.is_active
-                        ? "bg-blue-500/[0.12] border border-blue-500/30 text-white font-medium"
-                        : "text-mab-text-secondary hover:bg-white/[0.04] hover:text-white"
+                        ? "bg-white/[0.08] border border-white/[0.12] text-white font-medium shadow-sm"
+                        : "text-mab-text-secondary hover:bg-white/[0.04] hover:text-white border border-transparent"
                     }`}
                   >
                     <button
@@ -297,7 +297,12 @@ export function SidebarRail({
                       onClick={() => onSwitchProject(p.id)}
                       className="flex-1 flex items-center justify-between px-2.5 py-1.5 text-[12.5px] min-w-0 text-right"
                     >
-                      <span className="truncate">{p.name}</span>
+                      <div className="flex items-center gap-1.5 truncate">
+                        {p.is_active && (
+                          <span className="w-1.5 h-1.5 rounded-full bg-blue-500 shrink-0" />
+                        )}
+                        <span className="truncate">{p.name}</span>
+                      </div>
                       <span className="font-mono text-[10px] opacity-60 shrink-0 mr-1.5">
                         {p.id}
                       </span>
@@ -318,7 +323,7 @@ export function SidebarRail({
 
                   {/* Sub-tree: Project's Chat Sessions */}
                   {isExpanded && (
-                    <div className="pr-2 mr-2 border-r border-white/[0.08] space-y-0.5 py-0.5">
+                    <div className="pr-2 mr-2 border-r border-mab-border space-y-0.5 py-0.5">
                       <div className="flex items-center justify-between px-1.5 py-0.5">
                         <span className="text-[10.5px] text-mab-text-muted">
                           گفتگوها ({projSessions.length})
@@ -414,8 +419,8 @@ export function SidebarRail({
         </div>
       </div>
 
-      {/* Bottom Minimalist Status Bar (Anytype style) */}
-      <div className="pt-2 mt-2 border-t border-white/[0.06] space-y-1.5 text-[11px] shrink-0">
+      {/* Bottom Minimalist Status Bar (Anytype style) with fixed path clipping */}
+      <div className="pt-2 mt-2 border-t border-mab-border space-y-1.5 text-[11px] shrink-0">
         <div className="flex items-center justify-between text-mab-text-muted px-1">
           <span className="flex items-center gap-1.5">
             <Database className="w-3 h-3 text-blue-400" />
@@ -426,9 +431,13 @@ export function SidebarRail({
           </span>
         </div>
 
-        <div className="flex items-center gap-1 text-[10px] text-mab-text-muted px-1 truncate bidi-ltr">
-          <FolderOpen className="w-3 h-3 text-emerald-400/80 shrink-0" />
-          <span className="truncate" title={dash.active_project.workspace_path}>
+        <div
+          dir="ltr"
+          className="flex items-center gap-1.5 text-[10.5px] text-mab-text-muted px-1 rounded-md bg-white/[0.02] border border-mab-border py-1 overflow-hidden"
+          title={dash.active_project.workspace_path}
+        >
+          <FolderOpen className="w-3.5 h-3.5 text-emerald-400/80 shrink-0" />
+          <span className="truncate font-mono select-text" dir="ltr">
             {dash.active_project.workspace_path}
           </span>
         </div>
@@ -436,3 +445,5 @@ export function SidebarRail({
     </aside>
   );
 }
+
+export default SidebarRail;

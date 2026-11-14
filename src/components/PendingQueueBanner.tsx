@@ -53,7 +53,7 @@ export function PendingQueueBanner({
   const isConnected = connectionStatus?.connected ?? false;
 
   return (
-    <div className="mab-card border-amber-500/30 bg-[#16171B] p-3 space-y-2.5 shrink-0 shadow-sm select-text">
+    <div className="mab-card border-amber-500/30 bg-mab-surface p-3.5 space-y-2.5 shrink-0 shadow-sm select-text">
       <div className="flex items-center justify-between gap-2.5 flex-wrap">
         <div className="flex items-center gap-2.5 min-w-0 flex-1">
           <div className="w-8 h-8 rounded-lg bg-amber-500/15 border border-amber-500/30 text-amber-400 flex items-center justify-center shrink-0">
@@ -73,7 +73,7 @@ export function PendingQueueBanner({
               <span
                 className={`px-2 py-0.5 rounded-full text-[10.5px] font-medium inline-flex items-center gap-1 border ${
                   isCheckingConnection
-                    ? "bg-white/[0.04] border-white/[0.08] text-white/50"
+                    ? "bg-white/[0.04] border-mab-border text-white/50"
                     : isConnected
                     ? "bg-emerald-500/15 border-emerald-500/30 text-emerald-300"
                     : "bg-rose-500/15 border-rose-500/30 text-rose-300"
@@ -116,7 +116,7 @@ export function PendingQueueBanner({
             type="button"
             onClick={onRecheckConnection}
             disabled={isCheckingConnection || isProcessingQueue}
-            className="px-2.5 py-1 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.08] text-white/70 hover:text-white text-[11px] font-medium inline-flex items-center gap-1 transition disabled:opacity-50"
+            className="px-2.5 py-1 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] border border-mab-border text-white/70 hover:text-white text-[11px] font-medium inline-flex items-center gap-1 transition disabled:opacity-50"
           >
             <RefreshCw
               className={`w-3 h-3 ${isCheckingConnection ? "animate-spin" : ""}`}
@@ -130,7 +130,7 @@ export function PendingQueueBanner({
             className={`px-2.5 py-1 rounded-lg border text-[11px] font-medium inline-flex items-center gap-1 transition ${
               autoQueueEnabled
                 ? "bg-emerald-500/15 border-emerald-500/30 text-emerald-300"
-                : "bg-white/[0.04] border-white/[0.08] text-white/70"
+                : "bg-white/[0.04] border-mab-border text-white/70"
             }`}
           >
             {autoQueueEnabled ? (
@@ -154,7 +154,7 @@ export function PendingQueueBanner({
           <button
             type="button"
             onClick={() => setIsExpanded((v) => !v)}
-            className="p-1 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.08] text-white/70 hover:text-white transition"
+            className="p-1 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] border border-mab-border text-white/70 hover:text-white transition"
             title={isExpanded ? "بستن لیست" : "مشاهده لیست موارد"}
           >
             {isExpanded ? (
@@ -167,13 +167,13 @@ export function PendingQueueBanner({
       </div>
 
       {isExpanded && (
-        <div className="pt-2 border-t border-white/[0.06] space-y-1.5 max-h-56 overflow-y-auto">
+        <div className="pt-2 border-t border-mab-border space-y-1.5 max-h-56 overflow-y-auto">
           {queue.map((item, idx) => {
             const isItemBusy = processingQueueId === item.id;
             return (
               <div
                 key={item.id}
-                className="p-2.5 rounded-xl bg-white/[0.02] border border-white/[0.06] flex items-center justify-between gap-3 flex-wrap sm:flex-nowrap"
+                className="p-2.5 rounded-xl bg-white/[0.02] border border-mab-border flex items-center justify-between gap-3 flex-wrap sm:flex-nowrap"
               >
                 <div className="min-w-0 flex-1 space-y-0.5">
                   <div className="flex items-center gap-1.5 flex-wrap text-[11.5px]">
@@ -243,3 +243,5 @@ export function PendingQueueBanner({
     </div>
   );
 }
+
+export default PendingQueueBanner;
