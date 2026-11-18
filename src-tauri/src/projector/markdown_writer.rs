@@ -187,6 +187,7 @@ mod tests {
                 external_focus_id: Some("GERDALO".into()),
                 is_active: true,
                 updated_at: "2026-11-11".into(),
+                ..Default::default()
             },
             next_step_task: Some(WorkEntity {
                 id: "TSK-101".into(),
@@ -205,6 +206,7 @@ mod tests {
                 superseded_by_id: None,
                 stakeholder_tag: None,
                 updated_at: "2026-11-11".into(),
+                ..Default::default()
             }),
             horizon_tasks: vec![],
             active_guardrails: vec![LearnedAntipattern {
@@ -242,6 +244,7 @@ mod tests {
                 superseded_by_id: None,
                 stakeholder_tag: Some("@Architect".into()),
                 updated_at: "2026-11-11".into(),
+                ..Default::default()
             }],
             recent_logs: vec![SessionWorkLog {
                 id: 1,
@@ -279,6 +282,7 @@ mod tests {
             },
             can_undo: false,
             last_undo_summary: None,
+            ..Default::default()
         };
 
         sync_all_project_projections(

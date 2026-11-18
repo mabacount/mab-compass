@@ -5,6 +5,9 @@ import {
   CompassApi,
   DashboardState,
   LlmConnectionStatus,
+  Outcome,
+  WorkEntity,
+  WorkLine,
   fileToBase64,
 } from "./lib/tauri_api";
 import { HeaderBar } from "./components/HeaderBar";
@@ -12,17 +15,47 @@ import { SidebarRail, AppTab } from "./components/SidebarRail";
 import { PathAndChatView } from "./components/PathAndChatView";
 import { KnowledgeVaultView } from "./components/KnowledgeVaultView";
 import { WbsAndDocsView } from "./components/WbsAndDocsView";
+import { EcosystemAndCardsView } from "./components/EcosystemAndCardsView";
 import { SettingsView } from "./components/SettingsView";
 import { NewProjectModal } from "./components/NewProjectModal";
+import { OutcomeModal, OutcomeFormValues } from "./components/OutcomeModal";
+import {
+  WorkLineModal,
+  WorkLineCreatePayload,
+  WorkLineUpdatePayload,
+} from "./components/WorkLineModal";
+import {
+  TaskModal,
+  ManualTaskPayload,
+  TaskAssignPayload,
+} from "./components/TaskModal";
 import { PendingQueueBanner } from "./components/PendingQueueBanner";
 
 export default function App() {
   const [dash, setDash] = useState<DashboardState | null>(null);
   const [activeTab, setActiveTab] = useState<AppTab>("PATH_AND_CHAT");
   const [isFullChatMode, setIsFullChatMode] = useState(false);
-  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState<boolean>(() =>
-    typeof window !== "undefined" ? window.innerWidth < 960 : false
+  const [isNarrowViewport, setIsNarrowViewport] = useState<boolean>(() =>
+    typeof window !== "undefined" ? window.innerWidth < 768 : false
   );
+  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState<boolean>(() =>
+    typeof window !== "undefined" ? window.innerWidth < 1024 : false
+  );
+  const [sidebarWidth, setSidebarWidth] = useState<number>(() => {
+    if (typeof window === "undefined") return 255;
+    const saved = Number(window.localStorage.getItem("mab_compass_sidebar_width"));
+    return Number.isFinite(saved) && saved >= 190 && saved <= 440 ? saved : 255;
+  });
+  const [isDraggingSidebar, setIsDraggingSidebar] = useState(false);
+  const sidebarDragRef = useRef<{ startX: number; startWidth: number } | null>(null);
+
+  // Modals for manual 5-Layer management
+  const [showOutcomeModal, setShowOutcomeModal] = useState(false);
+  const [editingOutcome, setEditingOutcome] = useState<Outcome | null>(null);
+  const [showWorkLineModal, setShowWorkLineModal] = useState(false);
+  const [editingWorkLine, setEditingWorkLine] = useState<WorkLine | null>(null);
+  const [showTaskModal, setShowTaskModal] = useState(false);
+  const [editingTask, setEditingTask] = useState<WorkEntity | null>(null);
 
   const [chatInput, setChatInput] = useState("");
   const [isSendingChat, setIsSendingChat] = useState(false);
@@ -76,6 +109,63 @@ export default function App() {
       setIsCheckingConnection(false);
     }
   }, []);
+
+  // شنود تغییر اندازه پنجره برای ریسپانسیو هوشمند سایدبار و پنل‌ها
+  useEffect(() => {
+    const onResize = () => {
+      const w = window.innerWidth;
+      setIsNarrowViewport(w < 768);
+      if (w < 1024) {
+        setIsSidebarCollapsed(true);
+      }
+    };
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
+  // کشیدن لبه سایدبار راست (سبک VS Code) برای تغییر عرض
+  useEffect(() => {
+    if (!isDraggingSidebar) return;
+    const handleMouseMove = (e: MouseEvent) => {
+      const ref = sidebarDragRef.current;
+      if (!ref) return;
+      // در RTL سایدبار در سمت راست است؛ کشیدن به چپ عرض را افزایش می‌دهد
+      const nextWidth = Math.max(
+        190,
+        Math.min(440, ref.startWidth + (ref.startX - e.clientX))
+      );
+      setSidebarWidth(nextWidth);
+    };
+    const handleMouseUp = () => {
+      setIsDraggingSidebar(false);
+      sidebarDragRef.current = null;
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    window.addEventListener("mousemove", handleMouseMove);
+    window.addEventListener("mouseup", handleMouseUp);
+    return () => {
+      window.removeEventListener("mousemove", handleMouseMove);
+      window.removeEventListener("mouseup", handleMouseUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+  }, [isDraggingSidebar]);
+
+  useEffect(() => {
+    if (!isDraggingSidebar) {
+      try {
+        window.localStorage.setItem(
+          "mab_compass_sidebar_width",
+          String(Math.round(sidebarWidth))
+        );
+      } catch {
+        // Ignore storage errors
+      }
+    }
+  }, [isDraggingSidebar, sidebarWidth]);
 
   // بارگذاری اولیه داشبورد + اسکن پیام‌ها/اسناد پردازش‌نشده + تست اولیه اتصال
   useEffect(() => {
@@ -312,6 +402,7 @@ export default function App() {
             docType: committed.doc_type,
             extractedText: committed.extracted_text,
             combinedPromptText: committed.combined_prompt_text,
+            knowledgeDocId: committed.knowledge_doc_id ?? null,
           });
           setDash(outcome.dashboard);
           if (outcome.assistant_error) {
@@ -438,6 +529,16 @@ export default function App() {
       showToast("گام فعلی مختومه شد و گام بعدی در ریل پیش‌رو قرار گرفت!");
     } catch (e: unknown) {
       showToast(`خطا در بستن گام: ${String(e)}`);
+    }
+  };
+
+  const handleStartTask = async (taskId: string) => {
+    try {
+      const updated = await CompassApi.startTaskStep(taskId);
+      setDash(updated);
+      showToast(`گام [${taskId}] وارد وضعیت «در حال اجرا» شد.`);
+    } catch (e: unknown) {
+      showToast(`خطا در شروع گام: ${String(e)}`);
     }
   };
 
@@ -584,6 +685,7 @@ export default function App() {
           docType: committed.doc_type,
           extractedText: committed.extracted_text,
           combinedPromptText: committed.combined_prompt_text,
+          knowledgeDocId: committed.knowledge_doc_id ?? null,
         });
         setDash(outcome.dashboard);
         if (outcome.assistant_error) {
@@ -641,6 +743,7 @@ export default function App() {
         docType: committed.doc_type,
         extractedText: committed.extracted_text,
         combinedPromptText: committed.combined_prompt_text,
+        knowledgeDocId: committed.knowledge_doc_id ?? null,
       });
       setDash(outcome.dashboard);
       if (outcome.assistant_error) {
@@ -691,6 +794,170 @@ export default function App() {
     }
   };
 
+  const handleReorderQueueItem = async (
+    queueId: number,
+    direction: "TOP" | "UP" | "DOWN"
+  ) => {
+    try {
+      const updated = await CompassApi.reorderPendingQueueItem(queueId, direction);
+      setDash(updated);
+    } catch (e: unknown) {
+      showToast(`خطا در تغییر اولویت صف: ${String(e)}`);
+    }
+  };
+
+  const handleResetQueueOrder = async () => {
+    try {
+      const updated = await CompassApi.resetPendingQueueOrder();
+      setDash(updated);
+      showToast("ترتیب صف به ترتیب زمانی ایجاد بازنشانی شد.");
+    } catch (e: unknown) {
+      showToast(`خطا در بازنشانی ترتیب صف: ${String(e)}`);
+    }
+  };
+
+  const handleRequeueDoc = async (docId: number) => {
+    try {
+      const updated = await CompassApi.requeueKnowledgeDoc(docId);
+      setDash(updated);
+      showToast("سند به وضعیت «پردازش‌نشده» برگشت و وارد صف پردازش شد.");
+    } catch (e: unknown) {
+      showToast(`خطا در ارسال مجدد سند به صف: ${String(e)}`);
+    }
+  };
+
+  const handleUpsertOutcome = async (values: OutcomeFormValues) => {
+    try {
+      const updated = await CompassApi.upsertOutcome(values);
+      setDash(updated);
+      showToast(
+        values.outcomeId
+          ? "Outcome با موفقیت ویرایش شد."
+          : "Outcome جدید با موفقیت ایجاد شد."
+      );
+    } catch (e: unknown) {
+      showToast(`خطا در ذخیره Outcome: ${String(e)}`);
+    }
+  };
+
+  const handleDeleteOutcome = async (outcomeId: string) => {
+    try {
+      const updated = await CompassApi.deleteOutcome(outcomeId);
+      setDash(updated);
+      showToast("Outcome حذف شد (تسک‌ها و لاین‌های متصل حفظ شدند).");
+    } catch (e: unknown) {
+      showToast(`خطا در حذف Outcome: ${String(e)}`);
+    }
+  };
+
+  const handleCreateWorkLine = async (payload: WorkLineCreatePayload) => {
+    try {
+      const res = await CompassApi.createWorkLineChain({
+        project_id: dash.active_project.id,
+        ...payload,
+      });
+      if (res.dashboard) {
+        setDash(res.dashboard);
+      } else {
+        const refreshed = await CompassApi.getDashboard();
+        setDash(refreshed);
+      }
+      showToast("لاین کاری جدید ساخته شد.");
+    } catch (e: unknown) {
+      showToast(`خطا در ساخت لاین کاری: ${String(e)}`);
+    }
+  };
+
+  const handleUpdateWorkLine = async (payload: WorkLineUpdatePayload) => {
+    try {
+      const updated = await CompassApi.updateWorkLine(payload);
+      setDash(updated);
+      showToast("لاین کاری به‌روزرسانی شد.");
+    } catch (e: unknown) {
+      showToast(`خطا در ویرایش لاین کاری: ${String(e)}`);
+    }
+  };
+
+  const handleCreateManualTask = async (payload: ManualTaskPayload) => {
+    try {
+      const updated = await CompassApi.createTaskManual(payload);
+      setDash(updated);
+      showToast("تسک جدید با موفقیت ساخته شد.");
+    } catch (e: unknown) {
+      showToast(`خطا در ساخت تسک: ${String(e)}`);
+    }
+  };
+
+  const handleAssignTaskGrouping = async (payload: TaskAssignPayload) => {
+    try {
+      const updated = await CompassApi.assignTaskGrouping(payload);
+      setDash(updated);
+      showToast("تخصیص تسک به لاین کاری / Outcome ذخیره شد.");
+    } catch (e: unknown) {
+      showToast(`خطا در تخصیص تسک: ${String(e)}`);
+    }
+  };
+
+  const handleCreateVaultCard = async (params: {
+    realm: string;
+    domainCode: string;
+    itemType: string;
+    title: string;
+    contentMarkdown: string;
+    tags: string[];
+    attachToActiveProject: boolean;
+  }) => {
+    try {
+      const updated = await CompassApi.createPersonalVaultItem(params);
+      setDash(updated);
+      showToast("کارت دانش جدید با موفقیت ثبت شد.");
+    } catch (e: unknown) {
+      showToast(`خطا در ثبت کارت دانش: ${String(e)}`);
+    }
+  };
+
+  const handleDeleteVaultCard = async (itemId: string) => {
+    try {
+      const updated = await CompassApi.deletePersonalVaultItem(itemId);
+      setDash(updated);
+      showToast("کارت دانش حذف شد.");
+    } catch (e: unknown) {
+      showToast(`خطا در حذف کارت دانش: ${String(e)}`);
+    }
+  };
+
+  const handleResolveProposal = async (
+    proposalId: string,
+    approve: boolean
+  ) => {
+    try {
+      const updated = await CompassApi.resolvePendingProposal(
+        proposalId,
+        approve
+      );
+      setDash(updated);
+      showToast(approve ? "پیشنهاد تایید شد." : "پیشنهاد رد شد.");
+    } catch (e: unknown) {
+      showToast(`خطا در پردازش پیشنهاد: ${String(e)}`);
+    }
+  };
+
+  const handleUpsertCalendarDay = async (params: {
+    dateKey: string;
+    totalCapacityMinutes: number;
+    deepCapacityMinutes: number;
+    dayNote: string;
+    isOffDay: boolean;
+  }) => {
+    try {
+      const updated = await CompassApi.upsertCalendarDay(params);
+      setDash(updated);
+      showToast(`ظرفیت روز ${params.dateKey} ذخیره شد.`);
+    } catch (e: unknown) {
+      showToast(`خطا در ذخیره تقویم: ${String(e)}`);
+    }
+  };
+
   const isSplitDesktopWorkspace =
     activeTab === "PATH_AND_CHAT" || activeTab === "KNOWLEDGE_VAULT";
 
@@ -712,11 +979,13 @@ export default function App() {
         onExportExcel={handleExportExcel}
       />
 
-      <div className="flex-1 flex overflow-hidden min-h-0">
+      <div className="flex-1 flex overflow-hidden min-h-0 relative">
         <SidebarRail
           dash={dash}
           activeTab={activeTab}
           isCollapsed={isSidebarCollapsed}
+          isNarrowViewport={isNarrowViewport}
+          sidebarWidth={sidebarWidth}
           onToggleCollapse={() => setIsSidebarCollapsed((v) => !v)}
           onSelectTab={setActiveTab}
           onSwitchProject={handleSwitchProject}
@@ -726,7 +995,34 @@ export default function App() {
           onDeleteChatSession={handleDeleteChatSession}
         />
 
-        <main className="flex-1 p-3 sm:p-4 min-h-0 flex flex-col gap-3 overflow-hidden">
+        {/* VS Code–style Draggable Sidebar Sash */}
+        {!isSidebarCollapsed && !isNarrowViewport && (
+          <div
+            role="separator"
+            aria-orientation="vertical"
+            title="بکشید برای تغییر عرض فهرست راست (دوبار کلیک برای بازنشانی)"
+            onMouseDown={(e) => {
+              e.preventDefault();
+              sidebarDragRef.current = {
+                startX: e.clientX,
+                startWidth: sidebarWidth,
+              };
+              setIsDraggingSidebar(true);
+            }}
+            onDoubleClick={() => setSidebarWidth(255)}
+            className="w-2 -mr-1 z-30 shrink-0 cursor-col-resize flex items-center justify-center group select-none"
+          >
+            <div
+              className={`w-[3px] h-full transition-colors duration-150 ${
+                isDraggingSidebar
+                  ? "bg-blue-500 shadow-[0_0_8px_rgba(59,130,246,0.65)]"
+                  : "bg-transparent group-hover:bg-blue-500/75"
+              }`}
+            />
+          </div>
+        )}
+
+        <main className="flex-1 min-w-0 p-2.5 sm:p-4 min-h-0 flex flex-col gap-3 overflow-hidden">
           <PendingQueueBanner
             queue={dash.pending_queue}
             connectionStatus={connectionStatus}
@@ -745,12 +1041,14 @@ export default function App() {
               void runQueueDrain(true);
             }}
             onProcessSingleItem={(id) => void handleProcessSingleQueueItem(id)}
+            onReorderItem={(id, dir) => void handleReorderQueueItem(id, dir)}
+            onResetQueueOrder={() => void handleResetQueueOrder()}
             onDismissItem={(id) => void handleDismissQueueItem(id)}
             onOpenSettings={() => setActiveTab("SETTINGS")}
           />
 
           <div
-            className={`flex-1 min-h-0 ${
+            className={`flex-1 min-h-0 min-w-0 ${
               isSplitDesktopWorkspace
                 ? "overflow-y-auto lg:overflow-hidden"
                 : "overflow-y-auto"
@@ -765,6 +1063,7 @@ export default function App() {
                 }
                 allGatesPassed={allGatesPassed}
                 onQuickComplete={handleQuickComplete}
+                onStartTask={handleStartTask}
                 chatInput={chatInput}
                 onChangeChatInput={setChatInput}
                 isSendingChat={isSendingChat}
@@ -789,6 +1088,7 @@ export default function App() {
                 onBatchFilesSelected={handleBatchFilesSelected}
                 onBatchFilesDropped={(files) => void processBatchVaultFiles(files)}
                 onManualDocIngest={handleManualDocIngest}
+                onRequeueDoc={(docId) => void handleRequeueDoc(docId)}
                 vaultChatInput={vaultChatInput}
                 onChangeVaultChatInput={setVaultChatInput}
                 isSendingVaultChat={isSendingVaultChat}
@@ -807,7 +1107,56 @@ export default function App() {
             )}
 
             {activeTab === "WBS_AND_DOCS" && (
-              <WbsAndDocsView dash={dash} onQuickComplete={handleQuickComplete} />
+              <WbsAndDocsView
+                dash={dash}
+                onQuickComplete={handleQuickComplete}
+                onStartTask={handleStartTask}
+                onOpenNewOutcome={() => {
+                  setEditingOutcome(null);
+                  setShowOutcomeModal(true);
+                }}
+                onEditOutcome={(o) => {
+                  setEditingOutcome(o);
+                  setShowOutcomeModal(true);
+                }}
+                onOpenNewWorkLine={() => {
+                  setEditingWorkLine(null);
+                  setShowWorkLineModal(true);
+                }}
+                onEditWorkLine={(wl) => {
+                  setEditingWorkLine(wl);
+                  setShowWorkLineModal(true);
+                }}
+                onOpenNewTask={() => {
+                  setEditingTask(null);
+                  setShowTaskModal(true);
+                }}
+                onOpenAssignTask={(t) => {
+                  setEditingTask(t);
+                  setShowTaskModal(true);
+                }}
+              />
+            )}
+
+            {activeTab === "ECOSYSTEM_CARDS" && (
+              <EcosystemAndCardsView
+                dash={dash}
+                onOpenNewOutcome={() => {
+                  setEditingOutcome(null);
+                  setShowOutcomeModal(true);
+                }}
+                onEditOutcome={(o) => {
+                  setEditingOutcome(o);
+                  setShowOutcomeModal(true);
+                }}
+                onDeleteOutcome={(id) => void handleDeleteOutcome(id)}
+                onCreateVaultCard={handleCreateVaultCard}
+                onDeleteVaultCard={(id) => void handleDeleteVaultCard(id)}
+                onResolveProposal={(id, ok) =>
+                  void handleResolveProposal(id, ok)
+                }
+                onUpsertCalendarDay={handleUpsertCalendarDay}
+              />
             )}
 
             {activeTab === "SETTINGS" && (
@@ -828,8 +1177,35 @@ export default function App() {
         onCreate={handleCreateProject}
       />
 
+      <OutcomeModal
+        open={showOutcomeModal}
+        domains={dash.domains ?? []}
+        initialOutcome={editingOutcome}
+        onClose={() => setShowOutcomeModal(false)}
+        onSubmit={handleUpsertOutcome}
+      />
+
+      <WorkLineModal
+        open={showWorkLineModal}
+        outcomes={dash.outcomes ?? []}
+        initialWorkLine={editingWorkLine}
+        onClose={() => setShowWorkLineModal(false)}
+        onCreate={handleCreateWorkLine}
+        onUpdate={handleUpdateWorkLine}
+      />
+
+      <TaskModal
+        open={showTaskModal}
+        workLines={dash.work_lines ?? []}
+        outcomes={dash.outcomes ?? []}
+        editingTask={editingTask}
+        onClose={() => setShowTaskModal(false)}
+        onCreate={handleCreateManualTask}
+        onAssign={handleAssignTaskGrouping}
+      />
+
       {toastMsg && (
-        <div className="fixed bottom-5 left-5 max-w-md bg-[#18191E] border border-blue-500/40 text-white px-4 py-3 rounded-2xl text-[12.5px] font-medium z-50 shadow-mab-modal">
+        <div className="fixed bottom-4 left-4 right-4 sm:right-auto max-w-md bg-[#18191E] border border-blue-500/40 text-white px-4 py-3 rounded-2xl text-[12.5px] font-medium z-50 shadow-mab-modal">
           {toastMsg}
         </div>
       )}

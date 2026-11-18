@@ -121,6 +121,15 @@ mod tests {
         let tools = list_resp["result"]["tools"].as_array().unwrap();
         assert!(tools.iter().any(|t| t["name"] == "get_path_ahead"));
         assert!(tools.iter().any(|t| t["name"] == "create_work_entity"));
+        // Verify all 8 v3 tools are registered
+        assert!(tools.iter().any(|t| t["name"] == "upsert_domain_or_outcome"));
+        assert!(tools.iter().any(|t| t["name"] == "create_work_line_chain"));
+        assert!(tools.iter().any(|t| t["name"] == "append_or_reorder_work_line"));
+        assert!(tools.iter().any(|t| t["name"] == "query_tasks_by_context"));
+        assert!(tools.iter().any(|t| t["name"] == "schedule_task_on_calendar"));
+        assert!(tools.iter().any(|t| t["name"] == "propose_project_lifecycle"));
+        assert!(tools.iter().any(|t| t["name"] == "save_personal_or_lesson_item"));
+        assert!(tools.iter().any(|t| t["name"] == "open_in_right_panel"));
 
         let create_resp = handle_jsonrpc_request(
             &mut conn,
@@ -187,6 +196,42 @@ mod tests {
         )
         .unwrap();
         assert_eq!(undo_resp["result"]["isError"], false);
+
+        // Test calling v3 tool: open_in_right_panel
+        let panel_resp = handle_jsonrpc_request(
+            &mut conn,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "tools/call",
+                "params": {
+                    "name": "open_in_right_panel",
+                    "arguments": { "panel_type": "DOMAINS_OUTCOMES", "target_id": "MIND_LEARNING" }
+                }
+            }),
+        )
+        .unwrap();
+        assert_eq!(panel_resp["result"]["isError"], false);
+
+        // Test calling v3 tool: upsert_domain_or_outcome
+        let domain_resp = handle_jsonrpc_request(
+            &mut conn,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 8,
+                "method": "tools/call",
+                "params": {
+                    "name": "upsert_domain_or_outcome",
+                    "arguments": {
+                        "action": "UPDATE_DOMAIN",
+                        "domain_code": "MIND_LEARNING",
+                        "maturity_state": 4
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        assert_eq!(domain_resp["result"]["isError"], false);
 
         drop(conn);
         let _ = fs::remove_dir_all(&dir);

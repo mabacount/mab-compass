@@ -13,11 +13,12 @@
     "windows": [
       {
         "label": "main",
-        "title": "Mab-Compass v2.0 — Path Ahead & Knowledge Engine",
-        "width": 1150,
-        "height": 760,
-        "minWidth": 800,
-        "minHeight": 580,
+        "title": "Mab-Compass v3.0 — Outcome, WorkLine & Knowledge Engine",
+        "width": 1220,
+        "height": 780,
+        "minWidth": 640,
+        "minHeight": 520,
+        "resizable": true,
         "decorations": false,
         "transparent": false,
         "center": true,

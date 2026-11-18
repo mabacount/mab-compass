@@ -3,13 +3,15 @@ use crate::db::queries::{
     quick_complete_task, search_raw_events_fts, undo_last_mutation,
 };
 use crate::mab_focus_sync::synchronize_with_mab_focus;
-use crate::models::{AtomicMutation, CopilotEnvelope};
+use crate::models::{AtomicMutation, ChainStepInput, CopilotEnvelope};
 use crate::projector::markdown_writer::sync_all_project_projections;
 use crate::vault_manager::archive_raw_user_input;
+use chrono::Local;
 use rusqlite::{params, Connection};
 use serde_json::{json, Map, Value};
+use uuid::Uuid;
 
-pub fn tool_definitions() -> Value {
+fn legacy_tool_definitions() -> Value {
     json!([
         {
             "name": "list_projects",
@@ -195,6 +197,211 @@ pub fn tool_definitions() -> Value {
     ])
 }
 
+fn v3_tool_definitions() -> Value {
+    json!([
+        {
+            "name": "upsert_domain_or_outcome",
+            "description": "Update CADM life domain maturity/maintenance floors or insert/update strategic outcomes (OUT-xxxx).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["UPDATE_DOMAIN", "CREATE_OUTCOME", "UPDATE_OUTCOME", "UPSERT_OUTCOME"],
+                        "description": "Action type"
+                    },
+                    "domain_code": {
+                        "type": "string",
+                        "description": "CADM domain code (MIND_LEARNING, HEALTH_ENERGY, WEALTH_FINANCE, RELATIONS, RESILIENCE, PURPOSE, SPIRITUALITY, SANCTUARY)"
+                    },
+                    "maturity_state": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 5,
+                        "description": "Maturity level 0..5"
+                    },
+                    "maintenance_floor": { "type": "string", "description": "Daily maintenance floor statement" },
+                    "desired_state": { "type": "string", "description": "Target aspirational state" },
+                    "is_growth_focus": { "type": "boolean", "description": "Whether domain is active growth focus" },
+                    "outcome_id": { "type": "string", "description": "Outcome ID (OUT-xxxx)" },
+                    "title": { "type": "string", "description": "Outcome title" },
+                    "desired_reality_change": { "type": "string", "description": "Desired reality change" },
+                    "evidence_kr": { "type": "string", "description": "Key result evidence" },
+                    "time_window": { "type": "string", "description": "Target quarter/time window (e.g. 1405-Q3)" },
+                    "status": {
+                        "type": "string",
+                        "enum": ["ACTIVE", "ACHIEVED", "PAUSED", "DROPPED"],
+                        "description": "Outcome status"
+                    },
+                    "progress_percent": { "type": "integer", "minimum": 0, "maximum": 100, "description": "Progress percentage" }
+                },
+                "required": ["action"]
+            }
+        },
+        {
+            "name": "create_work_line_chain",
+            "description": "Atomically create a WorkLine and sequential chain of tasks with 4D context tagging. Step 1 is activated (IN_PROGRESS), steps 2..N are queued (QUEUED_IN_CHAIN) and locked until previous step completes.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project_id": { "type": "string", "description": "Project ID (defaults to active project)" },
+                    "line_title": { "type": "string", "description": "WorkLine title" },
+                    "goal_statement": { "type": "string", "description": "Goal or deliverable statement" },
+                    "line_mode": { "type": "string", "enum": ["SEQUENTIAL_CHAIN", "GOAL_CLUSTER"] },
+                    "outcome_id": { "type": "string", "description": "Optional linked outcome ID (OUT-xxxx)" },
+                    "steps": {
+                        "type": "array",
+                        "description": "List of sequential task steps to create atomically",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "title": { "type": "string" },
+                                "definition_of_done": { "type": "string" },
+                                "first_physical_action": { "type": "string" },
+                                "category": { "type": "string" },
+                                "energy_tag": { "type": "string", "enum": ["DEEP_HIGH", "MEDIUM_NORMAL", "LOW_ZOMBIE"] },
+                                "duration_minutes": { "type": "integer" },
+                                "device_tag": { "type": "string", "enum": ["LAPTOP_ONLY", "PHONE_OK", "AUDIO_HANDSFREE", "ANY_DEVICE"] },
+                                "location_tags": { "type": "array", "items": { "type": "string" } },
+                                "scheduled_date": { "type": "string" },
+                                "scheduled_slot": { "type": "string" },
+                                "due_date": { "type": "string" }
+                            },
+                            "required": ["title"]
+                        }
+                    }
+                },
+                "required": ["line_title", "steps"]
+            }
+        },
+        {
+            "name": "append_or_reorder_work_line",
+            "description": "Append a new step to an existing WorkLine or modify the sequence order and predecessor dependency of existing tasks in the chain.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "work_line_id": { "type": "string", "description": "Target WorkLine ID (WLN-xxxx)" },
+                    "task_id": { "type": "string", "description": "Task ID (TSK-xxxx)" },
+                    "new_sequence_order": { "type": "integer", "minimum": 1, "description": "New 1-based sequence order" },
+                    "depends_on_task_id": { "type": ["string", "null"], "description": "New predecessor task ID or null" },
+                    "new_step": {
+                        "type": "object",
+                        "description": "New step to append to the work line",
+                        "properties": {
+                            "title": { "type": "string" },
+                            "definition_of_done": { "type": "string" },
+                            "first_physical_action": { "type": "string" },
+                            "category": { "type": "string" },
+                            "energy_tag": { "type": "string", "enum": ["DEEP_HIGH", "MEDIUM_NORMAL", "LOW_ZOMBIE"] },
+                            "duration_minutes": { "type": "integer" },
+                            "device_tag": { "type": "string", "enum": ["LAPTOP_ONLY", "PHONE_OK", "AUDIO_HANDSFREE", "ANY_DEVICE"] },
+                            "location_tags": { "type": "array", "items": { "type": "string" } }
+                        },
+                        "required": ["title"]
+                    }
+                },
+                "required": ["work_line_id"]
+            }
+        },
+        {
+            "name": "query_tasks_by_context",
+            "description": "Filter actionable tasks matching 4D execution context (Device, Location, Energy, Duration), strictly excluding chained locked tasks.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project_id": { "type": "string", "description": "Optional project ID (defaults to active project)" },
+                    "device_tag": { "type": "string", "enum": ["LAPTOP_ONLY", "PHONE_OK", "AUDIO_HANDSFREE", "ANY_DEVICE"] },
+                    "location_tag": { "type": "string", "description": "Location context (DESK, METRO_COMMUTE, CAR_DRIVING, OUTSIDE_ERRAND)" },
+                    "energy_tag": { "type": "string", "enum": ["DEEP_HIGH", "MEDIUM_NORMAL", "LOW_ZOMBIE"] },
+                    "max_minutes": { "type": "integer", "description": "Maximum minutes available" },
+                    "only_unlocked": { "type": "boolean", "default": true, "description": "Whether to exclude locked sequential chain steps" }
+                }
+            }
+        },
+        {
+            "name": "schedule_task_on_calendar",
+            "description": "Schedule a task on the daily calendar planner with date, slot, and duration, ensuring day capacity record exists.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string", "description": "Task ID (TSK-xxxx)" },
+                    "scheduled_date": { "type": "string", "description": "ISO date string (YYYY-MM-DD)" },
+                    "scheduled_slot": {
+                        "type": "string",
+                        "enum": ["MORNING_DEEP", "MIDDAY_EXEC", "EVENING_WRAP", "NIGHT_REVIEW"]
+                    },
+                    "due_date": { "type": "string", "description": "Optional due date (YYYY-MM-DD)" },
+                    "duration_minutes": { "type": "integer", "description": "Optional duration in minutes" }
+                },
+                "required": ["task_id", "scheduled_date"]
+            }
+        },
+        {
+            "name": "propose_project_lifecycle",
+            "description": "Create a human-in-the-loop pending lifecycle proposal card (CREATE_PROJECT, PAUSE_PROJECT, ARCHIVE_PROJECT, PIVOT_PATH, RESUME_PROJECT) requiring user approval in chat.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "proposal_type": {
+                        "type": "string",
+                        "enum": ["CREATE_PROJECT", "PAUSE_PROJECT", "ARCHIVE_PROJECT", "PIVOT_PATH", "RESUME_PROJECT"],
+                        "description": "Proposal action type"
+                    },
+                    "title": { "type": "string", "description": "Proposal card headline" },
+                    "rationale": { "type": "string", "description": "Strategic rationale statement" },
+                    "project_id": { "type": "string", "description": "Target project ID" },
+                    "payload_json": { "type": "string", "description": "Optional JSON payload with parameters" }
+                },
+                "required": ["proposal_type", "title"]
+            }
+        },
+        {
+            "name": "save_personal_or_lesson_item",
+            "description": "Store a lesson learned, personal interest, note, idea, or bookmark in the personal vault (PVI-xxxx).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "realm": { "type": "string", "enum": ["WORK", "LIFE", "LEARNING", "INTERESTS"] },
+                    "domain_code": { "type": "string", "description": "CADM domain code (e.g. MIND_LEARNING)" },
+                    "item_type": {
+                        "type": "string",
+                        "enum": ["LESSON_LEARNED", "INTEREST", "IDEA", "BOOKMARK", "NOTE"]
+                    },
+                    "title": { "type": "string", "description": "Item title" },
+                    "content_markdown": { "type": "string", "description": "Detailed Markdown content / lesson body" },
+                    "tags": { "type": "array", "items": { "type": "string" } },
+                    "project_id": { "type": "string" }
+                },
+                "required": ["item_type", "title", "content_markdown"]
+            }
+        },
+        {
+            "name": "open_in_right_panel",
+            "description": "Instruct the Mab-Compass UI to open or switch the right inspector drawer to a specific view and target entity.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "panel_type": {
+                        "type": "string",
+                        "enum": ["DOCUMENT", "ALL_TASKS_AND_LINES", "DOMAINS_OUTCOMES", "CALENDAR", "DECISIONS", "VAULT_DIR"]
+                    },
+                    "target_id": { "type": "string", "description": "Target entity ID, document ID, domain code, or date key" }
+                },
+                "required": ["panel_type"]
+            }
+        }
+    ])
+}
+
+pub fn tool_definitions() -> Value {
+    let mut all = legacy_tool_definitions()
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    all.extend(v3_tool_definitions().as_array().cloned().unwrap_or_default());
+    Value::Array(all)
+}
+
 pub fn copilot_envelope_json_schema() -> Value {
     json!({
         "type": "object",
@@ -302,7 +509,14 @@ pub fn openai_tools_payload() -> Value {
             let n = t["name"].as_str().unwrap_or("");
             !matches!(n, "switch_project" | "create_project")
         })
-        .map(|t| {
+        .map(|mut t| {
+            if let Some(props) = t.pointer_mut("/inputSchema/properties").and_then(|p| p.as_object_mut()) {
+                for (_k, prop) in props.iter_mut() {
+                    if let Some(prop_obj) = prop.as_object_mut() {
+                        prop_obj.remove("description");
+                    }
+                }
+            }
             json!({
                 "type": "function",
                 "function": {
@@ -382,31 +596,16 @@ fn opt_f64(args: &Value, key: &str) -> Option<f64> {
 fn empty_mutation(op: &str) -> AtomicMutation {
     AtomicMutation {
         op: op.to_string(),
-        target_id: None,
-        entity_type: None,
-        category: None,
-        title: None,
-        definition_of_done: None,
-        first_physical_action: None,
-        status: None,
-        is_on_critical_path: None,
-        optimistic_pomos: None,
-        most_likely_pomos: None,
-        pessimistic_pomos: None,
-        stakeholder_tag: None,
-        sop_rule_statement: None,
-        mistake_pattern: None,
-        preventive_gate_question: None,
-        severity_score: None,
-        effective_pomos: None,
-        deliverable_summary: None,
-        internal_friction_note: None,
-        client_sanitized_note: None,
+        ..Default::default()
     }
 }
 
 pub fn execute_tool(conn: &mut Connection, name: &str, args: &Value) -> Result<Value, String> {
     execute_tool_with_context(conn, name, args, None, None, "MCP_TOOL")
+}
+
+pub fn execute_mcp_tool(conn: &mut Connection, name: &str, args: &Value) -> Result<Value, String> {
+    execute_tool(conn, name, args)
 }
 
 pub fn execute_tool_with_context(
@@ -761,6 +960,444 @@ pub fn execute_tool_with_context(
             Ok(json!({
                 "message": msg,
                 "next_step_task": updated.next_step_task
+            }))
+        }
+        "upsert_domain_or_outcome" => {
+            let action = opt_str(args, "action")
+                .ok_or_else(|| "Missing required parameters: action".to_string())?;
+            let domain_code = opt_str(args, "domain_code").unwrap_or_default();
+            let now = Local::now().to_rfc3339();
+
+            match action.as_str() {
+                "UPDATE_DOMAIN" => {
+                    if domain_code.is_empty() {
+                        return Err("Missing required parameters: domain_code".to_string());
+                    }
+                    if let Some(maturity_val) = args.get("maturity_state").and_then(|v| v.as_i64()) {
+                        if !(0..=5).contains(&maturity_val) {
+                            return Err(format!("maturity_state {} is out of bounds (0..5)", maturity_val));
+                        }
+                        conn.execute(
+                            "UPDATE life_domains SET maturity_state = ?1, updated_at = ?2 WHERE code = ?3",
+                            params![maturity_val, now, domain_code],
+                        )
+                        .map_err(|e| e.to_string())?;
+                    }
+                    if let Some(floor) = opt_str(args, "maintenance_floor") {
+                        conn.execute(
+                            "UPDATE life_domains SET maintenance_floor = ?1, updated_at = ?2 WHERE code = ?3",
+                            params![floor, now, domain_code],
+                        )
+                        .map_err(|e| e.to_string())?;
+                    }
+                    if let Some(desired) = opt_str(args, "desired_state") {
+                        conn.execute(
+                            "UPDATE life_domains SET desired_state = ?1, updated_at = ?2 WHERE code = ?3",
+                            params![desired, now, domain_code],
+                        )
+                        .map_err(|e| e.to_string())?;
+                    }
+                    if let Some(is_focus) = args.get("is_growth_focus").and_then(|v| v.as_bool()) {
+                        conn.execute(
+                            "UPDATE life_domains SET is_growth_focus = ?1, updated_at = ?2 WHERE code = ?3",
+                            params![if is_focus { 1 } else { 0 }, now, domain_code],
+                        )
+                        .map_err(|e| e.to_string())?;
+                    }
+                    Ok(json!({
+                        "status": "ok",
+                        "action": "UPDATE_DOMAIN",
+                        "domain_code": domain_code
+                    }))
+                }
+                "CREATE_OUTCOME" | "UPSERT_OUTCOME" => {
+                    if domain_code.is_empty() {
+                        return Err("Missing required parameters: domain_code".to_string());
+                    }
+                    let outcome_id = opt_str(args, "outcome_id")
+                        .unwrap_or_else(|| format!("OUT-{}", &Uuid::new_v4().to_string()[..8].to_uppercase()));
+                    let title = opt_str(args, "title").unwrap_or_else(|| "Untitled Outcome".to_string());
+                    let desired_reality = opt_str(args, "desired_reality_change")
+                        .or_else(|| opt_str(args, "desired_reality"))
+                        .unwrap_or_default();
+                    let evidence_kr = opt_str(args, "evidence_kr")
+                        .or_else(|| opt_str(args, "success_metric"))
+                        .unwrap_or_default();
+                    let time_window = opt_str(args, "time_window").unwrap_or_else(|| "1405-Q3".to_string());
+                    let status = opt_str(args, "status").unwrap_or_else(|| "ACTIVE".to_string());
+                    let progress = opt_i32(args, "progress_percent")
+                        .or_else(|| opt_i32(args, "progress_percentage"))
+                        .unwrap_or(0);
+
+                    let exists: i64 = conn
+                        .query_row("SELECT COUNT(*) FROM outcomes WHERE id = ?1", params![outcome_id], |r| r.get(0))
+                        .unwrap_or(0);
+
+                    if exists > 0 {
+                        conn.execute(
+                            "UPDATE outcomes SET domain_code = ?1, title = ?2, desired_reality_change = ?3, desired_reality = ?3,
+                                                evidence_kr = ?4, success_metric = ?4, time_window = ?5, status = ?6,
+                                                progress_percent = ?7, progress_percentage = ?7, updated_at = ?8
+                             WHERE id = ?9",
+                            params![domain_code, title, desired_reality, evidence_kr, time_window, status, progress, now, outcome_id],
+                        )
+                        .map_err(|e| e.to_string())?;
+                    } else {
+                        conn.execute(
+                            "INSERT INTO outcomes (
+                                id, domain_code, title, desired_reality_change, evidence_kr, time_window,
+                                status, progress_percent, created_at, updated_at, desired_reality, success_metric, progress_percentage
+                            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?4, ?5, ?8)",
+                            params![outcome_id, domain_code, title, desired_reality, evidence_kr, time_window, status, progress, now],
+                        )
+                        .map_err(|e| e.to_string())?;
+                    }
+
+                    Ok(json!({
+                        "status": "ok",
+                        "action": action,
+                        "outcome_id": outcome_id,
+                        "domain_code": domain_code
+                    }))
+                }
+                "UPDATE_OUTCOME" => {
+                    let outcome_id = opt_str(args, "outcome_id")
+                        .ok_or_else(|| "Missing outcome_id for UPDATE_OUTCOME".to_string())?;
+                    if let Some(status) = opt_str(args, "status") {
+                        conn.execute(
+                            "UPDATE outcomes SET status = ?1, updated_at = ?2 WHERE id = ?3",
+                            params![status, now, outcome_id],
+                        )
+                        .map_err(|e| e.to_string())?;
+                    }
+                    if let Some(progress) = opt_i32(args, "progress_percent").or_else(|| opt_i32(args, "progress_percentage")) {
+                        conn.execute(
+                            "UPDATE outcomes SET progress_percent = ?1, progress_percentage = ?1, updated_at = ?2 WHERE id = ?3",
+                            params![progress, now, outcome_id],
+                        )
+                        .map_err(|e| e.to_string())?;
+                    }
+                    if let Some(evidence_kr) = opt_str(args, "evidence_kr").or_else(|| opt_str(args, "success_metric")) {
+                        conn.execute(
+                            "UPDATE outcomes SET evidence_kr = ?1, success_metric = ?1, updated_at = ?2 WHERE id = ?3",
+                            params![evidence_kr, now, outcome_id],
+                        )
+                        .map_err(|e| e.to_string())?;
+                    }
+                    if let Some(title) = opt_str(args, "title") {
+                        conn.execute(
+                            "UPDATE outcomes SET title = ?1, updated_at = ?2 WHERE id = ?3",
+                            params![title, now, outcome_id],
+                        )
+                        .map_err(|e| e.to_string())?;
+                    }
+                    if let Some(reality) = opt_str(args, "desired_reality_change").or_else(|| opt_str(args, "desired_reality")) {
+                        conn.execute(
+                            "UPDATE outcomes SET desired_reality_change = ?1, desired_reality = ?1, updated_at = ?2 WHERE id = ?3",
+                            params![reality, now, outcome_id],
+                        )
+                        .map_err(|e| e.to_string())?;
+                    }
+                    Ok(json!({
+                        "status": "ok",
+                        "action": "UPDATE_OUTCOME",
+                        "outcome_id": outcome_id
+                    }))
+                }
+                _ => Err(format!("Unknown action for upsert_domain_or_outcome: {}", action)),
+            }
+        }
+        "create_work_line_chain" => {
+            let pid = resolve_pid(args).unwrap_or_else(|| {
+                conn.query_row("SELECT id FROM projects WHERE is_active = 1 LIMIT 1", [], |r| r.get(0))
+                    .unwrap_or_else(|_| "GERDALO".to_string())
+            });
+            let line_title = opt_str(args, "line_title")
+                .ok_or_else(|| "Missing required parameter: line_title".to_string())?;
+            let goal_statement = opt_str(args, "goal_statement").unwrap_or_default();
+            let line_mode = opt_str(args, "line_mode").unwrap_or_else(|| "SEQUENTIAL_CHAIN".to_string());
+            let outcome_id = opt_str(args, "outcome_id");
+
+            let steps_arr = args.get("steps").and_then(|v| v.as_array())
+                .ok_or_else(|| "Missing required parameter: steps".to_string())?;
+            if steps_arr.is_empty() {
+                return Err("Chain requires at least 1 step".to_string());
+            }
+
+            let mut steps_input = Vec::with_capacity(steps_arr.len());
+            for item in steps_arr {
+                let step: ChainStepInput = serde_json::from_value(item.clone())
+                    .map_err(|e| format!("Invalid step input: {}", e))?;
+                steps_input.push(step);
+            }
+
+            let (work_line, created_tasks) = crate::db::queries::create_work_line_with_chain(
+                conn,
+                &pid,
+                outcome_id.as_deref(),
+                &line_title,
+                &goal_statement,
+                &line_mode,
+                steps_input,
+            )
+            .map_err(|e| e.to_string())?;
+
+            let task_ids: Vec<String> = created_tasks.into_iter().map(|t| t.id).collect();
+
+            Ok(json!({
+                "work_line_id": work_line.id,
+                "project_id": pid,
+                "tasks": task_ids
+            }))
+        }
+        "append_or_reorder_work_line" => {
+            let line_id = opt_str(args, "work_line_id")
+                .ok_or_else(|| "Missing required parameter: work_line_id".to_string())?;
+            let now = Local::now().to_rfc3339();
+
+            // Verify work_line exists
+            let line_exists: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM work_lines WHERE id = ?1",
+                params![line_id],
+                |r| r.get(0),
+            ).map_err(|e| e.to_string())?;
+            if line_exists == 0 {
+                return Err(format!("work_line_id '{}' not found", line_id));
+            }
+
+            if let Some(new_step_val) = args.get("new_step") {
+                let step: ChainStepInput = serde_json::from_value(new_step_val.clone())
+                    .map_err(|e| format!("Invalid new_step input: {}", e))?;
+
+                let (max_seq, last_id): (i32, Option<String>) = conn
+                    .query_row(
+                        "SELECT COALESCE(MAX(sequence_order), 0), (SELECT id FROM work_entities WHERE work_line_id = ?1 ORDER BY sequence_order DESC LIMIT 1) FROM work_entities WHERE work_line_id = ?1",
+                        params![line_id],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .unwrap_or((0, None));
+
+                let new_seq = max_seq + 1;
+                let new_task_id = format!("TSK-{}", &Uuid::new_v4().to_string()[..8].to_uppercase());
+                let is_step_one = max_seq == 0;
+                let status = if is_step_one { "IN_PROGRESS" } else { "QUEUED_IN_CHAIN" };
+                let is_locked = if is_step_one { 0 } else { 1 };
+                let depends_on = if is_step_one { None } else { last_id };
+
+                let project_id: String = conn.query_row(
+                    "SELECT project_id FROM work_lines WHERE id = ?1",
+                    params![line_id],
+                    |r| r.get(0),
+                ).map_err(|e| e.to_string())?;
+
+                let locs_json = serde_json::to_string(&step.location_tags)
+                    .unwrap_or_else(|_| "[\"DESK\"]".to_string());
+
+                conn.execute(
+                    "INSERT INTO work_entities (
+                        id, project_id, entity_type, category, title, definition_of_done, first_physical_action,
+                        status, is_on_critical_path, optimistic_pomos, most_likely_pomos, pessimistic_pomos, calibrated_pomos,
+                        work_line_id, sequence_order, depends_on_task_id, is_locked_by_chain,
+                        energy_tag, duration_minutes, device_tag, location_tags_json, priority_score, updated_at
+                    ) VALUES (
+                        ?1, ?2, 'TASK', ?3, ?4, ?5, ?6,
+                        ?7, ?8, 1.0, 2.0, 3.0, 2.0,
+                        ?9, ?10, ?11, ?12,
+                        ?13, ?14, ?15, ?16, 50, ?17
+                    )",
+                    params![
+                        new_task_id, project_id, step.category, step.title, step.definition_of_done, step.first_physical_action,
+                        status, if is_step_one { 1 } else { 0 },
+                        line_id, new_seq, depends_on, is_locked,
+                        step.energy_tag, step.duration_minutes, step.device_tag, locs_json, now
+                    ],
+                ).map_err(|e| e.to_string())?;
+
+                Ok(json!({
+                    "status": "ok",
+                    "work_line_id": line_id,
+                    "task_id": new_task_id
+                }))
+            } else if let Some(task_id) = opt_str(args, "task_id") {
+                if let Some(new_seq) = opt_i32(args, "new_sequence_order") {
+                    let dep = args.get("depends_on_task_id").and_then(|v| {
+                        if v.is_null() {
+                            None
+                        } else {
+                            v.as_str()
+                        }
+                    });
+                    conn.execute(
+                        "UPDATE work_entities SET sequence_order = ?1, depends_on_task_id = ?2, updated_at = ?3 WHERE id = ?4",
+                        params![new_seq, dep, now, task_id],
+                    ).map_err(|e| e.to_string())?;
+                }
+                Ok(json!({
+                    "status": "ok",
+                    "work_line_id": line_id,
+                    "task_id": task_id
+                }))
+            } else {
+                Err("Missing required parameter: task_id or new_step".to_string())
+            }
+        }
+        "query_tasks_by_context" => {
+            let pid = resolve_pid(args).unwrap_or_else(|| {
+                conn.query_row("SELECT id FROM projects WHERE is_active = 1 LIMIT 1", [], |r| r.get(0))
+                    .unwrap_or_else(|_| "GERDALO".to_string())
+            });
+            let dev = opt_str(args, "device_tag");
+            let loc = opt_str(args, "location_tag");
+            let energy = opt_str(args, "energy_tag");
+            let max_min = opt_i32(args, "max_minutes");
+            let only_unlocked = args.get("only_unlocked").and_then(|v| v.as_bool()).unwrap_or(true);
+
+            let tasks = crate::db::queries::query_tasks_by_context(
+                conn,
+                &pid,
+                dev.as_deref(),
+                loc.as_deref(),
+                energy.as_deref(),
+                max_min,
+                only_unlocked,
+            )
+            .map_err(|e| e.to_string())?;
+
+            let count = tasks.len();
+            Ok(json!({
+                "tasks": tasks,
+                "count": count
+            }))
+        }
+        "schedule_task_on_calendar" => {
+            let task_id = opt_str(args, "task_id")
+                .ok_or_else(|| "Missing task_id".to_string())?;
+            let scheduled_date = opt_str(args, "scheduled_date")
+                .ok_or_else(|| "Missing scheduled_date".to_string())?;
+            let now = Local::now().to_rfc3339();
+
+            // Validate ISO date format YYYY-MM-DD
+            if scheduled_date.len() != 10
+                || scheduled_date.chars().nth(4) != Some('-')
+                || scheduled_date.chars().nth(7) != Some('-')
+            {
+                return Err(format!(
+                    "Invalid date format '{}', expected ISO YYYY-MM-DD",
+                    scheduled_date
+                ));
+            }
+
+            let slot = opt_str(args, "scheduled_slot").unwrap_or_else(|| "MORNING_DEEP".to_string());
+            let due_date = opt_str(args, "due_date");
+
+            if let Some(dur) = opt_i32(args, "duration_minutes") {
+                conn.execute(
+                    "UPDATE work_entities SET scheduled_date = ?1, scheduled_slot = ?2, due_date = ?3, duration_minutes = ?4, updated_at = ?5 WHERE id = ?6",
+                    params![scheduled_date, slot, due_date, dur, now, task_id],
+                ).map_err(|e| e.to_string())?;
+            } else {
+                conn.execute(
+                    "UPDATE work_entities SET scheduled_date = ?1, scheduled_slot = ?2, due_date = ?3, updated_at = ?4 WHERE id = ?5",
+                    params![scheduled_date, slot, due_date, now, task_id],
+                ).map_err(|e| e.to_string())?;
+            }
+
+            // Ensure calendar_days record exists for scheduled_date
+            conn.execute(
+                "INSERT OR IGNORE INTO calendar_days (date_key, total_capacity_minutes, deep_capacity_minutes, day_note, is_off_day, updated_at)
+                 VALUES (?1, 300, 150, '', 0, ?2)",
+                params![scheduled_date, now],
+            ).map_err(|e| e.to_string())?;
+
+            Ok(json!({
+                "task_id": task_id,
+                "scheduled_date": scheduled_date,
+                "scheduled_slot": slot,
+                "status": "scheduled"
+            }))
+        }
+        "propose_project_lifecycle" => {
+            let proposal_type = opt_str(args, "proposal_type")
+                .ok_or_else(|| "Missing proposal_type".to_string())?;
+            if !matches!(proposal_type.as_str(), "CREATE_PROJECT" | "PAUSE_PROJECT" | "ARCHIVE_PROJECT" | "PIVOT_PATH" | "RESUME_PROJECT") {
+                return Err(format!("Invalid proposal_type: {}", proposal_type));
+            }
+
+            let title = opt_str(args, "title")
+                .ok_or_else(|| "Missing title".to_string())?;
+            let rationale = opt_str(args, "rationale")
+                .or_else(|| opt_str(args, "rationale_markdown"))
+                .unwrap_or_default();
+            let project_id = opt_str(args, "project_id");
+            let payload_json = opt_str(args, "payload_json").unwrap_or_else(|| "{}".to_string());
+            let now = Local::now().to_rfc3339();
+
+            let proposal_id = format!("PRP-{}", &Uuid::new_v4().to_string()[..8].to_uppercase());
+
+            conn.execute(
+                "INSERT INTO pending_proposals (
+                    id, project_id, proposal_type, title, rationale_markdown, payload_json, status, created_at, rationale, proposed_payload_json
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'PENDING', ?7, ?5, ?6)",
+                params![proposal_id, project_id, proposal_type, title, rationale, payload_json, now],
+            ).map_err(|e| e.to_string())?;
+
+            Ok(json!({
+                "proposal_id": proposal_id,
+                "proposal_type": proposal_type,
+                "status": "PENDING",
+                "title": title
+            }))
+        }
+        "save_personal_or_lesson_item" => {
+            let item_type = opt_str(args, "item_type")
+                .ok_or_else(|| "Missing item_type".to_string())?;
+            if !matches!(item_type.as_str(), "LESSON_LEARNED" | "INTEREST" | "IDEA" | "BOOKMARK" | "NOTE") {
+                return Err(format!("Invalid item_type: {}", item_type));
+            }
+
+            let title = opt_str(args, "title")
+                .ok_or_else(|| "Missing title".to_string())?;
+            let content = opt_str(args, "content_markdown")
+                .ok_or_else(|| "Missing content_markdown".to_string())?;
+            let realm = opt_str(args, "realm").unwrap_or_else(|| "LIFE".to_string());
+            let domain_code = opt_str(args, "domain_code").unwrap_or_else(|| "MIND_LEARNING".to_string());
+            let project_id = opt_str(args, "project_id");
+            let tags_val = args.get("tags").cloned().unwrap_or_else(|| json!([]));
+            let tags_json = tags_val.to_string();
+            let now = Local::now().to_rfc3339();
+
+            let item_id = format!("PVI-{}", &Uuid::new_v4().to_string()[..8].to_uppercase());
+
+            conn.execute(
+                "INSERT INTO personal_vault_items (
+                    id, realm, domain_code, project_id, item_type, title, content_markdown, tags_json, created_at, updated_at, content
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?7)",
+                params![item_id, realm, domain_code, project_id, item_type, title, content, tags_json, now],
+            ).map_err(|e| e.to_string())?;
+
+            Ok(json!({
+                "item_id": item_id,
+                "item_type": item_type,
+                "domain_code": domain_code,
+                "title": title
+            }))
+        }
+        "open_in_right_panel" => {
+            let panel_type = opt_str(args, "panel_type")
+                .ok_or_else(|| "Missing required parameter: panel_type".to_string())?;
+            if !matches!(
+                panel_type.as_str(),
+                "DOCUMENT" | "ALL_TASKS_AND_LINES" | "DOMAINS_OUTCOMES" | "CALENDAR" | "DECISIONS" | "VAULT_DIR"
+            ) {
+                return Err(format!("Invalid panel_type: {}", panel_type));
+            }
+            let target_id = opt_str(args, "target_id");
+
+            Ok(json!({
+                "navigation_event": {
+                    "panel_type": panel_type,
+                    "target_id": target_id
+                }
             }))
         }
         _ => Err(format!("ابزار ناشناخته: {}", name)),

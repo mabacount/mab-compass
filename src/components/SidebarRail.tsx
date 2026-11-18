@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import {
+  Brain,
   ChevronDown,
   ChevronLeft,
   Compass,
@@ -18,12 +19,19 @@ import {
 import { ChatSession, DashboardState } from "../lib/tauri_api";
 import { formatShortTime } from "../lib/formatters";
 
-export type AppTab = "PATH_AND_CHAT" | "KNOWLEDGE_VAULT" | "WBS_AND_DOCS" | "SETTINGS";
+export type AppTab =
+  | "PATH_AND_CHAT"
+  | "KNOWLEDGE_VAULT"
+  | "WBS_AND_DOCS"
+  | "ECOSYSTEM_CARDS"
+  | "SETTINGS";
 
 interface SidebarRailProps {
   dash: DashboardState;
   activeTab: AppTab;
   isCollapsed: boolean;
+  isNarrowViewport?: boolean;
+  sidebarWidth?: number;
   onToggleCollapse: () => void;
   onSelectTab: (tab: AppTab) => void;
   onSwitchProject: (projectId: string) => void;
@@ -37,6 +45,8 @@ export function SidebarRail({
   dash,
   activeTab,
   isCollapsed,
+  isNarrowViewport = false,
+  sidebarWidth = 255,
   onToggleCollapse,
   onSelectTab,
   onSwitchProject,
@@ -81,9 +91,20 @@ export function SidebarRail({
     },
     {
       id: "WBS_AND_DOCS",
-      label: "نقشه WBS و تصمیمات",
+      label: "نقشه WBS و لاین‌ها",
       icon: Layers,
       badge: dash.open_tasks.length > 0 ? dash.open_tasks.length : null,
+    },
+    {
+      id: "ECOSYSTEM_CARDS",
+      label: "اهداف و کارت‌های دانش",
+      icon: Brain,
+      badge:
+        (dash.personal_vault_items?.length ?? 0) > 0
+          ? dash.personal_vault_items!.length
+          : dash.outcomes.length > 0
+          ? dash.outcomes.length
+          : null,
     },
     {
       id: "SETTINGS",
@@ -92,6 +113,13 @@ export function SidebarRail({
       badge: null,
     },
   ];
+
+  const handleSelectNav = (tab: AppTab) => {
+    onSelectTab(tab);
+    if (isNarrowViewport && !isCollapsed) {
+      onToggleCollapse();
+    }
+  };
 
   /* -------------------------------------------------------------------------- */
   /* Collapsed Rail (Width 60px)                                                 */
@@ -186,46 +214,64 @@ export function SidebarRail({
   }
 
   /* -------------------------------------------------------------------------- */
-  /* Expanded Sidebar (Anytype Style Width 250px)                               */
+  /* Expanded Sidebar (Drawer Overlay on Narrow Viewports < 768px)              */
   /* -------------------------------------------------------------------------- */
   return (
-    <aside className="w-[245px] xl:w-[260px] bg-mab-sidebar border-l border-mab-border flex flex-col justify-between p-3 shrink-0 min-h-0 select-none z-20 transition-all duration-200">
-      <div className="flex-1 min-h-0 flex flex-col gap-3 overflow-y-auto pl-0.5">
-        {/* Workspace Brand / Header */}
-        <div className="px-1 py-0.5 flex items-center justify-between shrink-0 gap-2">
-          <div className="flex items-center gap-2 min-w-0">
-            <div className="w-6 h-6 rounded-lg bg-white/[0.05] border border-white/[0.08] flex items-center justify-center shadow-sm text-blue-400 shrink-0">
-              <Compass className="w-3.5 h-3.5" />
+    <>
+      {isNarrowViewport && (
+        <div
+          onClick={onToggleCollapse}
+          className="fixed inset-0 top-[46px] bg-black/60 backdrop-blur-[2px] z-30 md:hidden"
+        />
+      )}
+      <aside
+        style={
+          isNarrowViewport
+            ? undefined
+            : { width: `${sidebarWidth}px` }
+        }
+        className={`${
+          isNarrowViewport
+            ? "fixed top-[46px] right-0 bottom-0 z-40 shadow-2xl w-[260px]"
+            : "z-20"
+        } bg-mab-sidebar border-l border-mab-border flex flex-col justify-between p-3 shrink-0 min-h-0 select-none`}
+      >
+        <div className="flex-1 min-h-0 flex flex-col gap-3 overflow-y-auto pl-0.5">
+          {/* Workspace Brand / Header */}
+          <div className="px-1 py-0.5 flex items-center justify-between shrink-0 gap-2">
+            <div className="flex items-center gap-2 min-w-0">
+              <div className="w-6 h-6 rounded-lg bg-white/[0.05] border border-white/[0.08] flex items-center justify-center shadow-sm text-blue-400 shrink-0">
+                <Compass className="w-3.5 h-3.5" />
+              </div>
+              <div className="min-w-0 flex items-center gap-1.5">
+                <span className="font-bold text-[13px] text-white tracking-tight truncate">
+                  Mab-Compass
+                </span>
+                <span className="px-1.5 py-0.5 rounded-full bg-blue-500/15 border border-blue-500/30 text-[9.5px] font-mono text-blue-300">
+                  v3.0
+                </span>
+              </div>
             </div>
-            <div className="min-w-0 flex items-center gap-1.5">
-              <span className="font-bold text-[13px] text-white tracking-tight truncate">
-                Mab-Compass
-              </span>
-              <span className="px-1.5 py-0.5 rounded-full bg-white/[0.05] border border-mab-border text-[9.5px] font-mono text-white/60">
-                v2.0
-              </span>
-            </div>
+
+            <button
+              type="button"
+              onClick={onToggleCollapse}
+              title="جمع‌کردن نوار کناری"
+              className="w-6 h-6 rounded-md bg-white/[0.03] hover:bg-white/[0.08] text-mab-text-muted hover:text-white flex items-center justify-center transition"
+            >
+              <PanelRightClose className="w-3.5 h-3.5" />
+            </button>
           </div>
 
-          <button
-            type="button"
-            onClick={onToggleCollapse}
-            title="جمع‌کردن نوار کناری"
-            className="w-6 h-6 rounded-md bg-white/[0.03] hover:bg-white/[0.08] text-mab-text-muted hover:text-white flex items-center justify-center transition"
-          >
-            <PanelRightClose className="w-3.5 h-3.5" />
-          </button>
-        </div>
-
-        {/* Section 1: Primary Navigation Views */}
-        <nav className="space-y-0.5">
-          {navItems.map((item) => {
-            const Icon = item.icon;
-            const selected = activeTab === item.id;
-            return (
-              <button
-                key={item.id}
-                onClick={() => onSelectTab(item.id)}
+          {/* Section 1: Primary Navigation Views */}
+          <nav className="space-y-0.5">
+            {navItems.map((item) => {
+              const Icon = item.icon;
+              const selected = activeTab === item.id;
+              return (
+                <button
+                  key={item.id}
+                  onClick={() => handleSelectNav(item.id)}
                 className={`w-full flex items-center justify-between px-2.5 py-2 rounded-lg text-[12.5px] transition group ${
                   selected
                     ? "bg-white/[0.08] text-white font-medium border border-white/[0.1] shadow-sm"
@@ -443,6 +489,7 @@ export function SidebarRail({
         </div>
       </div>
     </aside>
+    </>
   );
 }
 

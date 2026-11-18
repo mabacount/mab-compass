@@ -96,6 +96,7 @@ pub fn create_new_project(conn: &Connection, id_code: &str, name: &str) -> Resul
         external_focus_id: Some(clean_id),
         is_active: true,
         updated_at: now,
+        ..Default::default()
     })
 }
 
@@ -121,6 +122,7 @@ pub fn get_dashboard_state_for_project(
                 external_focus_id: r.get(3)?,
                 is_active: r.get::<_, i32>(4)? == 1,
                 updated_at: r.get(5)?,
+                ..Default::default()
             })
         })?
         .filter_map(|r| r.ok())
@@ -144,7 +146,37 @@ pub fn get_dashboard_state_for_project(
     let _ = ensure_project_directories(&active_project.workspace_path);
     let pid = &active_project.id;
 
-    let open_tasks = query_entities(conn, pid, "TASK", &["OPEN", "IN_PROGRESS", "BLOCKED"])?;
+    let domains = query_all_domains(conn).unwrap_or_default();
+    let outcomes = query_all_outcomes(conn).unwrap_or_default();
+    let work_lines = query_all_work_lines(conn, pid).unwrap_or_default();
+
+    let mut open_tasks = query_entities(
+        conn,
+        pid,
+        "TASK",
+        &["OPEN", "IN_PROGRESS", "BLOCKED", "QUEUED_IN_CHAIN"],
+    )?;
+
+    // Enrich tasks with project_name, work_line_title, inherited outcome_id, and live chain lock state
+    for task in &mut open_tasks {
+        task.project_name = active_project.name.clone();
+        if let Some(ref wl_id) = task.work_line_id {
+            if let Some(wl) = work_lines.iter().find(|w| w.id == *wl_id) {
+                task.work_line_title = Some(wl.title.clone());
+                if task.outcome_id.is_none() {
+                    task.outcome_id = wl.outcome_id.clone();
+                }
+            }
+            if task.status == "QUEUED_IN_CHAIN"
+                || is_locked_by_chain(conn, &task.id).unwrap_or(false)
+            {
+                task.is_locked_by_chain = true;
+            }
+        } else if task.status == "QUEUED_IN_CHAIN" {
+            task.is_locked_by_chain = true;
+        }
+    }
+
     let closed_tasks_count: i32 = conn
         .query_row(
             "SELECT COUNT(*) FROM work_entities WHERE project_id = ?1 AND entity_type = 'TASK' AND status = 'CLOSED'",
@@ -157,14 +189,89 @@ pub fn get_dashboard_state_for_project(
 
     let unblocked_tasks: Vec<WorkEntity> = open_tasks
         .iter()
-        .filter(|t| t.status != "BLOCKED")
+        .filter(|t| {
+            t.status != "BLOCKED"
+                && t.status != "QUEUED_IN_CHAIN"
+                && !t.is_locked_by_chain
+        })
         .cloned()
         .collect();
+
+    // Select up to 3 top priority steps across distinct WorkLines (1 active/next unlocked task per WorkLine)
+    let mut top_priority_steps: Vec<WorkEntity> = Vec::new();
+    let mut used_task_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut used_line_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // Gather candidate task per active WorkLine
+    let mut line_candidates: Vec<(bool, i32, WorkEntity)> = work_lines
+        .iter()
+        .filter(|wl| wl.status != "COMPLETED" && wl.status != "ARCHIVED")
+        .filter_map(|wl| {
+            let candidate = open_tasks
+                .iter()
+                .filter(|t| t.work_line_id.as_deref() == Some(wl.id.as_str()))
+                .filter(|t| {
+                    t.status != "BLOCKED"
+                        && t.status != "QUEUED_IN_CHAIN"
+                        && !t.is_locked_by_chain
+                })
+                .find(|t| t.status == "IN_PROGRESS")
+                .or_else(|| {
+                    open_tasks
+                        .iter()
+                        .filter(|t| t.work_line_id.as_deref() == Some(wl.id.as_str()))
+                        .filter(|t| {
+                            t.status != "BLOCKED"
+                                && t.status != "QUEUED_IN_CHAIN"
+                                && !t.is_locked_by_chain
+                        })
+                        .min_by_key(|t| t.sequence_order)
+                })
+                .cloned()?;
+            let is_in_progress = candidate.status == "IN_PROGRESS";
+            let score = candidate.priority_score + if candidate.is_on_critical_path { 20 } else { 0 };
+            Some((is_in_progress, score, candidate))
+        })
+        .collect();
+
+    line_candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+
+    for (_, _, task) in line_candidates {
+        if top_priority_steps.len() >= 3 {
+            break;
+        }
+        if let Some(ref wl_id) = task.work_line_id {
+            used_line_ids.insert(wl_id.clone());
+        }
+        used_task_ids.insert(task.id.clone());
+        top_priority_steps.push(task);
+    }
+
+    // Fill remaining priority slots (up to 3) from standalone or other unblocked tasks
+    if top_priority_steps.len() < 3 {
+        for t in &unblocked_tasks {
+            if top_priority_steps.len() >= 3 {
+                break;
+            }
+            if used_task_ids.contains(&t.id) {
+                continue;
+            }
+            if let Some(ref wl_id) = t.work_line_id {
+                if used_line_ids.contains(wl_id) {
+                    continue;
+                }
+                used_line_ids.insert(wl_id.clone());
+            }
+            used_task_ids.insert(t.id.clone());
+            top_priority_steps.push(t.clone());
+        }
+    }
 
     let next_step_task = unblocked_tasks
         .iter()
         .find(|t| t.status == "IN_PROGRESS" && t.is_on_critical_path)
         .or_else(|| unblocked_tasks.iter().find(|t| t.status == "IN_PROGRESS"))
+        .or_else(|| top_priority_steps.first())
         .or_else(|| unblocked_tasks.first())
         .cloned();
 
@@ -281,11 +388,16 @@ pub fn get_dashboard_state_for_project(
         .collect();
 
     let mut doc_stmt = conn.prepare(
-        "SELECT id, project_id, title, doc_type, original_filename, archived_path, executive_summary, extracted_items_count, ingested_at
+        "SELECT id, project_id, title, doc_type, original_filename, archived_path,
+                executive_summary, extracted_items_count, ingested_at,
+                binary_original_path, tags_json, realm, domain_code,
+                processing_status, processed_at
          FROM knowledge_documents WHERE project_id = ?1 ORDER BY id DESC",
     )?;
     let knowledge_docs: Vec<KnowledgeDocument> = doc_stmt
         .query_map(params![pid], |r| {
+            let tags_json: String = r.get(10).unwrap_or_else(|_| "[]".to_string());
+            let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
             Ok(KnowledgeDocument {
                 id: r.get(0)?,
                 project_id: r.get(1)?,
@@ -296,6 +408,13 @@ pub fn get_dashboard_state_for_project(
                 executive_summary: r.get(6)?,
                 extracted_items_count: r.get(7)?,
                 ingested_at: r.get(8)?,
+                binary_original_path: r.get(9).ok(),
+                tags_json,
+                tags,
+                realm: r.get(11).unwrap_or_else(|_| "WORK".to_string()),
+                domain_code: r.get(12).unwrap_or_else(|_| "WEALTH_FINANCE".to_string()),
+                processing_status: r.get(13).unwrap_or_else(|_| "UNPROCESSED".to_string()),
+                processed_at: r.get(14).ok(),
             })
         })?
         .filter_map(|r| r.ok())
@@ -310,6 +429,10 @@ pub fn get_dashboard_state_for_project(
         .ok();
 
     let pending_queue = query_pending_ai_queue(conn).unwrap_or_default();
+
+    let calendar_days = query_all_calendar_days(conn).unwrap_or_default();
+    let pending_proposals = query_all_pending_proposals(conn).unwrap_or_default();
+    let personal_vault_items = query_all_personal_vault_items(conn).unwrap_or_default();
 
     Ok(DashboardState {
         projects,
@@ -335,7 +458,184 @@ pub fn get_dashboard_state_for_project(
         settings,
         can_undo: last_undo.is_some(),
         last_undo_summary: last_undo,
+        domains,
+        outcomes,
+        work_lines,
+        top_priority_steps,
+        calendar_days,
+        pending_proposals,
+        personal_vault_items,
     })
+}
+
+pub fn query_all_domains(conn: &Connection) -> Result<Vec<LifeDomain>> {
+    let mut stmt = conn.prepare(
+        "SELECT code, title, description, maturity_state, maintenance_floor, desired_state, is_growth_focus, updated_at
+         FROM life_domains ORDER BY code",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(LifeDomain {
+            code: r.get(0)?,
+            title: r.get(1)?,
+            description: r.get(2).unwrap_or_default(),
+            maturity_state: r.get(3).unwrap_or(2),
+            maintenance_floor: r.get(4).unwrap_or_default(),
+            desired_state: r.get(5).unwrap_or_default(),
+            is_growth_focus: r.get::<_, i32>(6).unwrap_or(0) == 1,
+            updated_at: r.get(7).unwrap_or_default(),
+        })
+    })?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+pub fn query_all_outcomes(conn: &Connection) -> Result<Vec<Outcome>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, domain_code, title, desired_reality_change, evidence_kr, time_window, status, progress_percent, created_at, updated_at
+         FROM outcomes ORDER BY id",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(Outcome {
+            id: r.get(0)?,
+            domain_code: r.get(1)?,
+            title: r.get(2)?,
+            desired_reality_change: r.get(3).unwrap_or_default(),
+            evidence_kr: r.get(4).unwrap_or_default(),
+            time_window: r.get(5).unwrap_or_default(),
+            status: r.get(6).unwrap_or_else(|_| "ACTIVE".to_string()),
+            progress_percent: r.get(7).unwrap_or(0),
+            linked_projects_count: 0,
+            created_at: r.get(8).unwrap_or_default(),
+            updated_at: r.get(9).unwrap_or_default(),
+        })
+    })?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+pub fn query_all_work_lines(conn: &Connection, project_id: &str) -> Result<Vec<WorkLine>> {
+    let mut stmt = conn.prepare(
+        "SELECT wl.id,
+                wl.project_id,
+                COALESCE(p.name, wl.project_id) AS project_name,
+                wl.outcome_id,
+                o.title AS outcome_title,
+                wl.title,
+                wl.goal_statement,
+                wl.line_mode,
+                wl.status,
+                wl.color_hex,
+                (SELECT COUNT(*) FROM work_entities w
+                  WHERE w.work_line_id = wl.id AND w.entity_type = 'TASK' AND w.status != 'SUPERSEDED') AS total_tasks,
+                (SELECT COUNT(*) FROM work_entities w
+                  WHERE w.work_line_id = wl.id AND w.entity_type = 'TASK' AND w.status = 'CLOSED') AS completed_tasks,
+                (SELECT w.id FROM work_entities w
+                  WHERE w.work_line_id = wl.id AND w.entity_type = 'TASK' AND w.status IN ('IN_PROGRESS', 'OPEN')
+                  ORDER BY CASE WHEN w.status = 'IN_PROGRESS' THEN 0 ELSE 1 END ASC, w.sequence_order ASC
+                  LIMIT 1) AS active_step_id,
+                wl.created_at,
+                wl.updated_at
+         FROM work_lines wl
+         LEFT JOIN projects p ON p.id = wl.project_id
+         LEFT JOIN outcomes o ON o.id = wl.outcome_id
+         WHERE wl.project_id = ?1
+         ORDER BY wl.created_at ASC, wl.id ASC",
+    )?;
+    let rows = stmt.query_map(params![project_id], |r| {
+        Ok(WorkLine {
+            id: r.get(0)?,
+            project_id: r.get(1)?,
+            project_name: r.get(2).unwrap_or_default(),
+            outcome_id: r.get(3).ok(),
+            outcome_title: r.get(4).ok(),
+            title: r.get(5)?,
+            goal_statement: r.get(6).unwrap_or_default(),
+            line_mode: r.get(7).unwrap_or_else(|_| "SEQUENTIAL_CHAIN".to_string()),
+            status: r.get(8).unwrap_or_else(|_| "ACTIVE".to_string()),
+            color_hex: r.get(9).unwrap_or_else(|_| "#3B82F6".to_string()),
+            total_tasks: r.get(10).unwrap_or(0),
+            completed_tasks: r.get(11).unwrap_or(0),
+            active_step_id: r.get(12).ok(),
+            created_at: r.get(13).unwrap_or_default(),
+            updated_at: r.get(14).unwrap_or_default(),
+        })
+    })?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+pub fn query_all_calendar_days(conn: &Connection) -> Result<Vec<CalendarDay>> {
+    let mut stmt = conn.prepare(
+        "SELECT c.date_key,
+                c.total_capacity_minutes,
+                c.deep_capacity_minutes,
+                c.day_note,
+                c.is_off_day,
+                (SELECT COUNT(*) FROM work_entities w
+                  WHERE w.scheduled_date = c.date_key AND w.entity_type = 'TASK' AND w.status NOT IN ('CLOSED', 'SUPERSEDED')) AS assigned_tasks_count,
+                (SELECT COALESCE(SUM(w.duration_minutes), 0) FROM work_entities w
+                  WHERE w.scheduled_date = c.date_key AND w.entity_type = 'TASK' AND w.status NOT IN ('CLOSED', 'SUPERSEDED')) AS assigned_minutes,
+                c.updated_at
+         FROM calendar_days c
+         ORDER BY c.date_key DESC",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(CalendarDay {
+            date_key: r.get(0)?,
+            total_capacity_minutes: r.get(1).unwrap_or(300),
+            deep_capacity_minutes: r.get(2).unwrap_or(150),
+            day_note: r.get(3).unwrap_or_default(),
+            is_off_day: r.get::<_, i32>(4).unwrap_or(0) == 1,
+            assigned_tasks_count: r.get(5).unwrap_or(0),
+            assigned_minutes: r.get(6).unwrap_or(0),
+            updated_at: r.get(7).unwrap_or_default(),
+        })
+    })?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+pub fn query_all_pending_proposals(conn: &Connection) -> Result<Vec<PendingProposal>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, project_id, proposal_type, title, rationale_markdown, payload_json, status, created_at, resolved_at
+         FROM pending_proposals ORDER BY id DESC",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(PendingProposal {
+            id: r.get(0)?,
+            project_id: r.get(1).ok(),
+            proposal_type: r.get(2)?,
+            title: r.get(3)?,
+            rationale_markdown: r.get(4).unwrap_or_default(),
+            payload_json: r.get(5).unwrap_or_default(),
+            status: r.get(6).unwrap_or_else(|_| "PENDING".to_string()),
+            created_at: r.get(7).unwrap_or_default(),
+            resolved_at: r.get(8).ok(),
+        })
+    })?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+pub fn query_all_personal_vault_items(conn: &Connection) -> Result<Vec<PersonalVaultItem>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, realm, domain_code, project_id, item_type, title, content_markdown, tags_json, archived_path, created_at, updated_at
+         FROM personal_vault_items ORDER BY id DESC",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        let tags_str: String = r.get(7).unwrap_or_else(|_| "[]".to_string());
+        let tags: Vec<String> = serde_json::from_str(&tags_str).unwrap_or_default();
+        Ok(PersonalVaultItem {
+            id: r.get(0)?,
+            realm: r.get(1).unwrap_or_else(|_| "LIFE".to_string()),
+            domain_code: r.get(2).unwrap_or_else(|_| "MIND_LEARNING".to_string()),
+            project_id: r.get(3).ok(),
+            item_type: r.get(4)?,
+            title: r.get(5)?,
+            content_markdown: r.get(6).unwrap_or_default(),
+            tags_json: tags_str,
+            tags,
+            archived_path: r.get(8).ok(),
+            created_at: r.get(9).unwrap_or_default(),
+            updated_at: r.get(10).unwrap_or_default(),
+        })
+    })?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
 }
 
 pub fn normalize_chat_channel(channel: &str) -> &'static str {
@@ -610,6 +910,49 @@ fn query_session_messages(
     Ok(msgs)
 }
 
+fn map_work_entity_from_row(r: &rusqlite::Row) -> rusqlite::Result<WorkEntity> {
+    let loc_str: String = r.get(23).unwrap_or_else(|_| "[\"DESK\"]".to_string());
+    let location_tags: Vec<String> =
+        serde_json::from_str(&loc_str).unwrap_or_else(|_| vec!["DESK".to_string()]);
+    let is_locked: bool = r
+        .get::<_, i32>(28)
+        .map(|v| v == 1)
+        .unwrap_or_else(|_| r.get::<_, String>(7).map(|s| s == "QUEUED_IN_CHAIN").unwrap_or(false));
+    Ok(WorkEntity {
+        id: r.get(0)?,
+        project_id: r.get(1)?,
+        entity_type: r.get(2)?,
+        category: r.get(3)?,
+        title: r.get(4)?,
+        definition_of_done: r.get(5)?,
+        first_physical_action: r.get(6)?,
+        status: r.get(7)?,
+        is_on_critical_path: r.get::<_, i32>(8)? == 1,
+        optimistic_pomos: r.get(9)?,
+        most_likely_pomos: r.get(10)?,
+        pessimistic_pomos: r.get(11)?,
+        calibrated_pomos: r.get(12)?,
+        superseded_by_id: r.get(13)?,
+        stakeholder_tag: r.get(14)?,
+        updated_at: r.get(15)?,
+        project_name: String::new(),
+        work_line_id: r.get(16).ok(),
+        work_line_title: None,
+        outcome_id: r.get(17).ok(),
+        sequence_order: r.get(18).unwrap_or(1),
+        depends_on_task_id: r.get(19).ok(),
+        is_locked_by_chain: is_locked,
+        energy_tag: r.get(20).unwrap_or_else(|_| "MEDIUM_NORMAL".to_string()),
+        duration_minutes: r.get(21).unwrap_or(25),
+        device_tag: r.get(22).unwrap_or_else(|_| "LAPTOP_ONLY".to_string()),
+        location_tags,
+        scheduled_date: r.get(24).ok(),
+        scheduled_slot: r.get(25).ok(),
+        due_date: r.get(26).ok(),
+        priority_score: r.get(27).unwrap_or(50),
+    })
+}
+
 pub fn query_entities(
     conn: &Connection,
     project_id: &str,
@@ -619,7 +962,9 @@ pub fn query_entities(
     let mut stmt = conn.prepare(
         "SELECT id, project_id, entity_type, category, title, definition_of_done, first_physical_action,
                 status, is_on_critical_path, optimistic_pomos, most_likely_pomos, pessimistic_pomos,
-                calibrated_pomos, superseded_by_id, stakeholder_tag, updated_at
+                calibrated_pomos, superseded_by_id, stakeholder_tag, updated_at,
+                work_line_id, outcome_id, sequence_order, depends_on_task_id, energy_tag, duration_minutes,
+                device_tag, location_tags_json, scheduled_date, scheduled_slot, due_date, priority_score
          FROM work_entities
          WHERE project_id = ?1 AND entity_type = ?2
          ORDER BY
@@ -631,26 +976,7 @@ pub fn query_entities(
             updated_at DESC",
     )?;
 
-    let rows = stmt.query_map(params![project_id, entity_type], |r| {
-        Ok(WorkEntity {
-            id: r.get(0)?,
-            project_id: r.get(1)?,
-            entity_type: r.get(2)?,
-            category: r.get(3)?,
-            title: r.get(4)?,
-            definition_of_done: r.get(5)?,
-            first_physical_action: r.get(6)?,
-            status: r.get(7)?,
-            is_on_critical_path: r.get::<_, i32>(8)? == 1,
-            optimistic_pomos: r.get(9)?,
-            most_likely_pomos: r.get(10)?,
-            pessimistic_pomos: r.get(11)?,
-            calibrated_pomos: r.get(12)?,
-            superseded_by_id: r.get(13)?,
-            stakeholder_tag: r.get(14)?,
-            updated_at: r.get(15)?,
-        })
-    })?;
+    let rows = stmt.query_map(params![project_id, entity_type], map_work_entity_from_row)?;
 
     Ok(rows
         .filter_map(|r| r.ok())
@@ -662,31 +988,14 @@ fn query_all_project_entities(conn: &Connection, project_id: &str) -> Result<Vec
     let mut stmt = conn.prepare(
         "SELECT id, project_id, entity_type, category, title, definition_of_done, first_physical_action,
                 status, is_on_critical_path, optimistic_pomos, most_likely_pomos, pessimistic_pomos,
-                calibrated_pomos, superseded_by_id, stakeholder_tag, updated_at
+                calibrated_pomos, superseded_by_id, stakeholder_tag, updated_at,
+                work_line_id, outcome_id, sequence_order, depends_on_task_id, energy_tag, duration_minutes,
+                device_tag, location_tags_json, scheduled_date, scheduled_slot, due_date, priority_score
          FROM work_entities
          WHERE project_id = ?1",
     )?;
 
-    let rows = stmt.query_map(params![project_id], |r| {
-        Ok(WorkEntity {
-            id: r.get(0)?,
-            project_id: r.get(1)?,
-            entity_type: r.get(2)?,
-            category: r.get(3)?,
-            title: r.get(4)?,
-            definition_of_done: r.get(5)?,
-            first_physical_action: r.get(6)?,
-            status: r.get(7)?,
-            is_on_critical_path: r.get::<_, i32>(8)? == 1,
-            optimistic_pomos: r.get(9)?,
-            most_likely_pomos: r.get(10)?,
-            pessimistic_pomos: r.get(11)?,
-            calibrated_pomos: r.get(12)?,
-            superseded_by_id: r.get(13)?,
-            stakeholder_tag: r.get(14)?,
-            updated_at: r.get(15)?,
-        })
-    })?;
+    let rows = stmt.query_map(params![project_id], map_work_entity_from_row)?;
 
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
@@ -779,6 +1088,8 @@ pub fn quick_complete_task(
             ],
         )?;
         tx.commit()?;
+        // Domino advancement: if this task belonged to a SEQUENTIAL_CHAIN, unlock the next step
+        let _ = advance_sequential_chain_on_complete(conn, project_id, task_id);
         Ok(format!(
             "گام [{}] مختومه شد و گام بعدی در مسیر پیش‌رو فعال گردید.",
             task_id
@@ -786,6 +1097,26 @@ pub fn quick_complete_task(
     } else {
         Ok("تسک موردنظر یافت نشد.".into())
     }
+}
+
+/// تغییر وضعیت یک تسک باز (غیرقفل) به IN_PROGRESS برای شروع فوری اجرا
+pub fn start_task_step(
+    conn: &Connection,
+    project_id: &str,
+    task_id: &str,
+) -> Result<bool> {
+    let locked = is_locked_by_chain(conn, task_id).unwrap_or(false);
+    if locked {
+        return Ok(false);
+    }
+    let now = Local::now().to_rfc3339();
+    let affected = conn.execute(
+        "UPDATE work_entities
+         SET status = 'IN_PROGRESS', updated_at = ?1
+         WHERE id = ?2 AND project_id = ?3 AND status = 'OPEN'",
+        params![now, task_id, project_id],
+    )?;
+    Ok(affected > 0)
 }
 
 pub fn apply_copilot_envelope(
@@ -885,29 +1216,12 @@ pub fn apply_copilot_envelope_with_event(
                         .query_row(
                             "SELECT id, project_id, entity_type, category, title, definition_of_done, first_physical_action,
                                     status, is_on_critical_path, optimistic_pomos, most_likely_pomos, pessimistic_pomos,
-                                    calibrated_pomos, superseded_by_id, stakeholder_tag, updated_at
+                                    calibrated_pomos, superseded_by_id, stakeholder_tag, updated_at,
+                                    work_line_id, outcome_id, sequence_order, depends_on_task_id, energy_tag, duration_minutes,
+                                    device_tag, location_tags_json, scheduled_date, scheduled_slot, due_date, priority_score
                              FROM work_entities WHERE id = ?1 AND project_id = ?2",
                             params![tid, project_id],
-                            |r| {
-                                Ok(WorkEntity {
-                                    id: r.get(0)?,
-                                    project_id: r.get(1)?,
-                                    entity_type: r.get(2)?,
-                                    category: r.get(3)?,
-                                    title: r.get(4)?,
-                                    definition_of_done: r.get(5)?,
-                                    first_physical_action: r.get(6)?,
-                                    status: r.get(7)?,
-                                    is_on_critical_path: r.get::<_, i32>(8)? == 1,
-                                    optimistic_pomos: r.get(9)?,
-                                    most_likely_pomos: r.get(10)?,
-                                    pessimistic_pomos: r.get(11)?,
-                                    calibrated_pomos: r.get(12)?,
-                                    superseded_by_id: r.get(13)?,
-                                    stakeholder_tag: r.get(14)?,
-                                    updated_at: r.get(15)?,
-                                })
-                            },
+                            map_work_entity_from_row,
                         )
                         .ok();
 
@@ -1060,29 +1374,12 @@ pub fn apply_copilot_envelope_with_event(
                         .query_row(
                             "SELECT id, project_id, entity_type, category, title, definition_of_done, first_physical_action,
                                     status, is_on_critical_path, optimistic_pomos, most_likely_pomos, pessimistic_pomos,
-                                    calibrated_pomos, superseded_by_id, stakeholder_tag, updated_at
+                                    calibrated_pomos, superseded_by_id, stakeholder_tag, updated_at,
+                                    work_line_id, outcome_id, sequence_order, depends_on_task_id, energy_tag, duration_minutes,
+                                    device_tag, location_tags_json, scheduled_date, scheduled_slot, due_date, priority_score
                              FROM work_entities WHERE id = ?1 AND project_id = ?2",
                             params![tid, project_id],
-                            |r| {
-                                Ok(WorkEntity {
-                                    id: r.get(0)?,
-                                    project_id: r.get(1)?,
-                                    entity_type: r.get(2)?,
-                                    category: r.get(3)?,
-                                    title: r.get(4)?,
-                                    definition_of_done: r.get(5)?,
-                                    first_physical_action: r.get(6)?,
-                                    status: r.get(7)?,
-                                    is_on_critical_path: r.get::<_, i32>(8)? == 1,
-                                    optimistic_pomos: r.get(9)?,
-                                    most_likely_pomos: r.get(10)?,
-                                    pessimistic_pomos: r.get(11)?,
-                                    calibrated_pomos: r.get(12)?,
-                                    superseded_by_id: r.get(13)?,
-                                    stakeholder_tag: r.get(14)?,
-                                    updated_at: r.get(15)?,
-                                })
-                            },
+                            map_work_entity_from_row,
                         )
                         .ok();
 
@@ -1583,6 +1880,7 @@ pub fn get_knowledge_document_by_id(conn: &Connection, doc_id: i64) -> Option<Kn
                 executive_summary: r.get(6)?,
                 extracted_items_count: r.get(7)?,
                 ingested_at: r.get(8)?,
+                ..Default::default()
             })
         },
     )
@@ -1725,6 +2023,48 @@ pub fn insert_chat_turn_with_details(
 pub const UNANALYZED_DOC_SUMMARY_PREFIX: &str =
     "متن فایل استخراج و در حافظه پروژه آرشیو شد (تحلیل هوشمند";
 
+pub const WAITING_DOC_SUMMARY_PREFIX: &str = "در انتظار پردازش توسط هوش مصنوعی";
+
+#[allow(clippy::too_many_arguments)]
+pub fn insert_knowledge_doc_with_status(
+    conn: &Connection,
+    project_id: &str,
+    title: &str,
+    doc_type: &str,
+    original_filename: &str,
+    archived_path: &str,
+    summary: &str,
+    items_count: i32,
+    processing_status: &str,
+) -> Result<i64> {
+    let now = Local::now().to_rfc3339();
+    let processed_at: Option<&str> = if processing_status == "PROCESSED" {
+        Some(&now)
+    } else {
+        None
+    };
+    conn.execute(
+        "INSERT INTO knowledge_documents (
+            project_id, title, doc_type, original_filename, archived_path,
+            executive_summary, extracted_items_count, ingested_at, processing_status, processed_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            project_id,
+            title,
+            doc_type,
+            original_filename,
+            archived_path,
+            summary,
+            items_count,
+            now,
+            processing_status,
+            processed_at
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn insert_knowledge_doc_record(
     conn: &Connection,
     project_id: &str,
@@ -1735,24 +2075,58 @@ pub fn insert_knowledge_doc_record(
     summary: &str,
     items_count: i32,
 ) -> Result<i64> {
+    let status = if summary.starts_with(UNANALYZED_DOC_SUMMARY_PREFIX)
+        || summary.starts_with(WAITING_DOC_SUMMARY_PREFIX)
+    {
+        "UNPROCESSED"
+    } else {
+        "PROCESSED"
+    };
+    insert_knowledge_doc_with_status(
+        conn,
+        project_id,
+        title,
+        doc_type,
+        original_filename,
+        archived_path,
+        summary,
+        items_count,
+        status,
+    )
+}
+
+pub fn set_knowledge_doc_processing_status(
+    conn: &Connection,
+    doc_id: i64,
+    status: &str,
+    summary_opt: Option<&str>,
+    items_count_opt: Option<i32>,
+    new_archived_path: Option<&str>,
+) -> Result<()> {
     let now = Local::now().to_rfc3339();
+    let processed_at: Option<&str> = if status == "PROCESSED" {
+        Some(&now)
+    } else {
+        None
+    };
     conn.execute(
-        "INSERT INTO knowledge_documents (
-            project_id, title, doc_type, original_filename, archived_path,
-            executive_summary, extracted_items_count, ingested_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "UPDATE knowledge_documents
+         SET processing_status = ?1,
+             processed_at = CASE WHEN ?1 = 'PROCESSED' THEN ?2 ELSE processed_at END,
+             executive_summary = COALESCE(?3, executive_summary),
+             extracted_items_count = COALESCE(?4, extracted_items_count),
+             archived_path = COALESCE(?5, archived_path)
+         WHERE id = ?6",
         params![
-            project_id,
-            title,
-            doc_type,
-            original_filename,
-            archived_path,
-            summary,
-            items_count,
-            now
+            status,
+            processed_at,
+            summary_opt,
+            items_count_opt,
+            new_archived_path,
+            doc_id
         ],
     )?;
-    Ok(conn.last_insert_rowid())
+    Ok(())
 }
 
 pub fn update_knowledge_doc_analysis(
@@ -1762,23 +2136,68 @@ pub fn update_knowledge_doc_analysis(
     items_count: i32,
     new_archived_path: Option<&str>,
 ) -> Result<()> {
-    let now = Local::now().to_rfc3339();
-    if let Some(kp) = new_archived_path {
-        conn.execute(
-            "UPDATE knowledge_documents
-             SET executive_summary = ?1, extracted_items_count = ?2, archived_path = ?3, ingested_at = ?4
-             WHERE id = ?5",
-            params![new_summary, items_count, kp, now, doc_id],
-        )?;
+    set_knowledge_doc_processing_status(
+        conn,
+        doc_id,
+        "PROCESSED",
+        Some(new_summary),
+        Some(items_count),
+        new_archived_path,
+    )
+}
+
+pub fn requeue_knowledge_document(conn: &Connection, doc_id: i64) -> Result<i64> {
+    let (pid, title, orig_fname, arch_path): (String, String, String, String) = conn.query_row(
+        "SELECT project_id, title, original_filename, archived_path
+         FROM knowledge_documents WHERE id = ?1",
+        params![doc_id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    )?;
+
+    conn.execute(
+        "UPDATE knowledge_documents
+         SET processing_status = 'UNPROCESSED', processed_at = NULL
+         WHERE id = ?1",
+        params![doc_id],
+    )?;
+
+    let preview = if orig_fname.trim().is_empty() {
+        format!("📄 {}", title)
     } else {
-        conn.execute(
-            "UPDATE knowledge_documents
-             SET executive_summary = ?1, extracted_items_count = ?2, ingested_at = ?3
-             WHERE id = ?4",
-            params![new_summary, items_count, now, doc_id],
+        format!("📄 {} ({})", title, orig_fname)
+    };
+    let sid = ensure_active_chat_session(conn, &pid, "VAULT").unwrap_or_default();
+
+    // If an old DONE/DISMISSED queue item exists for this knowledge_doc_id, re-activate it
+    let updated = conn.execute(
+        "UPDATE pending_ai_queue
+         SET status = 'PENDING', last_error = NULL, updated_at = ?1
+         WHERE knowledge_doc_id = ?2",
+        params![Local::now().to_rfc3339(), doc_id],
+    )?;
+    if updated > 0 {
+        let qid: i64 = conn.query_row(
+            "SELECT id FROM pending_ai_queue WHERE knowledge_doc_id = ?1 ORDER BY id ASC LIMIT 1",
+            params![doc_id],
+            |r| r.get(0),
         )?;
+        return Ok(qid);
     }
-    Ok(())
+
+    enqueue_pending_ai_item(
+        conn,
+        &pid,
+        &sid,
+        "VAULT",
+        None,
+        None,
+        Some(doc_id),
+        None,
+        &build_queue_preview(&preview),
+        "DOC_ONBOARDING",
+        Some(&arch_path),
+        None,
+    )
 }
 
 pub fn find_unanalyzed_knowledge_doc_id(
@@ -1848,6 +2267,83 @@ fn build_queue_preview(text: &str) -> String {
     }
 }
 
+pub struct PendingQueueInput<'a> {
+    pub project_id: &'a str,
+    pub session_id: &'a str,
+    pub channel: &'a str,
+    pub user_message_id: Option<i64>,
+    pub system_message_id: Option<i64>,
+    pub knowledge_doc_id: Option<i64>,
+    pub raw_event_id: Option<i64>,
+    pub title_preview: &'a str,
+    pub source_type: &'a str,
+    pub archived_path: Option<&'a str>,
+    pub last_error: Option<&'a str>,
+}
+
+pub fn insert_pending_queue_item(
+    conn: &Connection,
+    input: PendingQueueInput<'_>,
+) -> Result<i64> {
+    enqueue_pending_ai_item(
+        conn,
+        input.project_id,
+        input.session_id,
+        input.channel,
+        input.user_message_id,
+        input.system_message_id,
+        input.knowledge_doc_id,
+        input.raw_event_id,
+        input.title_preview,
+        input.source_type,
+        input.archived_path,
+        input.last_error,
+    )
+}
+
+fn resolve_original_created_at(
+    conn: &Connection,
+    user_message_id: Option<i64>,
+    raw_event_id: Option<i64>,
+    knowledge_doc_id: Option<i64>,
+    fallback: &str,
+) -> String {
+    if let Some(uid) = user_message_id {
+        if let Ok(ts) = conn.query_row(
+            "SELECT created_at FROM chat_messages WHERE id = ?1",
+            params![uid],
+            |r| r.get::<_, String>(0),
+        ) {
+            if !ts.trim().is_empty() {
+                return ts;
+            }
+        }
+    }
+    if let Some(eid) = raw_event_id {
+        if let Ok(ts) = conn.query_row(
+            "SELECT created_at FROM raw_events WHERE id = ?1",
+            params![eid],
+            |r| r.get::<_, String>(0),
+        ) {
+            if !ts.trim().is_empty() {
+                return ts;
+            }
+        }
+    }
+    if let Some(kid) = knowledge_doc_id {
+        if let Ok(ts) = conn.query_row(
+            "SELECT ingested_at FROM knowledge_documents WHERE id = ?1",
+            params![kid],
+            |r| r.get::<_, String>(0),
+        ) {
+            if !ts.trim().is_empty() {
+                return ts;
+            }
+        }
+    }
+    fallback.to_string()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn enqueue_pending_ai_item(
     conn: &Connection,
@@ -1865,6 +2361,13 @@ pub fn enqueue_pending_ai_item(
 ) -> Result<i64> {
     let norm_ch = normalize_chat_channel(channel);
     let now = Local::now().to_rfc3339();
+    let original_created_at = resolve_original_created_at(
+        conn,
+        user_message_id,
+        raw_event_id,
+        knowledge_doc_id,
+        &now,
+    );
     let existing_id: Option<i64> = conn
         .query_row(
             "SELECT id FROM pending_ai_queue
@@ -1905,7 +2408,7 @@ pub fn enqueue_pending_ai_item(
             project_id, session_id, channel, user_message_id, system_message_id,
             knowledge_doc_id, raw_event_id, title_preview, source_type, archived_path,
             status, attempts, last_error, created_at, updated_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'PENDING', 0, ?11, ?12, ?12)",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'PENDING', 0, ?11, ?12, ?13)",
         params![
             project_id,
             session_id,
@@ -1918,6 +2421,7 @@ pub fn enqueue_pending_ai_item(
             source_type,
             archived_path,
             last_error,
+            original_created_at,
             now
         ],
     )?;
@@ -1951,7 +2455,7 @@ pub fn sync_unprocessed_items_into_queue(conn: &Connection) -> Result<usize> {
         params![now],
     )?;
 
-    // Auto-close pending knowledge_doc items whose executive summary is no longer the failure placeholder
+    // Auto-close pending knowledge_doc items that are now marked PROCESSED
     let like_prefix = format!("{}%", UNANALYZED_DOC_SUMMARY_PREFIX);
     conn.execute(
         "UPDATE pending_ai_queue
@@ -1959,10 +2463,11 @@ pub fn sync_unprocessed_items_into_queue(conn: &Connection) -> Result<usize> {
          WHERE status IN ('PENDING', 'PROCESSING')
            AND user_message_id IS NULL
            AND knowledge_doc_id IS NOT NULL
-           AND NOT EXISTS (
+           AND EXISTS (
                SELECT 1 FROM knowledge_documents k
                WHERE k.id = pending_ai_queue.knowledge_doc_id
-                 AND k.executive_summary LIKE ?2
+                 AND k.processing_status = 'PROCESSED'
+                 AND k.executive_summary NOT LIKE ?2
            )",
         params![now, like_prefix],
     )?;
@@ -2129,9 +2634,9 @@ pub fn sync_unprocessed_items_into_queue(conn: &Connection) -> Result<usize> {
     let mut doc_stmt = conn.prepare(
         "SELECT id, project_id, title, original_filename, archived_path, executive_summary
          FROM knowledge_documents
-         WHERE executive_summary LIKE ?1
+         WHERE (processing_status IN ('UNPROCESSED', 'FAILED') OR executive_summary LIKE ?1)
            AND id NOT IN (SELECT knowledge_doc_id FROM pending_ai_queue WHERE knowledge_doc_id IS NOT NULL)
-         ORDER BY id ASC",
+         ORDER BY ingested_at ASC, id ASC",
     )?;
     let orphan_docs: Vec<(i64, String, String, String, String, String)> = doc_stmt
         .query_map(params![like_prefix], |r| {
@@ -2171,6 +2676,76 @@ pub fn sync_unprocessed_items_into_queue(conn: &Connection) -> Result<usize> {
         inserted += 1;
     }
 
+    // 5. Scan any historical MAB_FOCUS_SYNC raw_events not yet represented in pending_ai_queue
+    let mut focus_stmt = conn.prepare(
+        "SELECT id, project_id, raw_content, archived_path, created_at
+         FROM raw_events
+         WHERE source_type = 'MAB_FOCUS_SYNC'
+           AND id NOT IN (SELECT raw_event_id FROM pending_ai_queue WHERE raw_event_id IS NOT NULL)
+         ORDER BY created_at ASC, id ASC",
+    )?;
+    let orphan_focus: Vec<(i64, String, String, Option<String>, String)> = focus_stmt
+        .query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    for (raw_id, pid, content, arch_path, created_at) in orphan_focus {
+        let first_line = build_queue_preview(&content);
+        let title = format!("گزارش Mab-Focus: {}", first_line);
+        let doc_fname = format!("mabfocus_ev_{}.md", raw_id);
+
+        let existing_kdoc: Option<i64> = if let Some(ref ap) = arch_path {
+            conn.query_row(
+                "SELECT id FROM knowledge_documents WHERE project_id = ?1 AND archived_path = ?2 ORDER BY id DESC LIMIT 1",
+                params![pid, ap],
+                |r| r.get(0),
+            )
+            .ok()
+        } else {
+            None
+        };
+
+        let kdoc_id = match existing_kdoc {
+            Some(id) => Some(id),
+            None => conn
+                .execute(
+                    "INSERT INTO knowledge_documents (
+                        project_id, title, doc_type, original_filename, archived_path,
+                        executive_summary, extracted_items_count, ingested_at, processing_status
+                     ) VALUES (?1, ?2, 'MAB_FOCUS_REPORT', ?3, ?4, ?5, 0, ?6, 'UNPROCESSED')",
+                    params![
+                        pid,
+                        title,
+                        doc_fname,
+                        arch_path.as_deref().unwrap_or(""),
+                        "در انتظار پردازش توسط هوش مصنوعی (گزارش دریافت‌شده از Mab-Focus)...",
+                        created_at
+                    ],
+                )
+                .ok()
+                .map(|_| conn.last_insert_rowid()),
+        };
+
+        let sid = ensure_active_chat_session(conn, &pid, "COPILOT").unwrap_or_default();
+        enqueue_pending_ai_item(
+            conn,
+            &pid,
+            &sid,
+            "COPILOT",
+            None,
+            None,
+            kdoc_id,
+            Some(raw_id),
+            &format!("⏱️ {}", first_line),
+            "MAB_FOCUS_SYNC",
+            arch_path.as_deref(),
+            None,
+        )?;
+        inserted += 1;
+    }
+
     Ok(inserted)
 }
 
@@ -2179,11 +2754,16 @@ pub fn query_pending_ai_queue(conn: &Connection) -> Result<Vec<PendingQueueItem>
         "SELECT q.id, q.project_id, COALESCE(p.name, q.project_id), q.session_id, q.channel,
                 q.user_message_id, q.system_message_id, q.knowledge_doc_id, q.raw_event_id,
                 q.title_preview, q.source_type, q.archived_path, q.status, q.attempts,
-                q.last_error, q.created_at, q.updated_at
+                q.last_error, q.priority_order,
+                COALESCE(cm.created_at, re.created_at, kd.ingested_at, q.created_at) AS effective_created_at,
+                q.updated_at
          FROM pending_ai_queue q
          LEFT JOIN projects p ON p.id = q.project_id
+         LEFT JOIN chat_messages cm ON cm.id = q.user_message_id
+         LEFT JOIN raw_events re ON re.id = q.raw_event_id
+         LEFT JOIN knowledge_documents kd ON kd.id = q.knowledge_doc_id
          WHERE q.status IN ('PENDING', 'PROCESSING')
-         ORDER BY q.id ASC",
+         ORDER BY q.priority_order DESC, effective_created_at ASC, q.id ASC",
     )?;
     let items: Vec<PendingQueueItem> = stmt
         .query_map([], |r| {
@@ -2203,8 +2783,9 @@ pub fn query_pending_ai_queue(conn: &Connection) -> Result<Vec<PendingQueueItem>
                 status: r.get(12)?,
                 attempts: r.get(13)?,
                 last_error: r.get(14)?,
-                created_at: r.get(15)?,
-                updated_at: r.get(16)?,
+                priority_order: r.get(15).unwrap_or(0),
+                created_at: r.get(16)?,
+                updated_at: r.get(17)?,
             })
         })?
         .filter_map(|r| r.ok())
@@ -2217,7 +2798,7 @@ pub fn get_pending_queue_item(conn: &Connection, queue_id: i64) -> Result<Pendin
         "SELECT q.id, q.project_id, COALESCE(p.name, q.project_id), q.session_id, q.channel,
                 q.user_message_id, q.system_message_id, q.knowledge_doc_id, q.raw_event_id,
                 q.title_preview, q.source_type, q.archived_path, q.status, q.attempts,
-                q.last_error, q.created_at, q.updated_at
+                q.last_error, q.priority_order, q.created_at, q.updated_at
          FROM pending_ai_queue q
          LEFT JOIN projects p ON p.id = q.project_id
          WHERE q.id = ?1",
@@ -2239,11 +2820,447 @@ pub fn get_pending_queue_item(conn: &Connection, queue_id: i64) -> Result<Pendin
                 status: r.get(12)?,
                 attempts: r.get(13)?,
                 last_error: r.get(14)?,
-                created_at: r.get(15)?,
-                updated_at: r.get(16)?,
+                priority_order: r.get(15).unwrap_or(0),
+                created_at: r.get(16)?,
+                updated_at: r.get(17)?,
             })
         },
     )
+}
+
+/// Reorders a pending queue item ("TOP" | "UP" | "DOWN") by normalizing priority_order across active queue items
+pub fn reorder_pending_queue_item(
+    conn: &Connection,
+    queue_id: i64,
+    direction: &str,
+) -> Result<()> {
+    let items = query_pending_ai_queue(conn)?;
+    if items.len() <= 1 {
+        return Ok(());
+    }
+    let Some(idx) = items.iter().position(|it| it.id == queue_id) else {
+        return Ok(());
+    };
+
+    let mut ordered_ids: Vec<i64> = items.iter().map(|it| it.id).collect();
+    match direction.trim().to_uppercase().as_str() {
+        "TOP" => {
+            if idx == 0 {
+                return Ok(());
+            }
+            let id = ordered_ids.remove(idx);
+            ordered_ids.insert(0, id);
+        }
+        "UP" => {
+            if idx == 0 {
+                return Ok(());
+            }
+            ordered_ids.swap(idx - 1, idx);
+        }
+        "DOWN" => {
+            if idx + 1 >= ordered_ids.len() {
+                return Ok(());
+            }
+            ordered_ids.swap(idx, idx + 1);
+        }
+        _ => return Ok(()),
+    }
+
+    let total = ordered_ids.len() as i32;
+    let now = Local::now().to_rfc3339();
+    for (pos, id) in ordered_ids.into_iter().enumerate() {
+        let rank = total - pos as i32;
+        conn.execute(
+            "UPDATE pending_ai_queue SET priority_order = ?1, updated_at = ?2 WHERE id = ?3",
+            params![rank, now, id],
+        )?;
+    }
+    Ok(())
+}
+
+/// Resets manual priority overrides so the queue falls back strictly to chronological creation time
+pub fn reset_pending_queue_order(conn: &Connection) -> Result<()> {
+    let now = Local::now().to_rfc3339();
+    conn.execute(
+        "UPDATE pending_ai_queue SET priority_order = 0, updated_at = ?1 WHERE status IN ('PENDING', 'PROCESSING')",
+        params![now],
+    )?;
+    Ok(())
+}
+
+// ============================================================================
+// Manual 5-Layer Ecosystem Management (Outcomes, WorkLines, Tasks, Cards, Proposals, Calendar)
+// ============================================================================
+
+#[allow(clippy::too_many_arguments)]
+pub fn upsert_outcome_manual(
+    conn: &Connection,
+    outcome_id: Option<&str>,
+    domain_code: &str,
+    title: &str,
+    desired_reality_change: &str,
+    evidence_kr: &str,
+    time_window: &str,
+    status: &str,
+    progress_percent: i32,
+) -> Result<String> {
+    let now = Local::now().to_rfc3339();
+    let clean_title = title.trim();
+    if clean_title.is_empty() {
+        return Err(rusqlite::Error::InvalidParameterName("عنوان Outcome نمی‌تواند خالی باشد".into()));
+    }
+    let clean_domain = if domain_code.trim().is_empty() {
+        "WEALTH_FINANCE"
+    } else {
+        domain_code.trim()
+    };
+    let clean_status = if status.trim().is_empty() { "ACTIVE" } else { status.trim() };
+    let clamped_progress = progress_percent.clamp(0, 100);
+
+    let target_id = outcome_id
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("OUT-{}", &uuid::Uuid::new_v4().to_string()[..4].to_uppercase()));
+
+    let exists: bool = conn
+        .query_row("SELECT COUNT(*) FROM outcomes WHERE id = ?1", params![target_id], |r| r.get::<_, i64>(0))
+        .unwrap_or(0)
+        > 0;
+
+    if exists {
+        conn.execute(
+            "UPDATE outcomes
+             SET domain_code = ?1, title = ?2, desired_reality_change = ?3, evidence_kr = ?4,
+                 time_window = ?5, status = ?6, progress_percent = ?7, updated_at = ?8
+             WHERE id = ?9",
+            params![
+                clean_domain,
+                clean_title,
+                desired_reality_change.trim(),
+                evidence_kr.trim(),
+                time_window.trim(),
+                clean_status,
+                clamped_progress,
+                now,
+                target_id
+            ],
+        )?;
+    } else {
+        conn.execute(
+            "INSERT INTO outcomes (
+                id, domain_code, title, desired_reality_change, evidence_kr, time_window,
+                status, progress_percent, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+            params![
+                target_id,
+                clean_domain,
+                clean_title,
+                desired_reality_change.trim(),
+                evidence_kr.trim(),
+                time_window.trim(),
+                clean_status,
+                clamped_progress,
+                now
+            ],
+        )?;
+    }
+    Ok(target_id)
+}
+
+pub fn delete_outcome(conn: &Connection, outcome_id: &str) -> Result<()> {
+    let now = Local::now().to_rfc3339();
+    conn.execute(
+        "UPDATE work_lines SET outcome_id = NULL, updated_at = ?1 WHERE outcome_id = ?2",
+        params![now, outcome_id],
+    )?;
+    conn.execute(
+        "UPDATE work_entities SET outcome_id = NULL, updated_at = ?1 WHERE outcome_id = ?2",
+        params![now, outcome_id],
+    )?;
+    conn.execute("DELETE FROM outcomes WHERE id = ?1", params![outcome_id])?;
+    Ok(())
+}
+
+pub fn update_work_line_manual(
+    conn: &Connection,
+    work_line_id: &str,
+    title: &str,
+    goal_statement: &str,
+    outcome_id: Option<&str>,
+    color_hex: &str,
+    status: &str,
+) -> Result<()> {
+    let now = Local::now().to_rfc3339();
+    let norm_outcome = outcome_id.map(str::trim).filter(|s| !s.is_empty());
+    let clean_color = if color_hex.trim().is_empty() { "#3B82F6" } else { color_hex.trim() };
+    let clean_status = if status.trim().is_empty() { "ACTIVE" } else { status.trim() };
+
+    conn.execute(
+        "UPDATE work_lines
+         SET title = ?1, goal_statement = ?2, outcome_id = ?3, color_hex = ?4, status = ?5, updated_at = ?6
+         WHERE id = ?7",
+        params![title.trim(), goal_statement.trim(), norm_outcome, clean_color, clean_status, now, work_line_id],
+    )?;
+
+    // Propagate outcome change to member tasks of this work line
+    conn.execute(
+        "UPDATE work_entities SET outcome_id = ?1, updated_at = ?2 WHERE work_line_id = ?3",
+        params![norm_outcome, now, work_line_id],
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn assign_task_grouping(
+    conn: &Connection,
+    project_id: &str,
+    task_id: &str,
+    work_line_id: Option<&str>,
+    outcome_id: Option<&str>,
+    priority_score: Option<i32>,
+    energy_tag: Option<&str>,
+    device_tag: Option<&str>,
+    duration_minutes: Option<i32>,
+    scheduled_date: Option<&str>,
+) -> Result<()> {
+    let _ = ensure_chain_columns(conn);
+    let now = Local::now().to_rfc3339();
+    let norm_wl = work_line_id.map(str::trim).filter(|s| !s.is_empty());
+    let mut norm_out = outcome_id.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+
+    // If assigned to a work_line and no explicit outcome_id given, inherit the work_line's outcome_id
+    if let Some(wl_id) = norm_wl {
+        if norm_out.is_none() {
+            norm_out = conn
+                .query_row("SELECT outcome_id FROM work_lines WHERE id = ?1", params![wl_id], |r| r.get::<_, Option<String>>(0))
+                .ok()
+                .flatten();
+        }
+    }
+
+    // Compute sequence_order & lock status if moved into a SEQUENTIAL_CHAIN
+    let mut next_seq: i32 = 1;
+    let mut next_depends: Option<String> = None;
+    let mut should_lock = false;
+    let mut next_status_override: Option<&str> = None;
+
+    if let Some(wl_id) = norm_wl {
+        let line_mode: String = conn
+            .query_row("SELECT line_mode FROM work_lines WHERE id = ?1", params![wl_id], |r| r.get(0))
+            .unwrap_or_else(|_| "GOAL_CLUSTER".to_string());
+        let max_seq: i32 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(sequence_order), 0) FROM work_entities WHERE work_line_id = ?1 AND id != ?2",
+                params![wl_id, task_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        next_seq = max_seq + 1;
+        if line_mode == "SEQUENTIAL_CHAIN" && max_seq > 0 {
+            let open_prev: Option<String> = conn
+                .query_row(
+                    "SELECT id FROM work_entities
+                     WHERE work_line_id = ?1 AND id != ?2 AND status != 'CLOSED'
+                     ORDER BY sequence_order DESC LIMIT 1",
+                    params![wl_id, task_id],
+                    |r| r.get(0),
+                )
+                .ok();
+            if let Some(prev_id) = open_prev {
+                next_depends = Some(prev_id);
+                should_lock = true;
+                next_status_override = Some("QUEUED_IN_CHAIN");
+            }
+        }
+    } else {
+        // Standalone task cannot remain QUEUED_IN_CHAIN
+        let cur_status: String = conn
+            .query_row("SELECT status FROM work_entities WHERE id = ?1", params![task_id], |r| r.get(0))
+            .unwrap_or_else(|_| "OPEN".to_string());
+        if cur_status == "QUEUED_IN_CHAIN" {
+            next_status_override = Some("OPEN");
+        }
+    }
+
+    conn.execute(
+        "UPDATE work_entities
+         SET work_line_id = ?1,
+             outcome_id = ?2,
+             sequence_order = ?3,
+             depends_on_task_id = ?4,
+             is_locked_by_chain = ?5,
+             status = COALESCE(?6, status),
+             priority_score = COALESCE(?7, priority_score),
+             energy_tag = COALESCE(?8, energy_tag),
+             device_tag = COALESCE(?9, device_tag),
+             duration_minutes = COALESCE(?10, duration_minutes),
+             scheduled_date = CASE WHEN ?11 IS NOT NULL THEN NULLIF(?11, '') ELSE scheduled_date END,
+             updated_at = ?12
+         WHERE id = ?13 AND project_id = ?14",
+        params![
+            norm_wl,
+            norm_out,
+            next_seq,
+            next_depends,
+            if should_lock { 1 } else { 0 },
+            next_status_override,
+            priority_score,
+            energy_tag.map(str::trim).filter(|s| !s.is_empty()),
+            device_tag.map(str::trim).filter(|s| !s.is_empty()),
+            duration_minutes,
+            scheduled_date,
+            now,
+            task_id,
+            project_id
+        ],
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn create_task_manual(
+    conn: &Connection,
+    project_id: &str,
+    title: &str,
+    category: &str,
+    definition_of_done: &str,
+    first_physical_action: &str,
+    work_line_id: Option<&str>,
+    outcome_id: Option<&str>,
+    energy_tag: &str,
+    device_tag: &str,
+    duration_minutes: i32,
+    scheduled_date: Option<&str>,
+) -> Result<String> {
+    let _ = ensure_chain_columns(conn);
+    let now = Local::now().to_rfc3339();
+    let task_id = format!("TSK-{}", &uuid::Uuid::new_v4().to_string()[..4].to_uppercase());
+    let clean_cat = if category.trim().is_empty() { "GENERAL" } else { category.trim() };
+    let clean_energy = if energy_tag.trim().is_empty() { "MEDIUM_NORMAL" } else { energy_tag.trim() };
+    let clean_device = if device_tag.trim().is_empty() { "LAPTOP_ONLY" } else { device_tag.trim() };
+    let dur = duration_minutes.max(5);
+    let pomos = (dur as f64 / 25.0).max(0.5);
+
+    conn.execute(
+        "INSERT INTO work_entities (
+            id, project_id, entity_type, category, title, definition_of_done, first_physical_action,
+            status, is_on_critical_path, optimistic_pomos, most_likely_pomos, pessimistic_pomos, calibrated_pomos,
+            energy_tag, duration_minutes, device_tag, scheduled_date, priority_score, updated_at
+         ) VALUES (?1, ?2, 'TASK', ?3, ?4, ?5, ?6, 'OPEN', 0, ?7, ?7, ?7, ?7, ?8, ?9, ?10, ?11, 50, ?12)",
+        params![
+            task_id,
+            project_id,
+            clean_cat,
+            title.trim(),
+            definition_of_done.trim(),
+            first_physical_action.trim(),
+            pomos,
+            clean_energy,
+            dur,
+            clean_device,
+            scheduled_date.map(str::trim).filter(|s| !s.is_empty()),
+            now
+        ],
+    )?;
+
+    if work_line_id.is_some() || outcome_id.is_some() {
+        assign_task_grouping(
+            conn,
+            project_id,
+            &task_id,
+            work_line_id,
+            outcome_id,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )?;
+    }
+    Ok(task_id)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn create_personal_vault_item(
+    conn: &Connection,
+    project_id: Option<&str>,
+    realm: &str,
+    domain_code: &str,
+    item_type: &str,
+    title: &str,
+    content_markdown: &str,
+    tags: &[String],
+) -> Result<String> {
+    let now = Local::now().to_rfc3339();
+    let id = format!("PVI-{}", &uuid::Uuid::new_v4().to_string()[..4].to_uppercase());
+    let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".to_string());
+    let clean_realm = if realm.trim().is_empty() { "WORK" } else { realm.trim() };
+    let clean_domain = if domain_code.trim().is_empty() { "MIND_LEARNING" } else { domain_code.trim() };
+    let clean_type = if item_type.trim().is_empty() { "MEMORY_CARD" } else { item_type.trim() };
+
+    conn.execute(
+        "INSERT INTO personal_vault_items (
+            id, realm, domain_code, project_id, item_type, title, content_markdown, tags_json, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+        params![
+            id,
+            clean_realm,
+            clean_domain,
+            project_id.map(str::trim).filter(|s| !s.is_empty()),
+            clean_type,
+            title.trim(),
+            content_markdown.trim(),
+            tags_json,
+            now
+        ],
+    )?;
+    Ok(id)
+}
+
+pub fn delete_personal_vault_item(conn: &Connection, item_id: &str) -> Result<()> {
+    conn.execute("DELETE FROM personal_vault_items WHERE id = ?1", params![item_id])?;
+    Ok(())
+}
+
+pub fn resolve_pending_proposal(conn: &Connection, proposal_id: &str, approve: bool) -> Result<()> {
+    let now = Local::now().to_rfc3339();
+    let status = if approve { "APPROVED" } else { "REJECTED" };
+    conn.execute(
+        "UPDATE pending_proposals SET status = ?1, resolved_at = ?2 WHERE id = ?3",
+        params![status, now, proposal_id],
+    )?;
+    Ok(())
+}
+
+pub fn upsert_calendar_day(
+    conn: &Connection,
+    date_key: &str,
+    total_capacity_minutes: i32,
+    deep_capacity_minutes: i32,
+    day_note: &str,
+    is_off_day: bool,
+) -> Result<()> {
+    let now = Local::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO calendar_days (date_key, total_capacity_minutes, deep_capacity_minutes, day_note, is_off_day, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(date_key) DO UPDATE SET
+            total_capacity_minutes = excluded.total_capacity_minutes,
+            deep_capacity_minutes = excluded.deep_capacity_minutes,
+            day_note = excluded.day_note,
+            is_off_day = excluded.is_off_day,
+            updated_at = excluded.updated_at",
+        params![
+            date_key.trim(),
+            total_capacity_minutes.max(0),
+            deep_capacity_minutes.max(0),
+            day_note.trim(),
+            if is_off_day { 1 } else { 0 },
+            now
+        ],
+    )?;
+    Ok(())
 }
 
 pub fn set_pending_item_processing(conn: &Connection, queue_id: i64) -> Result<()> {
@@ -2454,6 +3471,452 @@ pub fn undo_last_mutation(conn: &mut Connection, project_id: &str) -> Result<Str
     }
 }
 
+// ==============================================================================
+// SEQUENTIAL CHAIN ENGINE & CONTEXT-AWARE TASK EXECUTION (v3.0 MILESTONE 2)
+// ==============================================================================
+
+/// Ensures `is_locked_by_chain` column exists on `work_entities`
+pub fn ensure_chain_columns(conn: &Connection) -> Result<()> {
+    let pragma_cols: Vec<String> = {
+        let mut stmt = conn.prepare("PRAGMA table_info(work_entities)")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+    if !pragma_cols.iter().any(|c| c == "is_locked_by_chain") {
+        let _ = conn.execute(
+            "ALTER TABLE work_entities ADD COLUMN is_locked_by_chain INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+    }
+    Ok(())
+}
+
+/// Helper to load a single WorkEntity by its ID with all v3.0 columns
+pub fn query_work_entity_by_id(conn: &Connection, task_id: &str) -> Result<Option<WorkEntity>> {
+    let _ = ensure_chain_columns(conn);
+    let mut stmt = conn.prepare(
+        "SELECT id, project_id, entity_type, category, title, definition_of_done, first_physical_action,
+                status, is_on_critical_path, optimistic_pomos, most_likely_pomos, pessimistic_pomos,
+                calibrated_pomos, superseded_by_id, stakeholder_tag, updated_at,
+                work_line_id, outcome_id, sequence_order, depends_on_task_id, energy_tag, duration_minutes,
+                device_tag, location_tags_json, scheduled_date, scheduled_slot, due_date, priority_score,
+                is_locked_by_chain
+         FROM work_entities WHERE id = ?1",
+    )?;
+
+    let mut rows = stmt.query(params![task_id])?;
+    if let Some(r) = rows.next()? {
+        let mut entity = map_work_entity_from_row(r)?;
+        entity.is_locked_by_chain = is_locked_by_chain(conn, &entity.id).unwrap_or(false);
+        Ok(Some(entity))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Atomically creates a WorkLine and sequential chain of tasks.
+/// - Creates a `work_lines` record (ID prefix `WLN-`, status = 'ACTIVE', line_mode = 'SEQUENTIAL_CHAIN' or 'GOAL_CLUSTER').
+/// - Atomically creates `work_entities` for each step:
+///   - Step 1 (idx 0): sequence_order = 1, status = "IN_PROGRESS", depends_on_task_id = None, is_locked_by_chain = false, is_on_critical_path = true.
+///   - Step 2..N (idx 1..N-1): sequence_order = idx + 1, status = "QUEUED_IN_CHAIN", depends_on_task_id = Some(previous_task_id), is_locked_by_chain = true, is_on_critical_path = false.
+///   - Populates 4D context tags from ChainStepInput (energy_tag, duration_minutes, device_tag, location_tags_json).
+/// Returns `(WorkLine, Vec<WorkEntity>)`.
+pub fn create_work_line_with_chain(
+    conn: &Connection,
+    project_id: &str,
+    outcome_id: Option<&str>,
+    title: &str,
+    goal_statement: &str,
+    line_mode: &str,
+    steps: Vec<ChainStepInput>,
+) -> Result<(WorkLine, Vec<WorkEntity>)> {
+    let _ = ensure_chain_columns(conn);
+
+    let line_id = format!("WLN-{}", &uuid::Uuid::new_v4().to_string()[..8].to_uppercase());
+    let now = Local::now().to_rfc3339();
+    let mode = if line_mode.trim().is_empty() {
+        "SEQUENTIAL_CHAIN"
+    } else {
+        line_mode.trim()
+    };
+
+    conn.execute(
+        "INSERT INTO work_lines (
+            id, project_id, outcome_id, title, goal_statement, line_mode, status, color_hex,
+            created_at, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'ACTIVE', '#3B82F6', ?7, ?7)",
+        params![line_id, project_id, outcome_id, title, goal_statement, mode, now],
+    )?;
+
+    let mut created_entities = Vec::with_capacity(steps.len());
+    let mut prev_task_id: Option<String> = None;
+
+    for (idx, step) in steps.into_iter().enumerate() {
+        let task_id = format!("TSK-{}", &uuid::Uuid::new_v4().to_string()[..8].to_uppercase());
+        let seq_order = (idx + 1) as i32;
+        let is_step_one = idx == 0;
+        let status = if is_step_one {
+            "IN_PROGRESS"
+        } else {
+            "QUEUED_IN_CHAIN"
+        };
+        let is_locked = !is_step_one;
+        let is_on_critical_path = is_step_one;
+        let depends_on = if is_step_one {
+            None
+        } else {
+            prev_task_id.clone()
+        };
+
+        let energy_tag = if step.energy_tag.trim().is_empty() {
+            "MEDIUM_NORMAL".to_string()
+        } else {
+            step.energy_tag.trim().to_string()
+        };
+        let duration_minutes = if step.duration_minutes <= 0 {
+            25
+        } else {
+            step.duration_minutes
+        };
+        let device_tag = if step.device_tag.trim().is_empty() {
+            "LAPTOP_ONLY".to_string()
+        } else {
+            step.device_tag.trim().to_string()
+        };
+        let location_tags = if step.location_tags.is_empty() {
+            vec!["DESK".to_string()]
+        } else {
+            step.location_tags
+        };
+        let location_tags_json =
+            serde_json::to_string(&location_tags).unwrap_or_else(|_| "[\"DESK\"]".to_string());
+        let category = if step.category.trim().is_empty() {
+            "GENERAL".to_string()
+        } else {
+            step.category.trim().to_string()
+        };
+        let priority_score = 50;
+
+        conn.execute(
+            "INSERT INTO work_entities (
+                id, project_id, entity_type, category, title, definition_of_done, first_physical_action,
+                status, is_on_critical_path, optimistic_pomos, most_likely_pomos, pessimistic_pomos, calibrated_pomos,
+                work_line_id, outcome_id, sequence_order, depends_on_task_id, is_locked_by_chain,
+                energy_tag, duration_minutes, device_tag, location_tags_json, scheduled_date, scheduled_slot, due_date, priority_score, updated_at
+            ) VALUES (
+                ?1, ?2, 'TASK', ?3, ?4, ?5, ?6,
+                ?7, ?8, 1.0, 2.0, 3.0, 2.0,
+                ?9, ?10, ?11, ?12, ?13,
+                ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22
+            )",
+            params![
+                task_id,
+                project_id,
+                category,
+                step.title,
+                step.definition_of_done,
+                step.first_physical_action,
+                status,
+                if is_on_critical_path { 1 } else { 0 },
+                line_id,
+                outcome_id,
+                seq_order,
+                depends_on,
+                if is_locked { 1 } else { 0 },
+                energy_tag,
+                duration_minutes,
+                device_tag,
+                location_tags_json,
+                step.scheduled_date,
+                step.scheduled_slot,
+                step.due_date,
+                priority_score,
+                now
+            ],
+        )?;
+
+        let entity = WorkEntity {
+            id: task_id.clone(),
+            project_id: project_id.to_string(),
+            project_name: String::new(),
+            entity_type: "TASK".to_string(),
+            category,
+            title: step.title,
+            definition_of_done: step.definition_of_done,
+            first_physical_action: step.first_physical_action,
+            status: status.to_string(),
+            is_on_critical_path,
+            optimistic_pomos: 1.0,
+            most_likely_pomos: 2.0,
+            pessimistic_pomos: 3.0,
+            calibrated_pomos: 2.0,
+            superseded_by_id: None,
+            stakeholder_tag: None,
+            updated_at: now.clone(),
+            work_line_id: Some(line_id.clone()),
+            work_line_title: Some(title.to_string()),
+            outcome_id: outcome_id.map(str::to_string),
+            sequence_order: seq_order,
+            depends_on_task_id: depends_on,
+            is_locked_by_chain: is_locked,
+            energy_tag,
+            duration_minutes,
+            device_tag,
+            location_tags,
+            scheduled_date: step.scheduled_date,
+            scheduled_slot: step.scheduled_slot,
+            due_date: step.due_date,
+            priority_score,
+        };
+
+        prev_task_id = Some(task_id);
+        created_entities.push(entity);
+    }
+
+    let work_line = WorkLine {
+        id: line_id,
+        project_id: project_id.to_string(),
+        project_name: String::new(),
+        outcome_id: outcome_id.map(str::to_string),
+        outcome_title: None,
+        title: title.to_string(),
+        goal_statement: goal_statement.to_string(),
+        line_mode: mode.to_string(),
+        status: "ACTIVE".to_string(),
+        color_hex: "#3B82F6".to_string(),
+        total_tasks: created_entities.len() as i32,
+        completed_tasks: 0,
+        active_step_id: created_entities.first().map(|e| e.id.clone()),
+        created_at: now.clone(),
+        updated_at: now,
+    };
+
+    Ok((work_line, created_entities))
+}
+
+/// Evaluates whether a task is locked by its sequential chain:
+/// - If task has no `work_line_id`, returns `false`.
+/// - If parent `work_lines.line_mode != 'SEQUENTIAL_CHAIN'`, returns `false`.
+/// - If task status is `'CLOSED'` or `'SUPERSEDED'`, returns `false`.
+/// - Checks if any preceding step in the same chain (with `sequence_order < current_task.sequence_order`) is not `'CLOSED'`.
+/// - Returns `true` if any preceding step is unclosed; otherwise `false`.
+pub fn is_locked_by_chain(conn: &Connection, task_id: &str) -> Result<bool> {
+    let row: Option<(Option<String>, i32, String)> = conn
+        .query_row(
+            "SELECT work_line_id, sequence_order, status FROM work_entities WHERE id = ?1",
+            params![task_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .ok();
+
+    let (work_line_id, seq_order, status) = match row {
+        Some((Some(wln), seq, st)) if !wln.is_empty() => (wln, seq, st),
+        _ => return Ok(false),
+    };
+
+    if status == "CLOSED" || status == "SUPERSEDED" {
+        return Ok(false);
+    }
+
+    let line_mode: Option<String> = conn
+        .query_row(
+            "SELECT line_mode FROM work_lines WHERE id = ?1",
+            params![work_line_id],
+            |r| r.get(0),
+        )
+        .ok();
+
+    if let Some(mode) = line_mode {
+        if mode != "SEQUENTIAL_CHAIN" {
+            return Ok(false);
+        }
+    } else {
+        return Ok(false);
+    }
+
+    if seq_order <= 1 {
+        return Ok(false);
+    }
+
+    let unclosed_prior: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM work_entities WHERE work_line_id = ?1 AND sequence_order < ?2 AND status != 'CLOSED'",
+        params![work_line_id, seq_order],
+        |r| r.get(0),
+    )?;
+
+    Ok(unclosed_prior > 0)
+}
+
+/// Domino auto-advancement:
+/// - Updates the completed task: status = 'CLOSED', is_locked_by_chain = false.
+/// - Checks if the task belongs to a SEQUENTIAL_CHAIN WorkLine.
+/// - If so, finds the immediate next step (`sequence_order > completed.sequence_order` and status in `["QUEUED_IN_CHAIN", "OPEN"]` ordered by `sequence_order ASC LIMIT 1`).
+/// - If a next step exists: updates it to `status = 'IN_PROGRESS'`, `is_locked_by_chain = false`, `is_on_critical_path = true`, and returns `Some(WorkEntity)`.
+/// - If no further uncompleted steps exist in the WorkLine (all steps are `'CLOSED'`), marks the parent `work_lines.status = 'COMPLETED'` and returns `None`.
+pub fn advance_sequential_chain_on_complete(
+    conn: &Connection,
+    project_id: &str,
+    completed_task_id: &str,
+) -> Result<Option<WorkEntity>> {
+    let _ = ensure_chain_columns(conn);
+    let now = Local::now().to_rfc3339();
+
+    // 1. Mark completed task as CLOSED and unlocked
+    conn.execute(
+        "UPDATE work_entities SET status = 'CLOSED', is_locked_by_chain = 0, updated_at = ?1
+         WHERE id = ?2 AND project_id = ?3",
+        params![now, completed_task_id, project_id],
+    )?;
+
+    // 2. Fetch work_line_id and sequence_order of completed task
+    let meta: Option<(Option<String>, i32)> = conn
+        .query_row(
+            "SELECT work_line_id, sequence_order FROM work_entities WHERE id = ?1",
+            params![completed_task_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok();
+
+    if let Some((Some(line_id), seq_order)) = meta {
+        // Check if parent work_line is SEQUENTIAL_CHAIN
+        let line_mode: Option<String> = conn
+            .query_row(
+                "SELECT line_mode FROM work_lines WHERE id = ?1",
+                params![line_id],
+                |r| r.get(0),
+            )
+            .ok();
+
+        if line_mode.as_deref() == Some("SEQUENTIAL_CHAIN") {
+            // Find next step in chain
+            let next_task: Option<String> = conn
+                .query_row(
+                    "SELECT id FROM work_entities
+                     WHERE work_line_id = ?1 AND status IN ('QUEUED_IN_CHAIN', 'OPEN') AND sequence_order > ?2
+                     ORDER BY sequence_order ASC LIMIT 1",
+                    params![line_id, seq_order],
+                    |r| r.get(0),
+                )
+                .ok();
+
+            if let Some(next_id) = next_task {
+                conn.execute(
+                    "UPDATE work_entities
+                     SET status = 'IN_PROGRESS', is_locked_by_chain = 0, is_on_critical_path = 1, updated_at = ?1
+                     WHERE id = ?2",
+                    params![now, next_id],
+                )?;
+                return query_work_entity_by_id(conn, &next_id);
+            } else {
+                // Check if all tasks in the work_line are CLOSED
+                let open_count: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM work_entities WHERE work_line_id = ?1 AND status != 'CLOSED'",
+                    params![line_id],
+                    |r| r.get(0),
+                )?;
+
+                if open_count == 0 {
+                    conn.execute(
+                        "UPDATE work_lines SET status = 'COMPLETED', updated_at = ?1 WHERE id = ?2",
+                        params![now, line_id],
+                    )?;
+                }
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+/// Queries work_entities for actionable tasks matching user execution context:
+/// - Filters by entity_type = 'TASK' and status NOT IN ('CLOSED', 'SUPERSEDED').
+/// - If `only_unlocked == true`, filters out any task where `is_locked_by_chain` is true or `is_locked_by_chain(conn, &task.id)?` is true.
+/// - Matches `device_tag` (if provided, matches or if task device_tag is `ANY_DEVICE`).
+/// - Matches `location_tag` (if provided, checks if `location_tags_json` contains the tag or `ANY_LOCATION`).
+/// - Matches `energy_tag` (if provided, matches energy level).
+/// - Matches `max_minutes` (if provided, duration_minutes <= max_minutes).
+/// - Orders by priority_score DESC, sequence_order ASC, updated_at DESC.
+pub fn query_tasks_by_context(
+    conn: &Connection,
+    project_id: &str,
+    device_tag: Option<&str>,
+    location_tag: Option<&str>,
+    energy_tag: Option<&str>,
+    max_minutes: Option<i32>,
+    only_unlocked: bool,
+) -> Result<Vec<WorkEntity>> {
+    let _ = ensure_chain_columns(conn);
+
+    let mut sql = String::from(
+        "SELECT id, project_id, entity_type, category, title, definition_of_done, first_physical_action,
+                status, is_on_critical_path, optimistic_pomos, most_likely_pomos, pessimistic_pomos,
+                calibrated_pomos, superseded_by_id, stakeholder_tag, updated_at,
+                work_line_id, outcome_id, sequence_order, depends_on_task_id, energy_tag, duration_minutes,
+                device_tag, location_tags_json, scheduled_date, scheduled_slot, due_date, priority_score,
+                is_locked_by_chain
+         FROM work_entities
+         WHERE entity_type = 'TASK' AND status NOT IN ('CLOSED', 'SUPERSEDED')"
+    );
+
+    let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+    if !project_id.trim().is_empty() {
+        sql.push_str(" AND project_id = ?");
+        params_vec.push(Box::new(project_id.trim().to_string()));
+    }
+
+    if only_unlocked {
+        sql.push_str(" AND status != 'QUEUED_IN_CHAIN' AND is_locked_by_chain = 0");
+    }
+
+    if let Some(dev) = device_tag.map(str::trim).filter(|s| !s.is_empty() && *s != "ALL") {
+        sql.push_str(" AND (device_tag = ? OR device_tag = 'ANY_DEVICE')");
+        params_vec.push(Box::new(dev.to_string()));
+    }
+
+    if let Some(loc) = location_tag.map(str::trim).filter(|s| !s.is_empty() && *s != "ALL") {
+        sql.push_str(" AND (location_tags_json LIKE ? OR location_tags_json LIKE '%\"ANY_LOCATION\"%')");
+        params_vec.push(Box::new(format!("%\"{}\"%", loc)));
+    }
+
+    if let Some(eng) = energy_tag.map(str::trim).filter(|s| !s.is_empty() && *s != "ALL") {
+        sql.push_str(" AND energy_tag = ?");
+        params_vec.push(Box::new(eng.to_string()));
+    }
+
+    if let Some(max_m) = max_minutes.filter(|m| *m > 0) {
+        sql.push_str(" AND duration_minutes <= ?");
+        params_vec.push(Box::new(max_m));
+    }
+
+    sql.push_str(" ORDER BY priority_score DESC, sequence_order ASC, updated_at DESC");
+
+    let params_slice: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|b| b.as_ref()).collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_slice.as_slice(), map_work_entity_from_row)?;
+
+    let mut result = Vec::new();
+    for item in rows {
+        let mut task = item?;
+        let locked = is_locked_by_chain(conn, &task.id)?;
+        task.is_locked_by_chain = locked;
+
+        if only_unlocked && locked {
+            continue;
+        }
+
+        if let Some(loc) = location_tag.map(str::trim).filter(|s| !s.is_empty() && *s != "ALL") {
+            if !task.location_tags.iter().any(|t| t == loc || t == "ANY_LOCATION") {
+                continue;
+            }
+        }
+
+        result.push(task);
+    }
+
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2498,6 +3961,7 @@ mod tests {
                     deliverable_summary: None,
                     internal_friction_note: None,
                     client_sanitized_note: None,
+                    ..Default::default()
                 },
                 AtomicMutation {
                     op: "CREATE_ENTITY".into(),
@@ -2521,6 +3985,7 @@ mod tests {
                     deliverable_summary: None,
                     internal_friction_note: None,
                     client_sanitized_note: None,
+                    ..Default::default()
                 },
             ],
         };
@@ -2650,6 +4115,7 @@ mod tests {
             deliverable_summary: None,
             internal_friction_note: None,
             client_sanitized_note: None,
+            ..Default::default()
         });
 
         let badge1 = apply_copilot_envelope(
@@ -2708,6 +4174,7 @@ mod tests {
                 deliverable_summary: None,
                 internal_friction_note: None,
                 client_sanitized_note: None,
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -2791,6 +4258,7 @@ mod tests {
             deliverable_summary: None,
             internal_friction_note: None,
             client_sanitized_note: None,
+            ..Default::default()
         };
         let mut m2 = m1.clone();
         m2.title = Some("تسک دوم".into());
@@ -2846,6 +4314,7 @@ mod tests {
                 deliverable_summary: None,
                 internal_friction_note: None,
                 client_sanitized_note: None,
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -2880,6 +4349,7 @@ mod tests {
                 deliverable_summary: None,
                 internal_friction_note: None,
                 client_sanitized_note: None,
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -3097,6 +4567,597 @@ mod tests {
         let queue_final = query_pending_ai_queue(&conn).unwrap();
         assert_eq!(queue_final.len(), 1);
         assert_eq!(queue_final[0].knowledge_doc_id, Some(orphan_doc_id));
+
+        drop(conn);
+        let _ = std::fs::remove_dir_all(PathBuf::from(dir));
+    }
+
+    #[test]
+    fn test_m2_sequential_chain_engine_and_context_queries() {
+        let dir = std::env::temp_dir().join(format!("mab_compass_m2_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("test_m2.sqlite");
+        let conn = init_database(&db_path, &dir).unwrap();
+
+        // 1. Test create_work_line_with_chain
+        let steps = vec![
+            ChainStepInput {
+                title: "مرحله ۱: طراحی ساختار".into(),
+                definition_of_done: "مستندات آماده باشد".into(),
+                first_physical_action: "باز کردن ادیتور".into(),
+                energy_tag: "DEEP_HIGH".into(),
+                duration_minutes: 50,
+                device_tag: "LAPTOP_ONLY".into(),
+                location_tags: vec!["DESK".into()],
+                category: "ARCHITECTURE".into(),
+                ..Default::default()
+            },
+            ChainStepInput {
+                title: "مرحله ۲: پیاده‌سازی سرویس".into(),
+                definition_of_done: "تست‌ها پاس شوند".into(),
+                first_physical_action: "کدنویسی متدها".into(),
+                energy_tag: "MEDIUM_NORMAL".into(),
+                duration_minutes: 25,
+                device_tag: "LAPTOP_ONLY".into(),
+                location_tags: vec!["DESK".into()],
+                category: "BACKEND".into(),
+                ..Default::default()
+            },
+            ChainStepInput {
+                title: "مرحله ۳: بازبینی نهایی روی موبایل".into(),
+                definition_of_done: "تایید کیفیت".into(),
+                first_physical_action: "نصب روی گوشی".into(),
+                energy_tag: "LOW_ZOMBIE".into(),
+                duration_minutes: 15,
+                device_tag: "PHONE_OK".into(),
+                location_tags: vec!["METRO_COMMUTE".into()],
+                category: "GENERAL".into(),
+                ..Default::default()
+            },
+        ];
+
+        let (work_line, entities) = create_work_line_with_chain(
+            &conn,
+            "GERDALO",
+            None,
+            "زنجیره تست M2",
+            "اتمام کامل تسک‌ها",
+            "SEQUENTIAL_CHAIN",
+            steps,
+        )
+        .expect("create_work_line_with_chain failed");
+
+        assert!(work_line.id.starts_with("WLN-"));
+        assert_eq!(work_line.line_mode, "SEQUENTIAL_CHAIN");
+        assert_eq!(work_line.status, "ACTIVE");
+        assert_eq!(entities.len(), 3);
+
+        // Step 1: active, unlocked, critical path
+        assert_eq!(entities[0].sequence_order, 1);
+        assert_eq!(entities[0].status, "IN_PROGRESS");
+        assert_eq!(entities[0].is_locked_by_chain, false);
+        assert_eq!(entities[0].is_on_critical_path, true);
+        assert!(entities[0].depends_on_task_id.is_none());
+
+        // Step 2: queued, locked, depends on step 1
+        assert_eq!(entities[1].sequence_order, 2);
+        assert_eq!(entities[1].status, "QUEUED_IN_CHAIN");
+        assert_eq!(entities[1].is_locked_by_chain, true);
+        assert_eq!(entities[1].is_on_critical_path, false);
+        assert_eq!(entities[1].depends_on_task_id.as_deref(), Some(entities[0].id.as_str()));
+
+        // Step 3: queued, locked, depends on step 2
+        assert_eq!(entities[2].sequence_order, 3);
+        assert_eq!(entities[2].status, "QUEUED_IN_CHAIN");
+        assert_eq!(entities[2].is_locked_by_chain, true);
+        assert_eq!(entities[2].depends_on_task_id.as_deref(), Some(entities[1].id.as_str()));
+
+        // 2. Test is_locked_by_chain
+        assert_eq!(is_locked_by_chain(&conn, &entities[0].id).unwrap(), false);
+        assert_eq!(is_locked_by_chain(&conn, &entities[1].id).unwrap(), true);
+        assert_eq!(is_locked_by_chain(&conn, &entities[2].id).unwrap(), true);
+
+        // Unchained standalone task
+        conn.execute(
+            "INSERT INTO work_entities (id, project_id, entity_type, category, title, status, is_locked_by_chain, updated_at)
+             VALUES ('TSK-SOLO-M2', 'GERDALO', 'TASK', 'GENERAL', 'Standalone', 'OPEN', 0, '2026-11-15T00:00:00Z')",
+            [],
+        ).unwrap();
+        assert_eq!(is_locked_by_chain(&conn, "TSK-SOLO-M2").unwrap(), false);
+
+        // Cluster task
+        conn.execute(
+            "INSERT INTO work_lines (id, project_id, title, line_mode, status, created_at, updated_at)
+             VALUES ('WLN-CLUSTER-M2', 'GERDALO', 'Cluster', 'GOAL_CLUSTER', 'ACTIVE', '2026-11-15T00:00:00Z', '2026-11-15T00:00:00Z')",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO work_entities (id, project_id, entity_type, category, title, work_line_id, sequence_order, status, is_locked_by_chain, updated_at)
+             VALUES ('TSK-CLUS-M2', 'GERDALO', 'TASK', 'GENERAL', 'Cluster Step', 'WLN-CLUSTER-M2', 2, 'OPEN', 0, '2026-11-15T00:00:00Z')",
+            [],
+        ).unwrap();
+        assert_eq!(is_locked_by_chain(&conn, "TSK-CLUS-M2").unwrap(), false);
+
+        // 3. Test query_tasks_by_context
+        // Query unlocked tasks for laptop: should match Step 1 and Standalone, but NOT Step 2 (locked)
+        let laptop_tasks = query_tasks_by_context(
+            &conn,
+            "GERDALO",
+            Some("LAPTOP_ONLY"),
+            None,
+            None,
+            None,
+            true, // only_unlocked
+        ).unwrap();
+        let laptop_ids: Vec<String> = laptop_tasks.iter().map(|t| t.id.clone()).collect();
+        assert!(laptop_ids.contains(&entities[0].id));
+        assert!(!laptop_ids.contains(&entities[1].id)); // step 2 locked!
+
+        // Query with only_unlocked = false: step 2 IS included
+        let all_laptop = query_tasks_by_context(
+            &conn,
+            "GERDALO",
+            Some("LAPTOP_ONLY"),
+            None,
+            None,
+            None,
+            false,
+        ).unwrap();
+        let all_laptop_ids: Vec<String> = all_laptop.iter().map(|t| t.id.clone()).collect();
+        assert!(all_laptop_ids.contains(&entities[0].id));
+        assert!(all_laptop_ids.contains(&entities[1].id));
+
+        // 4. Test advance_sequential_chain_on_complete (Domino effect)
+        // Complete Step 1 -> advances Step 2 to IN_PROGRESS
+        let promoted_1 = advance_sequential_chain_on_complete(&conn, "GERDALO", &entities[0].id).unwrap();
+        assert!(promoted_1.is_some());
+        let p1 = promoted_1.unwrap();
+        assert_eq!(p1.id, entities[1].id);
+        assert_eq!(p1.status, "IN_PROGRESS");
+        assert_eq!(p1.is_locked_by_chain, false);
+
+        // Step 2 is now unlocked; Step 3 remains locked
+        assert_eq!(is_locked_by_chain(&conn, &entities[1].id).unwrap(), false);
+        assert_eq!(is_locked_by_chain(&conn, &entities[2].id).unwrap(), true);
+
+        // Complete Step 2 -> advances Step 3 to IN_PROGRESS
+        let promoted_2 = advance_sequential_chain_on_complete(&conn, "GERDALO", &entities[1].id).unwrap();
+        assert!(promoted_2.is_some());
+        let p2 = promoted_2.unwrap();
+        assert_eq!(p2.id, entities[2].id);
+        assert_eq!(p2.status, "IN_PROGRESS");
+        assert_eq!(p2.is_locked_by_chain, false);
+        assert_eq!(is_locked_by_chain(&conn, &entities[2].id).unwrap(), false);
+
+        // Complete Step 3 (final step) -> returns None, marks parent work_lines COMPLETED
+        let final_promoted = advance_sequential_chain_on_complete(&conn, "GERDALO", &entities[2].id).unwrap();
+        assert!(final_promoted.is_none());
+
+        let line_status: String = conn
+            .query_row("SELECT status FROM work_lines WHERE id = ?1", params![work_line.id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(line_status, "COMPLETED");
+
+        drop(conn);
+        let _ = std::fs::remove_dir_all(PathBuf::from(dir));
+    }
+
+    #[test]
+    fn test_top_3_priority_steps_work_lines_progress_and_domino_quick_complete() {
+        let dir = format!("target/tmp/test_top3_{}", uuid::Uuid::new_v4());
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = PathBuf::from(&dir).join("compass.sqlite");
+        let vault_path = PathBuf::from(&dir).join("vault");
+        let mut conn = init_database(&db_path, &vault_path).expect("init db failed");
+
+        // Create an outcome
+        conn.execute(
+            "INSERT INTO outcomes (id, domain_code, title, desired_reality_change, evidence_kr, time_window, status, progress_percent, created_at, updated_at)
+             VALUES ('OUT-101', 'WEALTH_FINANCE', 'راه‌اندازی سیستم پایدار', 'تحول اجرایی', '۳ لاین تکمیل', 'Q4', 'ACTIVE', 25, '2026-11-10T10:00:00Z', '2026-11-10T10:00:00Z')",
+            [],
+        ).unwrap();
+
+        // Create 4 distinct WorkLines (3 sequential + 1 cluster) to verify top_priority_steps picks max 3 from distinct lines
+        let (wl1, e1) = create_work_line_with_chain(
+            &conn,
+            "GERDALO",
+            Some("OUT-101"),
+            "لاین ۱ - زیرساخت",
+            "ساخت لایه هسته",
+            "SEQUENTIAL_CHAIN",
+            vec![
+                ChainStepInput { title: "گام ۱-۱".into(), ..Default::default() },
+                ChainStepInput { title: "گام ۱-۲".into(), ..Default::default() },
+            ],
+        ).unwrap();
+
+        let (wl2, e2) = create_work_line_with_chain(
+            &conn,
+            "GERDALO",
+            Some("OUT-101"),
+            "لاین ۲ - فرانت‌اند",
+            "ساخت رابط کاربری",
+            "SEQUENTIAL_CHAIN",
+            vec![
+                ChainStepInput { title: "گام ۲-۱".into(), ..Default::default() },
+                ChainStepInput { title: "گام ۲-۲".into(), ..Default::default() },
+            ],
+        ).unwrap();
+
+        let (wl3, e3) = create_work_line_with_chain(
+            &conn,
+            "GERDALO",
+            None,
+            "لاین ۳ - مستندسازی",
+            "نوشتن راهنما",
+            "GOAL_CLUSTER",
+            vec![
+                ChainStepInput { title: "گام ۳-۱".into(), ..Default::default() },
+            ],
+        ).unwrap();
+
+        let (_wl4, _e4) = create_work_line_with_chain(
+            &conn,
+            "GERDALO",
+            None,
+            "لاین ۴ - اضافی",
+            "کار چهارم",
+            "GOAL_CLUSTER",
+            vec![
+                ChainStepInput { title: "گام ۴-۱".into(), ..Default::default() },
+            ],
+        ).unwrap();
+
+        let dash = get_dashboard_state(&conn).expect("get_dashboard_state failed");
+
+        // 1. All QUEUED_IN_CHAIN tasks must be visible in open_tasks with is_locked_by_chain = true
+        let step1_2 = dash.open_tasks.iter().find(|t| t.id == e1[1].id).expect("step 1-2 must appear in open_tasks for WBS");
+        assert!(step1_2.is_locked_by_chain);
+        assert_eq!(step1_2.work_line_title.as_deref(), Some("لاین ۱ - زیرساخت"));
+        assert_eq!(step1_2.outcome_id.as_deref(), Some("OUT-101"));
+
+        // 2. query_all_work_lines computes real task counts & outcome_title
+        let wl1_state = dash.work_lines.iter().find(|w| w.id == wl1.id).unwrap();
+        assert_eq!(wl1_state.total_tasks, 2);
+        assert_eq!(wl1_state.completed_tasks, 0);
+        assert_eq!(wl1_state.outcome_title.as_deref(), Some("راه‌اندازی سیستم پایدار"));
+        assert_eq!(wl1_state.active_step_id.as_deref(), Some(e1[0].id.as_str()));
+
+        // 3. top_priority_steps has exactly 3 items from 3 distinct work lines, none locked
+        assert_eq!(dash.top_priority_steps.len(), 3);
+        let distinct_lines: std::collections::HashSet<&str> = dash
+            .top_priority_steps
+            .iter()
+            .filter_map(|t| t.work_line_id.as_deref())
+            .collect();
+        assert_eq!(distinct_lines.len(), 3);
+        assert!(dash.top_priority_steps.iter().all(|t| !t.is_locked_by_chain));
+        let top_ids: Vec<&str> = dash.top_priority_steps.iter().map(|t| t.id.as_str()).collect();
+        assert!(top_ids.contains(&e1[0].id.as_str()));
+        assert!(top_ids.contains(&e2[0].id.as_str()));
+        assert!(!top_ids.contains(&e1[1].id.as_str()));
+        assert!(!top_ids.contains(&e2[1].id.as_str()));
+
+        // 4. start_task_step rejects locked chain step, accepts unlocked OPEN step
+        assert_eq!(start_task_step(&conn, "GERDALO", &e1[1].id).unwrap(), false);
+        // Make e3[0] OPEN first to test start_task_step
+        conn.execute("UPDATE work_entities SET status = 'OPEN' WHERE id = ?1", params![e3[0].id]).unwrap();
+        assert_eq!(start_task_step(&conn, "GERDALO", &e3[0].id).unwrap(), true);
+
+        // 5. quick_complete_task triggers domino advancement: completing e1[0] unlocks e1[1] and updates work_line progress!
+        quick_complete_task(&mut conn, "GERDALO", &e1[0].id, 2).expect("quick_complete_task failed");
+        let dash_after = get_dashboard_state(&conn).expect("get_dashboard_state after complete failed");
+        let step1_2_after = dash_after.open_tasks.iter().find(|t| t.id == e1[1].id).unwrap();
+        assert_eq!(step1_2_after.status, "IN_PROGRESS");
+        assert!(!step1_2_after.is_locked_by_chain);
+
+        let wl1_after = dash_after.work_lines.iter().find(|w| w.id == wl1.id).unwrap();
+        assert_eq!(wl1_after.total_tasks, 2);
+        assert_eq!(wl1_after.completed_tasks, 1);
+        assert_eq!(wl1_after.active_step_id.as_deref(), Some(e1[1].id.as_str()));
+        let _ = (wl2, wl3);
+
+        drop(conn);
+        let _ = std::fs::remove_dir_all(PathBuf::from(dir));
+    }
+
+    #[test]
+    fn test_pending_queue_chronological_creation_order() {
+        let dir = format!("target/tmp/test_queue_order_{}", uuid::Uuid::new_v4());
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = PathBuf::from(&dir).join("compass.sqlite");
+        let vault_path = PathBuf::from(&dir).join("vault");
+        let conn = init_database(&db_path, &vault_path).expect("init db failed");
+        let sid = ensure_active_chat_session(&conn, "GERDALO", "COPILOT").unwrap();
+
+        // Insert a NEWER message first, and an OLDER message second (simulating backfilled/offline earlier creation)
+        conn.execute(
+            "INSERT INTO chat_messages (project_id, session_id, sender, channel, message_text, created_at)
+             VALUES ('GERDALO', ?1, 'USER', 'COPILOT', 'پیام جدیدتر', '2026-11-17T12:00:00+03:30')",
+            params![sid],
+        ).unwrap();
+        let newer_msg_id = conn.last_insert_rowid();
+
+        conn.execute(
+            "INSERT INTO chat_messages (project_id, session_id, sender, channel, message_text, created_at)
+             VALUES ('GERDALO', ?1, 'USER', 'COPILOT', 'پیام قدیمی‌تر', '2026-11-16T08:00:00+03:30')",
+            params![sid],
+        ).unwrap();
+        let older_msg_id = conn.last_insert_rowid();
+
+        // Enqueue newer FIRST, then older SECOND
+        insert_pending_queue_item(
+            &conn,
+            PendingQueueInput {
+                project_id: "GERDALO",
+                session_id: &sid,
+                channel: "COPILOT",
+                user_message_id: Some(newer_msg_id),
+                system_message_id: None,
+                knowledge_doc_id: None,
+                raw_event_id: None,
+                title_preview: "پیام جدیدتر",
+                source_type: "USER_CHAT",
+                archived_path: None,
+                last_error: None,
+            },
+        ).unwrap();
+
+        insert_pending_queue_item(
+            &conn,
+            PendingQueueInput {
+                project_id: "GERDALO",
+                session_id: &sid,
+                channel: "COPILOT",
+                user_message_id: Some(older_msg_id),
+                system_message_id: None,
+                knowledge_doc_id: None,
+                raw_event_id: None,
+                title_preview: "پیام قدیمی‌تر",
+                source_type: "USER_CHAT",
+                archived_path: None,
+                last_error: None,
+            },
+        ).unwrap();
+
+        // Query must return the OLDER creation timestamp first!
+        let queue = query_pending_ai_queue(&conn).unwrap();
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue[0].user_message_id, Some(older_msg_id));
+        assert_eq!(queue[0].created_at, "2026-11-16T08:00:00+03:30");
+        assert_eq!(queue[1].user_message_id, Some(newer_msg_id));
+        assert_eq!(queue[1].created_at, "2026-11-17T12:00:00+03:30");
+
+        drop(conn);
+        let _ = std::fs::remove_dir_all(PathBuf::from(dir));
+    }
+
+    #[test]
+    fn test_document_processing_status_lifecycle() {
+        let dir = format!("target/tmp/test_doc_lifecycle_{}", uuid::Uuid::new_v4());
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = PathBuf::from(&dir).join("compass.sqlite");
+        let vault_path = PathBuf::from(&dir).join("vault");
+        let conn = init_database(&db_path, &vault_path).expect("init db failed");
+
+        let doc_id = insert_knowledge_doc_with_status(
+            &conn,
+            "GERDALO",
+            "گزارش معماری",
+            "TECHNICAL_DOC",
+            "arch.md",
+            "vault/arch.md",
+            "در انتظار پردازش توسط هوش مصنوعی",
+            0,
+            "UNPROCESSED",
+        )
+        .unwrap();
+
+        let dash1 = get_dashboard_state(&conn).unwrap();
+        let doc1 = dash1.knowledge_docs.iter().find(|d| d.id == doc_id).unwrap();
+        assert_eq!(doc1.processing_status, "UNPROCESSED");
+        assert!(doc1.processed_at.is_none());
+
+        // Move to PROCESSING
+        set_knowledge_doc_processing_status(&conn, doc_id, "PROCESSING", None, None, None).unwrap();
+        let dash2 = get_dashboard_state(&conn).unwrap();
+        assert_eq!(
+            dash2.knowledge_docs.iter().find(|d| d.id == doc_id).unwrap().processing_status,
+            "PROCESSING"
+        );
+
+        // Complete processing -> PROCESSED with extracted count & processed_at
+        update_knowledge_doc_analysis(&conn, doc_id, "خلاصه نهایی تحلیل‌شده", 5, None).unwrap();
+        let dash3 = get_dashboard_state(&conn).unwrap();
+        let doc3 = dash3.knowledge_docs.iter().find(|d| d.id == doc_id).unwrap();
+        assert_eq!(doc3.processing_status, "PROCESSED");
+        assert_eq!(doc3.extracted_items_count, 5);
+        assert!(doc3.processed_at.is_some());
+
+        // Requeue -> resets to UNPROCESSED and puts back into pending_ai_queue
+        let qid = requeue_knowledge_document(&conn, doc_id).unwrap();
+        assert!(qid > 0);
+        let dash4 = get_dashboard_state(&conn).unwrap();
+        let doc4 = dash4.knowledge_docs.iter().find(|d| d.id == doc_id).unwrap();
+        assert_eq!(doc4.processing_status, "UNPROCESSED");
+        assert!(dash4.pending_queue.iter().any(|q| q.knowledge_doc_id == Some(doc_id)));
+
+        drop(conn);
+        let _ = std::fs::remove_dir_all(PathBuf::from(dir));
+    }
+
+    #[test]
+    fn test_pending_queue_manual_reordering_and_reset() {
+        let dir = format!("target/tmp/test_queue_reorder_{}", uuid::Uuid::new_v4());
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = PathBuf::from(&dir).join("compass.sqlite");
+        let vault_path = PathBuf::from(&dir).join("vault");
+        let conn = init_database(&db_path, &vault_path).expect("init db failed");
+        let sid = ensure_active_chat_session(&conn, "GERDALO", "COPILOT").unwrap();
+
+        let mut qids = Vec::new();
+        for (i, ts) in [
+            "2026-11-15T08:00:00+03:30",
+            "2026-11-16T08:00:00+03:30",
+            "2026-11-17T08:00:00+03:30",
+        ]
+        .iter()
+        .enumerate()
+        {
+            conn.execute(
+                "INSERT INTO chat_messages (project_id, session_id, sender, channel, message_text, created_at)
+                 VALUES ('GERDALO', ?1, 'USER', 'COPILOT', ?2, ?3)",
+                params![sid, format!("msg-{}", i + 1), ts],
+            )
+            .unwrap();
+            let mid = conn.last_insert_rowid();
+            let qid = insert_pending_queue_item(
+                &conn,
+                PendingQueueInput {
+                    project_id: "GERDALO",
+                    session_id: &sid,
+                    channel: "COPILOT",
+                    user_message_id: Some(mid),
+                    system_message_id: None,
+                    knowledge_doc_id: None,
+                    raw_event_id: None,
+                    title_preview: &format!("msg-{}", i + 1),
+                    source_type: "USER_CHAT",
+                    archived_path: None,
+                    last_error: None,
+                },
+            )
+            .unwrap();
+            qids.push(qid);
+        }
+
+        // Default chronological order: [0, 1, 2]
+        let q0: Vec<i64> = query_pending_ai_queue(&conn).unwrap().iter().map(|q| q.id).collect();
+        assert_eq!(q0, vec![qids[0], qids[1], qids[2]]);
+
+        // Move item 2 to TOP -> [2, 0, 1]
+        reorder_pending_queue_item(&conn, qids[2], "TOP").unwrap();
+        let q1: Vec<i64> = query_pending_ai_queue(&conn).unwrap().iter().map(|q| q.id).collect();
+        assert_eq!(q1, vec![qids[2], qids[0], qids[1]]);
+
+        // Move item 1 UP -> [2, 1, 0]
+        reorder_pending_queue_item(&conn, qids[1], "UP").unwrap();
+        let q2: Vec<i64> = query_pending_ai_queue(&conn).unwrap().iter().map(|q| q.id).collect();
+        assert_eq!(q2, vec![qids[2], qids[1], qids[0]]);
+
+        // Move item 2 DOWN -> [1, 2, 0]
+        reorder_pending_queue_item(&conn, qids[2], "DOWN").unwrap();
+        let q3: Vec<i64> = query_pending_ai_queue(&conn).unwrap().iter().map(|q| q.id).collect();
+        assert_eq!(q3, vec![qids[1], qids[2], qids[0]]);
+
+        // Reset -> back to chronological order [0, 1, 2]
+        reset_pending_queue_order(&conn).unwrap();
+        let q4: Vec<i64> = query_pending_ai_queue(&conn).unwrap().iter().map(|q| q.id).collect();
+        assert_eq!(q4, vec![qids[0], qids[1], qids[2]]);
+
+        drop(conn);
+        let _ = std::fs::remove_dir_all(PathBuf::from(dir));
+    }
+
+    #[test]
+    fn test_manual_outcome_workline_task_assignment_and_cards() {
+        let dir = format!("target/tmp/test_manual_5layer_{}", uuid::Uuid::new_v4());
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = PathBuf::from(&dir).join("compass.sqlite");
+        let vault_path = PathBuf::from(&dir).join("vault");
+        let conn = init_database(&db_path, &vault_path).expect("init db failed");
+
+        // 1. Create Outcome
+        let out_id = upsert_outcome_manual(
+            &conn,
+            None,
+            "WEALTH_FINANCE",
+            "انتشار نسخه ۳",
+            "سیستم کاملاً خودکار کار کند",
+            "۰ خطا در تولید",
+            "۳۰ روز",
+            "ACTIVE",
+            30,
+        )
+        .unwrap();
+        assert!(out_id.starts_with("OUT-"));
+
+        // 2. Create WorkLine linked to Outcome
+        let (wl, _) = create_work_line_with_chain(
+            &conn,
+            "GERDALO",
+            Some(&out_id),
+            "لاین هسته",
+            "تحویل هسته پایدار",
+            "SEQUENTIAL_CHAIN",
+            vec![ChainStepInput { title: "گام اول".into(), ..Default::default() }],
+        )
+        .unwrap();
+
+        // 3. Create manual standalone task, then assign it to WorkLine (should become step #2 locked in sequential chain!)
+        let t_id = create_task_manual(
+            &conn,
+            "GERDALO",
+            "تسک دوم دستی",
+            "BACKEND",
+            "پاس شدن تست",
+            "باز کردن فایل",
+            None,
+            None,
+            "HIGH_DEEP",
+            "LAPTOP_ONLY",
+            45,
+            Some("2026-11-20"),
+        )
+        .unwrap();
+
+        assign_task_grouping(
+            &conn,
+            "GERDALO",
+            &t_id,
+            Some(&wl.id),
+            None,
+            Some(85),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // 4. Create Knowledge / Memory Card & Calendar Day
+        let card_id = create_personal_vault_item(
+            &conn,
+            Some("GERDALO"),
+            "WORK",
+            "MIND_LEARNING",
+            "MEMORY_CARD",
+            "قانون Full-Stack Gate چیست؟",
+            "هر قابلیت باید همزمان در Rust و TypeScript و UI کامل شود.",
+            &["معماری".into(), "کیفیت".into()],
+        )
+        .unwrap();
+
+        upsert_calendar_day(&conn, "2026-11-20", 360, 180, "روز تمرکز عمیق", false).unwrap();
+
+        let dash = get_dashboard_state(&conn).unwrap();
+        let assigned_task = dash.open_tasks.iter().find(|t| t.id == t_id).unwrap();
+        assert_eq!(assigned_task.work_line_id.as_deref(), Some(wl.id.as_str()));
+        assert_eq!(assigned_task.outcome_id.as_deref(), Some(out_id.as_str()));
+        assert_eq!(assigned_task.sequence_order, 2);
+        assert!(assigned_task.is_locked_by_chain);
+
+        assert!(dash.personal_vault_items.iter().any(|c| c.id == card_id));
+        let cal = dash.calendar_days.iter().find(|d| d.date_key == "2026-11-20").unwrap();
+        assert_eq!(cal.assigned_tasks_count, 1);
+        assert_eq!(cal.assigned_minutes, 45);
+
+        // Cleanup delete tests
+        delete_personal_vault_item(&conn, &card_id).unwrap();
+        delete_outcome(&conn, &out_id).unwrap();
+        let dash_after = get_dashboard_state(&conn).unwrap();
+        assert!(!dash_after.personal_vault_items.iter().any(|c| c.id == card_id));
+        assert!(!dash_after.outcomes.iter().any(|o| o.id == out_id));
 
         drop(conn);
         let _ = std::fs::remove_dir_all(PathBuf::from(dir));

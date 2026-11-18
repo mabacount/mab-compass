@@ -202,6 +202,31 @@ fn cmd_commit_user_chat_message(
     )
     .map_err(|e| e.to_string())?;
 
+    let preview: String = message_text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or(&message_text)
+        .chars()
+        .take(72)
+        .collect();
+    let _ = insert_pending_queue_item(
+        &conn,
+        PendingQueueInput {
+            project_id: &pid,
+            session_id: &resolved_sid,
+            channel: norm_ch,
+            user_message_id: Some(user_message_id),
+            system_message_id: None,
+            knowledge_doc_id: None,
+            raw_event_id: Some(raw_event_id),
+            title_preview: &preview,
+            source_type,
+            archived_path: Some(&archived_path),
+            last_error: None,
+        },
+    );
+
     let updated = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
     Ok(CommittedChatTurn {
         dashboard: updated,
@@ -784,6 +809,7 @@ fn cmd_commit_user_file_message(
         &combined_prompt_text,
     )?;
 
+    let file_source_type = if norm_ch == "VAULT" { "DOC_ONBOARDING" } else { "COPILOT_FILE" };
     let (resolved_sid, raw_event_id, user_message_id) = commit_user_chat_turn(
         &conn,
         &pid,
@@ -791,9 +817,40 @@ fn cmd_commit_user_file_message(
         &norm_ch,
         &display_user_msg,
         Some(&archived_path),
-        if norm_ch == "VAULT" { "DOC_ONBOARDING" } else { "COPILOT_FILE" },
+        file_source_type,
     )
     .map_err(|e| e.to_string())?;
+
+    let kdoc_id = insert_knowledge_doc_with_status(
+        &conn,
+        &pid,
+        &effective_title,
+        &effective_doc_type,
+        &original_filename,
+        &archived_path,
+        "در انتظار پردازش توسط هوش مصنوعی برای استخراج تسک‌ها، لاین‌ها و کارت‌های دانش...",
+        0,
+        "UNPROCESSED",
+    )
+    .ok();
+
+    let file_preview = format!("📎 {}", original_filename);
+    let _ = insert_pending_queue_item(
+        &conn,
+        PendingQueueInput {
+            project_id: &pid,
+            session_id: &resolved_sid,
+            channel: &norm_ch,
+            user_message_id: Some(user_message_id),
+            system_message_id: None,
+            knowledge_doc_id: kdoc_id,
+            raw_event_id: Some(raw_event_id),
+            title_preview: &file_preview,
+            source_type: file_source_type,
+            archived_path: Some(&archived_path),
+            last_error: None,
+        },
+    );
 
     let updated = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
     Ok(CommittedFileTurn {
@@ -808,6 +865,7 @@ fn cmd_commit_user_file_message(
         effective_title,
         effective_filename: original_filename,
         doc_type: effective_doc_type,
+        knowledge_doc_id: kdoc_id,
     })
 }
 
@@ -848,6 +906,37 @@ fn cmd_commit_vault_text_message(
     )
     .map_err(|e| e.to_string())?;
 
+    let kdoc_id = insert_knowledge_doc_with_status(
+        &conn,
+        &pid,
+        &effective_title,
+        &doc_type,
+        &effective_filename,
+        &archived_path,
+        "در انتظار پردازش توسط هوش مصنوعی برای استخراج تسک‌ها، لاین‌ها و کارت‌های دانش...",
+        0,
+        "UNPROCESSED",
+    )
+    .ok();
+
+    let text_preview = format!("📄 {}", effective_title);
+    let _ = insert_pending_queue_item(
+        &conn,
+        PendingQueueInput {
+            project_id: &pid,
+            session_id: &resolved_sid,
+            channel: "VAULT",
+            user_message_id: Some(user_message_id),
+            system_message_id: None,
+            knowledge_doc_id: kdoc_id,
+            raw_event_id: Some(raw_event_id),
+            title_preview: &text_preview,
+            source_type: "DOC_ONBOARDING",
+            archived_path: Some(&archived_path),
+            last_error: None,
+        },
+    );
+
     let updated = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
     Ok(CommittedFileTurn {
         dashboard: updated,
@@ -861,10 +950,12 @@ fn cmd_commit_vault_text_message(
         effective_title,
         effective_filename,
         doc_type,
+        knowledge_doc_id: kdoc_id,
     })
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn cmd_run_file_assistant_turn(
     state: State<'_, AppState>,
     channel: String,
@@ -876,6 +967,7 @@ async fn cmd_run_file_assistant_turn(
     doc_type: String,
     extracted_text: String,
     combined_prompt_text: String,
+    knowledge_doc_id: Option<i64>,
 ) -> Result<AssistantTurnOutcome, String> {
     let norm_ch = normalize_chat_channel(&channel).to_string();
     let (
@@ -888,8 +980,21 @@ async fn cmd_run_file_assistant_turn(
         knowledge_docs,
         copilot_history,
         vault_history,
+        resolved_kdoc_id,
     ) = {
         let conn = state.db.lock().map_err(|e| e.to_string())?;
+        let resolved_doc = knowledge_doc_id.or_else(|| {
+            conn.query_row(
+                "SELECT knowledge_doc_id FROM pending_ai_queue WHERE user_message_id = ?1 LIMIT 1",
+                rusqlite::params![user_message_id],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .ok()
+            .flatten()
+        });
+        if let Some(did) = resolved_doc {
+            let _ = set_knowledge_doc_processing_status(&conn, did, "PROCESSING", None, None, None);
+        }
         let d = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
         let filtered_copilot: Vec<ChatMessage> = d
             .chat_history
@@ -913,6 +1018,7 @@ async fn cmd_run_file_assistant_turn(
             d.knowledge_docs.clone(),
             filtered_copilot,
             filtered_vault,
+            resolved_doc,
         )
     };
 
@@ -1002,17 +1108,29 @@ async fn cmd_run_file_assistant_turn(
             };
             let badge = format_turn_badge(&turn.mcp_ops_executed, &env_badge, &turn.transport_label);
 
-            let inserted_doc_id = insert_knowledge_doc_record(
-                &conn,
-                &pid,
-                &effective_title,
-                &doc_type,
-                &effective_filename,
-                &knowledge_path,
-                &summary,
-                items_count,
-            )
-            .ok();
+            let inserted_doc_id = if let Some(did) = resolved_kdoc_id {
+                let _ = update_knowledge_doc_analysis(
+                    &conn,
+                    did,
+                    &summary,
+                    items_count,
+                    Some(&knowledge_path),
+                );
+                Some(did)
+            } else {
+                insert_knowledge_doc_with_status(
+                    &conn,
+                    &pid,
+                    &effective_title,
+                    &doc_type,
+                    &effective_filename,
+                    &knowledge_path,
+                    &summary,
+                    items_count,
+                    "PROCESSED",
+                )
+                .ok()
+            };
 
             append_assistant_chat_message(
                 &conn,
@@ -1052,8 +1170,18 @@ async fn cmd_run_file_assistant_turn(
             .ok();
 
             let conn = state.db.lock().map_err(|e| e.to_string())?;
-            let kdoc_id = if let Some(kp) = &knowledge_path {
-                insert_knowledge_doc_record(
+            let kdoc_id = if let Some(did) = resolved_kdoc_id {
+                let _ = set_knowledge_doc_processing_status(
+                    &conn,
+                    did,
+                    "FAILED",
+                    Some("متن فایل استخراج و در حافظه پروژه آرشیو شد (تحلیل هوشمند به دلیل خطای مدل انجام نشد)."),
+                    Some(0),
+                    knowledge_path.as_deref(),
+                );
+                Some(did)
+            } else if let Some(kp) = &knowledge_path {
+                insert_knowledge_doc_with_status(
                     &conn,
                     &pid,
                     &effective_title,
@@ -1062,6 +1190,7 @@ async fn cmd_run_file_assistant_turn(
                     kp,
                     "متن فایل استخراج و در حافظه پروژه آرشیو شد (تحلیل هوشمند به دلیل خطای مدل انجام نشد).",
                     0,
+                    "FAILED",
                 )
                 .ok()
             } else {
@@ -1124,6 +1253,23 @@ fn cmd_quick_complete_step(
 }
 
 #[tauri::command]
+fn cmd_start_task_step(
+    state: State<'_, AppState>,
+    task_id: String,
+) -> Result<DashboardState, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let dash_before = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
+    let started = start_task_step(&conn, &dash_before.active_project.id, &task_id)
+        .map_err(|e| e.to_string())?;
+    if !started {
+        return Err("این گام یا در زنجیره قفل است یا از قبل در حال اجرا می‌باشد.".into());
+    }
+    let dash_after = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
+    let _ = sync_all_project_projections(&dash_after, None, None);
+    Ok(dash_after)
+}
+
+#[tauri::command]
 async fn cmd_send_copilot_message(
     state: State<'_, AppState>,
     message_text: String,
@@ -1178,6 +1324,7 @@ async fn cmd_send_copilot_file_message(
         committed.doc_type,
         committed.extracted_text,
         committed.combined_prompt_text,
+        committed.knowledge_doc_id,
     )
     .await?;
     if let Some(err) = outcome.assistant_error {
@@ -1213,6 +1360,7 @@ async fn cmd_ingest_onboarding_document(
         committed.doc_type,
         committed.extracted_text,
         committed.combined_prompt_text,
+        committed.knowledge_doc_id,
     )
     .await?;
     if let Some(err) = outcome.assistant_error {
@@ -1250,6 +1398,7 @@ async fn cmd_ingest_onboarding_file(
         committed.doc_type,
         committed.extracted_text,
         committed.combined_prompt_text,
+        committed.knowledge_doc_id,
     )
     .await?;
     if let Some(err) = outcome.assistant_error {
@@ -1389,6 +1538,9 @@ async fn cmd_process_pending_queue_item(
         }
 
         let _ = set_pending_item_processing(&conn, queue_id);
+        if let Some(doc_id) = item.knowledge_doc_id {
+            let _ = set_knowledge_doc_processing_status(&conn, doc_id, "PROCESSING", None, None, None);
+        }
         let target_dash = get_dashboard_state_for_project(&conn, Some(&item.project_id))
             .map_err(|e| e.to_string())?;
 
@@ -1691,6 +1843,9 @@ async fn cmd_process_pending_queue_item(
         Err(err) => {
             let conn = state.db.lock().map_err(|e| e.to_string())?;
             let _ = record_pending_item_failure(&conn, queue_id, &err);
+            if let Some(doc_id) = item.knowledge_doc_id {
+                let _ = set_knowledge_doc_processing_status(&conn, doc_id, "FAILED", None, None, None);
+            }
             if let Some(sys_id) = item.system_message_id {
                 let notice = format!(
                     "⚠️ پیام شما در صف انتظار و آرشیو پروژه ذخیره است، اما در ارسال خودکار به هوش مصنوعی خطا رخ داد:\n{}",
@@ -1706,6 +1861,388 @@ async fn cmd_process_pending_queue_item(
             })
         }
     }
+}
+
+// ==============================================================================
+// TAURI IPC COMMANDS — SEQUENTIAL CHAIN & CONTEXT EXECUTION (v3.0 MILESTONE 2)
+// ==============================================================================
+
+#[tauri::command]
+fn cmd_create_work_line_chain(
+    state: State<'_, AppState>,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+
+    let project_id = params
+        .get("project_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            conn.query_row(
+                "SELECT id FROM projects WHERE is_active = 1 LIMIT 1",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap_or_else(|_| "GERDALO".to_string())
+        });
+
+    let outcome_id = params
+        .get("outcome_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty());
+
+    let title = params
+        .get("title")
+        .or_else(|| params.get("line_title"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("مسیر زنجیره‌ای جدید");
+
+    let goal_statement = params
+        .get("goal_statement")
+        .or_else(|| params.get("goal"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    let line_mode = params
+        .get("line_mode")
+        .or_else(|| params.get("mode"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("SEQUENTIAL_CHAIN");
+
+    let steps: Vec<ChainStepInput> = if let Some(arr) = params.get("steps").and_then(|v| v.as_array()) {
+        arr.iter()
+            .map(|item| {
+                if let Some(s) = item.as_str() {
+                    ChainStepInput {
+                        title: s.to_string(),
+                        ..Default::default()
+                    }
+                } else {
+                    serde_json::from_value::<ChainStepInput>(item.clone()).unwrap_or_default()
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let (mut work_line, tasks) = create_work_line_with_chain(
+        &conn,
+        &project_id,
+        outcome_id,
+        title,
+        goal_statement,
+        line_mode,
+        steps,
+    )
+    .map_err(|e| e.to_string())?;
+
+    if let Some(color) = params.get("color_hex").and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty()) {
+        let _ = conn.execute(
+            "UPDATE work_lines SET color_hex = ?1 WHERE id = ?2",
+            rusqlite::params![color.trim(), work_line.id],
+        );
+        work_line.color_hex = color.trim().to_string();
+    }
+
+    let updated_dash = get_dashboard_state(&conn).ok();
+    Ok(serde_json::json!({
+        "status": "ok",
+        "work_line": work_line,
+        "work_line_id": work_line.id,
+        "tasks": tasks.iter().map(|t| t.id.clone()).collect::<Vec<String>>(),
+        "entities": tasks,
+        "dashboard": updated_dash,
+    }))
+}
+
+#[tauri::command]
+fn cmd_reorder_pending_queue_item(
+    state: State<'_, AppState>,
+    queue_id: i64,
+    direction: String,
+) -> Result<DashboardState, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    reorder_pending_queue_item(&conn, queue_id, &direction).map_err(|e| e.to_string())?;
+    get_dashboard_state(&conn).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn cmd_reset_pending_queue_order(state: State<'_, AppState>) -> Result<DashboardState, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    reset_pending_queue_order(&conn).map_err(|e| e.to_string())?;
+    get_dashboard_state(&conn).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn cmd_requeue_knowledge_doc(
+    state: State<'_, AppState>,
+    doc_id: i64,
+) -> Result<DashboardState, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    requeue_knowledge_document(&conn, doc_id).map_err(|e| e.to_string())?;
+    get_dashboard_state(&conn).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn cmd_upsert_outcome(
+    state: State<'_, AppState>,
+    outcome_id: Option<String>,
+    domain_code: String,
+    title: String,
+    desired_reality_change: String,
+    evidence_kr: String,
+    time_window: String,
+    status: String,
+    progress_percent: i32,
+) -> Result<DashboardState, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    upsert_outcome_manual(
+        &conn,
+        outcome_id.as_deref(),
+        &domain_code,
+        &title,
+        &desired_reality_change,
+        &evidence_kr,
+        &time_window,
+        &status,
+        progress_percent,
+    )
+    .map_err(|e| e.to_string())?;
+    get_dashboard_state(&conn).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn cmd_delete_outcome(
+    state: State<'_, AppState>,
+    outcome_id: String,
+) -> Result<DashboardState, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    delete_outcome(&conn, &outcome_id).map_err(|e| e.to_string())?;
+    get_dashboard_state(&conn).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn cmd_update_work_line(
+    state: State<'_, AppState>,
+    work_line_id: String,
+    title: String,
+    goal_statement: String,
+    outcome_id: Option<String>,
+    color_hex: String,
+    status: String,
+) -> Result<DashboardState, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    update_work_line_manual(
+        &conn,
+        &work_line_id,
+        &title,
+        &goal_statement,
+        outcome_id.as_deref(),
+        &color_hex,
+        &status,
+    )
+    .map_err(|e| e.to_string())?;
+    get_dashboard_state(&conn).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn cmd_assign_task_grouping(
+    state: State<'_, AppState>,
+    task_id: String,
+    work_line_id: Option<String>,
+    outcome_id: Option<String>,
+    priority_score: Option<i32>,
+    energy_tag: Option<String>,
+    device_tag: Option<String>,
+    duration_minutes: Option<i32>,
+    scheduled_date: Option<String>,
+) -> Result<DashboardState, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let dash = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
+    assign_task_grouping(
+        &conn,
+        &dash.active_project.id,
+        &task_id,
+        work_line_id.as_deref(),
+        outcome_id.as_deref(),
+        priority_score,
+        energy_tag.as_deref(),
+        device_tag.as_deref(),
+        duration_minutes,
+        scheduled_date.as_deref(),
+    )
+    .map_err(|e| e.to_string())?;
+    let updated = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
+    let _ = sync_all_project_projections(&updated, None, None);
+    Ok(updated)
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn cmd_create_task_manual(
+    state: State<'_, AppState>,
+    title: String,
+    category: String,
+    definition_of_done: String,
+    first_physical_action: String,
+    work_line_id: Option<String>,
+    outcome_id: Option<String>,
+    energy_tag: String,
+    device_tag: String,
+    duration_minutes: i32,
+    scheduled_date: Option<String>,
+) -> Result<DashboardState, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let dash = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
+    create_task_manual(
+        &conn,
+        &dash.active_project.id,
+        &title,
+        &category,
+        &definition_of_done,
+        &first_physical_action,
+        work_line_id.as_deref(),
+        outcome_id.as_deref(),
+        &energy_tag,
+        &device_tag,
+        duration_minutes,
+        scheduled_date.as_deref(),
+    )
+    .map_err(|e| e.to_string())?;
+    let updated = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
+    let _ = sync_all_project_projections(&updated, None, None);
+    Ok(updated)
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn cmd_create_personal_vault_item(
+    state: State<'_, AppState>,
+    realm: String,
+    domain_code: String,
+    item_type: String,
+    title: String,
+    content_markdown: String,
+    tags: Vec<String>,
+    attach_to_active_project: bool,
+) -> Result<DashboardState, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let dash = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
+    let pid = if attach_to_active_project {
+        Some(dash.active_project.id.as_str())
+    } else {
+        None
+    };
+    create_personal_vault_item(
+        &conn,
+        pid,
+        &realm,
+        &domain_code,
+        &item_type,
+        &title,
+        &content_markdown,
+        &tags,
+    )
+    .map_err(|e| e.to_string())?;
+    get_dashboard_state(&conn).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn cmd_delete_personal_vault_item(
+    state: State<'_, AppState>,
+    item_id: String,
+) -> Result<DashboardState, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    delete_personal_vault_item(&conn, &item_id).map_err(|e| e.to_string())?;
+    get_dashboard_state(&conn).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn cmd_resolve_pending_proposal(
+    state: State<'_, AppState>,
+    proposal_id: String,
+    approve: bool,
+) -> Result<DashboardState, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    resolve_pending_proposal(&conn, &proposal_id, approve).map_err(|e| e.to_string())?;
+    get_dashboard_state(&conn).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn cmd_upsert_calendar_day(
+    state: State<'_, AppState>,
+    date_key: String,
+    total_capacity_minutes: i32,
+    deep_capacity_minutes: i32,
+    day_note: String,
+    is_off_day: bool,
+) -> Result<DashboardState, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    upsert_calendar_day(
+        &conn,
+        &date_key,
+        total_capacity_minutes,
+        deep_capacity_minutes,
+        &day_note,
+        is_off_day,
+    )
+    .map_err(|e| e.to_string())?;
+    get_dashboard_state(&conn).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn cmd_advance_chain_step(
+    state: State<'_, AppState>,
+    project_id: String,
+    task_id: String,
+) -> Result<Option<WorkEntity>, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    advance_sequential_chain_on_complete(&conn, &project_id, &task_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn cmd_query_tasks_by_context(
+    state: State<'_, AppState>,
+    params: serde_json::Value,
+) -> Result<Vec<WorkEntity>, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+
+    let project_id = params
+        .get("project_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            conn.query_row(
+                "SELECT id FROM projects WHERE is_active = 1 LIMIT 1",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap_or_default()
+        });
+
+    let device_tag = params.get("device_tag").and_then(|v| v.as_str());
+    let location_tag = params.get("location_tag").and_then(|v| v.as_str());
+    let energy_tag = params.get("energy_tag").and_then(|v| v.as_str());
+    let max_minutes = params.get("max_minutes").and_then(|v| v.as_i64()).map(|m| m as i32);
+    let only_unlocked = params.get("only_unlocked").and_then(|v| v.as_bool()).unwrap_or(true);
+
+    query_tasks_by_context(
+        &conn,
+        &project_id,
+        device_tag,
+        location_tag,
+        energy_tag,
+        max_minutes,
+        only_unlocked,
+    )
+    .map_err(|e| e.to_string())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1748,6 +2285,10 @@ pub fn run() {
             cmd_switch_project,
             cmd_create_project,
             cmd_quick_complete_step,
+            cmd_start_task_step,
+            cmd_create_work_line_chain,
+            cmd_advance_chain_step,
+            cmd_query_tasks_by_context,
             cmd_create_chat_session,
             cmd_switch_chat_session,
             cmd_delete_chat_session,
@@ -1770,7 +2311,19 @@ pub fn run() {
             cmd_check_llm_connection,
             cmd_scan_unprocessed_queue,
             cmd_dismiss_pending_queue_item,
-            cmd_process_pending_queue_item
+            cmd_process_pending_queue_item,
+            cmd_reorder_pending_queue_item,
+            cmd_reset_pending_queue_order,
+            cmd_requeue_knowledge_doc,
+            cmd_upsert_outcome,
+            cmd_delete_outcome,
+            cmd_update_work_line,
+            cmd_assign_task_grouping,
+            cmd_create_task_manual,
+            cmd_create_personal_vault_item,
+            cmd_delete_personal_vault_item,
+            cmd_resolve_pending_proposal,
+            cmd_upsert_calendar_day
         ])
         .run(tauri::generate_context!())
         .expect("Error running Mab-Compass Tauri v2 application");

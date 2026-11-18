@@ -9,6 +9,49 @@ export interface Project {
   updated_at: string;
 }
 
+export interface LifeDomain {
+  code: string;
+  title: string;
+  description: string;
+  maturity_state: number;
+  maintenance_floor: string;
+  desired_state: string;
+  is_growth_focus: boolean;
+  updated_at: string;
+}
+
+export interface Outcome {
+  id: string;
+  domain_code: string;
+  title: string;
+  desired_reality_change: string;
+  evidence_kr: string;
+  time_window: string;
+  status: string;
+  progress_percent: number;
+  linked_projects_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface WorkLine {
+  id: string;
+  project_id: string;
+  project_name: string;
+  outcome_id?: string | null;
+  outcome_title?: string | null;
+  title: string;
+  goal_statement: string;
+  line_mode: string; // "SEQUENTIAL_CHAIN" | "GOAL_CLUSTER"
+  status: string;
+  color_hex: string;
+  total_tasks: number;
+  completed_tasks: number;
+  active_step_id?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface WorkEntity {
   id: string;
   project_id: string;
@@ -26,6 +69,21 @@ export interface WorkEntity {
   superseded_by_id?: string | null;
   stakeholder_tag?: string | null;
   updated_at: string;
+  project_name?: string;
+  work_line_id?: string | null;
+  work_line_title?: string | null;
+  outcome_id?: string | null;
+  sequence_order: number;
+  depends_on_task_id?: string | null;
+  is_locked_by_chain: boolean;
+  energy_tag: string;
+  duration_minutes: number;
+  device_tag: string;
+  location_tags: string[];
+  scheduled_date?: string | null;
+  scheduled_slot?: string | null;
+  due_date?: string | null;
+  priority_score: number;
 }
 
 export interface SopRule {
@@ -102,6 +160,65 @@ export interface KnowledgeDocument {
   executive_summary: string;
   extracted_items_count: number;
   ingested_at: string;
+  binary_original_path?: string | null;
+  tags_json?: string;
+  tags?: string[];
+  realm?: string;
+  domain_code?: string;
+  processing_status: "UNPROCESSED" | "PROCESSING" | "PROCESSED" | "FAILED" | string;
+  processed_at?: string | null;
+}
+
+export interface CalendarDay {
+  date_key: string;
+  total_capacity_minutes: number;
+  deep_capacity_minutes: number;
+  day_note: string;
+  is_off_day: boolean;
+  assigned_tasks_count: number;
+  assigned_minutes: number;
+  updated_at: string;
+}
+
+export interface PendingProposal {
+  id: string;
+  project_id?: string | null;
+  proposal_type: string;
+  title: string;
+  rationale_markdown: string;
+  payload_json: string;
+  status: string;
+  created_at: string;
+  resolved_at?: string | null;
+}
+
+export interface PersonalVaultItem {
+  id: string;
+  realm: string;
+  domain_code: string;
+  project_id?: string | null;
+  item_type: string; // "MEMORY_CARD" | "LESSON" | "INSTRUCTION" | "NOTE" | "INTEREST"
+  title: string;
+  content_markdown: string;
+  tags_json?: string;
+  tags: string[];
+  archived_path?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ChainStepInput {
+  title: string;
+  definition_of_done?: string;
+  first_physical_action?: string;
+  energy_tag?: string;
+  duration_minutes?: number;
+  device_tag?: string;
+  location_tags?: string[];
+  category?: string;
+  scheduled_date?: string | null;
+  scheduled_slot?: string | null;
+  due_date?: string | null;
 }
 
 export interface PendingQueueItem {
@@ -120,6 +237,7 @@ export interface PendingQueueItem {
   status: string;
   attempts: number;
   last_error?: string | null;
+  priority_order?: number;
   created_at: string;
   updated_at: string;
 }
@@ -193,6 +311,13 @@ export interface DashboardState {
   settings: AppSettings;
   can_undo: boolean;
   last_undo_summary?: string | null;
+  domains: LifeDomain[];
+  outcomes: Outcome[];
+  work_lines: WorkLine[];
+  top_priority_steps?: WorkEntity[];
+  calendar_days?: CalendarDay[];
+  pending_proposals?: PendingProposal[];
+  personal_vault_items?: PersonalVaultItem[];
 }
 
 export interface CommittedChatTurn {
@@ -215,6 +340,7 @@ export interface CommittedFileTurn {
   effective_title: string;
   effective_filename: string;
   doc_type: string;
+  knowledge_doc_id?: number | null;
 }
 
 export interface AssistantTurnOutcome {
@@ -245,6 +371,8 @@ export const CompassApi = {
     invoke<DashboardState>("cmd_create_project", { idCode, name }),
   quickCompleteStep: (taskId: string, pomosSpent: number) =>
     invoke<DashboardState>("cmd_quick_complete_step", { taskId, pomosSpent }),
+  startTaskStep: (taskId: string) =>
+    invoke<DashboardState>("cmd_start_task_step", { taskId }),
   createChatSession: (
     projectId: string | null,
     channel: "COPILOT" | "VAULT",
@@ -316,6 +444,7 @@ export const CompassApi = {
     docType: string;
     extractedText: string;
     combinedPromptText: string;
+    knowledgeDocId?: number | null;
   }) => invoke<AssistantTurnOutcome>("cmd_run_file_assistant_turn", params),
   sendCopilotMessage: (messageText: string) =>
     invoke<DashboardState>("cmd_send_copilot_message", { messageText }),
@@ -377,4 +506,125 @@ export const CompassApi = {
     invoke<PendingQueueProcessOutcome>("cmd_process_pending_queue_item", { queueId }),
   dismissPendingQueueItem: (queueId: number) =>
     invoke<DashboardState>("cmd_dismiss_pending_queue_item", { queueId }),
+  reorderPendingQueueItem: (queueId: number, direction: "TOP" | "UP" | "DOWN") =>
+    invoke<DashboardState>("cmd_reorder_pending_queue_item", { queueId, direction }),
+  resetPendingQueueOrder: () =>
+    invoke<DashboardState>("cmd_reset_pending_queue_order"),
+  requeueKnowledgeDoc: (docId: number) =>
+    invoke<DashboardState>("cmd_requeue_knowledge_doc", { docId }),
+  upsertOutcome: (params: {
+    outcomeId?: string | null;
+    domainCode: string;
+    title: string;
+    desiredRealityChange: string;
+    evidenceKr: string;
+    timeWindow: string;
+    status: string;
+    progressPercent: number;
+  }) =>
+    invoke<DashboardState>("cmd_upsert_outcome", {
+      outcomeId: params.outcomeId ?? null,
+      domainCode: params.domainCode,
+      title: params.title,
+      desiredRealityChange: params.desiredRealityChange,
+      evidenceKr: params.evidenceKr,
+      timeWindow: params.timeWindow,
+      status: params.status,
+      progressPercent: params.progressPercent,
+    }),
+  deleteOutcome: (outcomeId: string) =>
+    invoke<DashboardState>("cmd_delete_outcome", { outcomeId }),
+  createWorkLineChain: (params: {
+    project_id?: string;
+    outcome_id?: string | null;
+    title: string;
+    goal_statement: string;
+    line_mode: "SEQUENTIAL_CHAIN" | "GOAL_CLUSTER";
+    color_hex?: string;
+    steps: ChainStepInput[];
+  }) =>
+    invoke<{ status: string; work_line_id: string; dashboard?: DashboardState }>(
+      "cmd_create_work_line_chain",
+      { params }
+    ),
+  updateWorkLine: (params: {
+    workLineId: string;
+    title: string;
+    goalStatement: string;
+    outcomeId?: string | null;
+    colorHex: string;
+    status: string;
+  }) =>
+    invoke<DashboardState>("cmd_update_work_line", {
+      workLineId: params.workLineId,
+      title: params.title,
+      goalStatement: params.goalStatement,
+      outcomeId: params.outcomeId ?? null,
+      colorHex: params.colorHex,
+      status: params.status,
+    }),
+  assignTaskGrouping: (params: {
+    taskId: string;
+    workLineId?: string | null;
+    outcomeId?: string | null;
+    priorityScore?: number | null;
+    energyTag?: string | null;
+    deviceTag?: string | null;
+    durationMinutes?: number | null;
+    scheduledDate?: string | null;
+  }) =>
+    invoke<DashboardState>("cmd_assign_task_grouping", {
+      taskId: params.taskId,
+      workLineId: params.workLineId ?? null,
+      outcomeId: params.outcomeId ?? null,
+      priorityScore: params.priorityScore ?? null,
+      energyTag: params.energyTag ?? null,
+      deviceTag: params.deviceTag ?? null,
+      durationMinutes: params.durationMinutes ?? null,
+      scheduledDate: params.scheduledDate ?? null,
+    }),
+  createTaskManual: (params: {
+    title: string;
+    category: string;
+    definitionOfDone: string;
+    firstPhysicalAction: string;
+    workLineId?: string | null;
+    outcomeId?: string | null;
+    energyTag: string;
+    deviceTag: string;
+    durationMinutes: number;
+    scheduledDate?: string | null;
+  }) =>
+    invoke<DashboardState>("cmd_create_task_manual", {
+      title: params.title,
+      category: params.category,
+      definitionOfDone: params.definitionOfDone,
+      firstPhysicalAction: params.firstPhysicalAction,
+      workLineId: params.workLineId ?? null,
+      outcomeId: params.outcomeId ?? null,
+      energyTag: params.energyTag,
+      deviceTag: params.deviceTag,
+      durationMinutes: params.durationMinutes,
+      scheduledDate: params.scheduledDate ?? null,
+    }),
+  createPersonalVaultItem: (params: {
+    realm: string;
+    domainCode: string;
+    itemType: string;
+    title: string;
+    contentMarkdown: string;
+    tags: string[];
+    attachToActiveProject: boolean;
+  }) => invoke<DashboardState>("cmd_create_personal_vault_item", params),
+  deletePersonalVaultItem: (itemId: string) =>
+    invoke<DashboardState>("cmd_delete_personal_vault_item", { itemId }),
+  resolvePendingProposal: (proposalId: string, approve: boolean) =>
+    invoke<DashboardState>("cmd_resolve_pending_proposal", { proposalId, approve }),
+  upsertCalendarDay: (params: {
+    dateKey: string;
+    totalCapacityMinutes: number;
+    deepCapacityMinutes: number;
+    dayNote: string;
+    isOffDay: boolean;
+  }) => invoke<DashboardState>("cmd_upsert_calendar_day", params),
 };

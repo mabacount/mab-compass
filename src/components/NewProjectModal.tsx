@@ -26,7 +26,7 @@ export function NewProjectModal({ open, onClose, onCreate }: NewProjectModalProp
       onClick={onClose}
     >
       <div
-        className="bg-mab-surface border border-mab-border w-full max-w-[440px] p-6 space-y-4 rounded-2xl shadow-2xl"
+        className="bg-mab-surface border border-mab-border w-full max-w-[440px] max-h-[90vh] overflow-y-auto p-5 sm:p-6 space-y-4 rounded-2xl shadow-2xl"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between border-b border-mab-border pb-3">

@@ -299,17 +299,54 @@ fn ingest_item_into_compass(
     )
     .ok();
 
+    let effective_created_at = if !item.recorded_at.trim().is_empty() {
+        item.recorded_at.trim()
+    } else {
+        now
+    };
+
     let _ = conn.execute(
         "INSERT INTO mab_focus_synced_notes (fingerprint, project_id, raw_note, synced_at)
          VALUES (?1, ?2, ?3, ?4)",
         params![fingerprint, target_proj.id, formatted_note, now],
     );
 
-    let _ = conn.execute(
-        "INSERT INTO raw_events (project_id, raw_content, archived_path, source_type, created_at)
-         VALUES (?1, ?2, ?3, 'MAB_FOCUS_SYNC', ?4)",
-        params![target_proj.id, formatted_note, archived_path, now],
-    );
+    let raw_event_id = if conn
+        .execute(
+            "INSERT INTO raw_events (project_id, raw_content, archived_path, source_type, created_at)
+             VALUES (?1, ?2, ?3, 'MAB_FOCUS_SYNC', ?4)",
+            params![target_proj.id, formatted_note, archived_path, effective_created_at],
+        )
+        .is_ok()
+    {
+        Some(conn.last_insert_rowid())
+    } else {
+        None
+    };
+
+    let doc_title = format!("گزارش Mab-Focus: {}", item.task_title.trim());
+    let doc_filename = format!("mabfocus_{}.md", &fingerprint[..8]);
+    let kdoc_id = if conn
+        .execute(
+            "INSERT INTO knowledge_documents (
+                project_id, title, doc_type, original_filename, archived_path,
+                executive_summary, extracted_items_count, ingested_at, processing_status
+             ) VALUES (?1, ?2, 'MAB_FOCUS_REPORT', ?3, ?4, ?5, 0, ?6, 'UNPROCESSED')",
+            params![
+                target_proj.id,
+                doc_title,
+                doc_filename,
+                archived_path.as_deref().unwrap_or(""),
+                "در انتظار پردازش توسط هوش مصنوعی (گزارش دریافت‌شده از Mab-Focus)...",
+                effective_created_at
+            ],
+        )
+        .is_ok()
+    {
+        Some(conn.last_insert_rowid())
+    } else {
+        None
+    };
 
     if item.create_work_log {
         let pomos = ((item.duration_minutes + 12) / 25).max(1);
@@ -329,7 +366,7 @@ fn ingest_item_into_compass(
                 pomos as f64,
                 pomos,
                 log_summary,
-                item.recorded_at
+                effective_created_at
             ],
         );
     }
@@ -347,12 +384,32 @@ fn ingest_item_into_compass(
             formatted_note,
             archived_path,
             item.badge_text,
-            now
+            effective_created_at
         ],
     );
     let _ = conn.execute(
         "UPDATE chat_sessions SET updated_at = ?1 WHERE id = ?2",
         params![now, copilot_sid],
+    );
+
+    // Enqueue the Mab-Focus report into pending_ai_queue in chronological creation order
+    let queue_preview: String = format!("⏱️ Mab-Focus: {}", item.task_title.trim())
+        .chars()
+        .take(72)
+        .collect();
+    let _ = crate::db::queries::enqueue_pending_ai_item(
+        conn,
+        &target_proj.id,
+        &copilot_sid,
+        "COPILOT",
+        None,
+        None,
+        kdoc_id,
+        raw_event_id,
+        &queue_preview,
+        "MAB_FOCUS_SYNC",
+        archived_path.as_deref(),
+        None,
     );
 
     true
@@ -829,6 +886,7 @@ fn load_local_projects(conn: &Connection) -> Result<Vec<Project>, String> {
                 external_focus_id: r.get(3)?,
                 is_active: r.get::<_, i32>(4)? == 1,
                 updated_at: r.get(5)?,
+                ..Default::default()
             })
         })
         .map_err(|e| e.to_string())?;
@@ -1237,6 +1295,15 @@ mod tests {
         assert_eq!(d3.recent_logs.len(), 1);
         assert_eq!(d3.recent_logs[0].effective_pomos, 2);
         assert_eq!(d3.chat_history.len(), 3);
+
+        // Verify all 3 Mab-Focus reports were registered as UNPROCESSED docs & queued in chronological order!
+        assert_eq!(d3.knowledge_docs.len(), 3);
+        assert!(d3.knowledge_docs.iter().all(|doc| doc.doc_type == "MAB_FOCUS_REPORT" && doc.processing_status == "UNPROCESSED"));
+        assert_eq!(d3.pending_queue.len(), 3);
+        assert!(d3.pending_queue.iter().all(|q| q.source_type == "MAB_FOCUS_SYNC"));
+        assert_eq!(d3.pending_queue[0].created_at, "2026-11-11T17:20:00");
+        assert_eq!(d3.pending_queue[1].created_at, "2026-11-11T17:45:00");
+        assert_eq!(d3.pending_queue[2].created_at, "2026-11-11T17:55:00");
 
         drop(c3);
         let _ = fs::remove_dir_all(root_v3);

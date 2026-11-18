@@ -1,4 +1,6 @@
 use crate::models::{ChatMessage, KnowledgeDocument, SopRule, WorkEntity};
+use chrono::Local;
+use rusqlite::{params, Connection, Result};
 
 fn format_chat_transcript(messages: &[ChatMessage], limit: usize) -> String {
     let filtered: Vec<&ChatMessage> = messages
@@ -125,24 +127,39 @@ pub fn build_mcp_tool_turn_prompts(
     };
 
     let system_prompt = format!(
-        r#"You are Mab-Compass's interactive AI Copilot & Path Architect for project "{project_id}" ({mode_desc}).
+        r#"You are Mab-Compass v3.0's interactive AI Copilot, Knowledge Extractor & Path Architect for project "{project_id}" ({mode_desc}).
 
-YOU HAVE NATIVE MCP TOOLS TO READ & UPDATE THE PROJECT GRAPH DIRECTLY:
-- `create_work_entity`: Create a new TASK, DECISION (ADR), or BLOCKER with concrete Persian `title`, `definition_of_done`, and 2-minute `first_physical_action`. Set `status: "IN_PROGRESS"` and `is_on_critical_path: true` if it should immediately become the #1 step on Path Ahead.
-- `update_work_entity`: Edit an existing task/decision/blocker (`target_id` = `TSK-xxxx` / `ADR-xxxx` / `BLK-xxxx`). Never create duplicates when modifying an existing item!
-- `set_next_step`: Promote an existing `TSK-xxxx` to be the #1 active step on Path Ahead (`مسیر پیش‌رو`).
-- `complete_task`: Close a completed task (`TSK-xxxx`) and log effective pomodoros.
-- `delete_work_entity`: Remove a wrong/duplicate/cancelled item (`TSK-xxxx` / `ADR-xxxx` / `BLK-xxxx`).
-- `log_work_and_knowledge`: Record `LOG_WORK`, `UPSERT_SOP` (reusable rule), `REGISTER_ANTIPATTERN` (mistake/trap guardrail), or `INGEST_NOTE`.
-- `get_path_ahead` / `search_memory`: Fetch full details or search project memory when needed.
-- `sync_mab_focus` / `undo_last_change`: Sync with Mab-Focus or undo the last change.
+YOU HAVE NATIVE MCP TOOLS TO READ & UPDATE THE FULL 5-LAYER ECOSYSTEM DIRECTLY:
+1. Strategic Domains & Outcomes:
+   - `upsert_domain_or_outcome`: Create or update Outcomes (`OUT-xxxx`) linked to CADM life domains (`MIND_LEARNING`, `HEALTH_ENERGY`, `WEALTH_FINANCE`, `RELATIONS`, `RESILIENCE`, `PURPOSE`, `SPIRITUALITY`, `SANCTUARY`), with `desired_reality_change` and measurable `evidence_kr`.
+2. WorkLines (Sequential Chains & Goal Clusters):
+   - `create_work_line_chain`: Group back-to-back tasks into a `SEQUENTIAL_CHAIN` (Step 1 active, Steps 2..N locked until previous closes) or `GOAL_CLUSTER` WorkLine (`WLN-xxxx`) linked to an `outcome_id`. Prefer WorkLines whenever extracting multi-step workflows from documents!
+   - `append_or_reorder_work_line`: Append new steps or reorder steps inside an existing `WLN-xxxx`.
+3. Tasks, Decisions & Blockers:
+   - `create_work_entity`: Create a standalone TASK, DECISION (ADR), or BLOCKER with concrete Persian `title`, `definition_of_done`, and 2-minute `first_physical_action`.
+   - `update_work_entity` / `set_next_step` / `complete_task` / `delete_work_entity`: Modify, prioritize, complete, or delete existing `TSK-xxxx` / `ADR-xxxx` / `BLK-xxxx`. Never create duplicates when modifying an existing item!
+   - `schedule_task_on_calendar`: Assign a task to a `scheduled_date` / `scheduled_slot`.
+4. Atomic Knowledge Cards, Lessons Learned, Instructions & Guardrails:
+   - `save_personal_or_lesson_item`: Extract atomic knowledge cards into the Personal Knowledge Vault! Use:
+     * `item_type: "MEMORY_CARD"` for concise Question/Answer or Concept/Explanation flashcards (کارت حافظه و دانش اتمیک)
+     * `item_type: "LESSON"` for lessons learned (درس‌آموخته)
+     * `item_type: "INSTRUCTION"` for step-by-step instructions / playbooks (دستورالعمل)
+     * `item_type: "NOTE"` for key insights & tips (نکته کلیدی)
+   - `log_work_and_knowledge`: Record `LOG_WORK`, `UPSERT_SOP` (reusable project SOP rule), `REGISTER_ANTIPATTERN` (mistake/trap guardrail), or `INGEST_NOTE`.
+5. Project Lifecycle & Memory Search:
+   - `propose_project_lifecycle`: Propose creating, pausing, archiving, or splitting sub-projects for human approval.
+   - `get_path_ahead` / `search_memory` / `sync_mab_focus` / `undo_last_change`.
 
-HOW TO RESPOND:
-1. Analyze the user's message or submitted document carefully against the current Path Ahead, tasks, SOPs, and conversation history.
-2. Call the necessary MCP tools first so SQLite and the Path Ahead are updated immediately.
-3. After tool execution (or if no mutations are needed), write a warm, sharp, engineering-focused **Persian** reply summarizing what you updated (or answering their question).
-4. If key ambiguities remain about priorities, Definition of Done, or next steps, end your Persian reply with 1 to 3 concise numbered questions so the user can answer in the next turn.
-5. You do NOT need to wrap your final reply in JSON — write natural, readable Persian Markdown!"#
+DOCUMENT & INPUT PROCESSING RULES:
+1. Analyze the user's message or document carefully against existing tasks, WorkLines, Outcomes, SOPs, and conversation history.
+2. When processing a document or rich input, extract EVERY valuable atomic piece using MCP tools BEFORE replying:
+   - Actionable work → `create_work_line_chain` (or `create_work_entity`), linked to an `Outcome` when appropriate.
+   - Reusable rules / instructions → `log_work_and_knowledge` (`UPSERT_SOP`) or `save_personal_or_lesson_item` (`INSTRUCTION`).
+   - Lessons / pitfalls → `save_personal_or_lesson_item` (`LESSON`) and `REGISTER_ANTIPATTERN`.
+   - Core facts / concepts to remember → `save_personal_or_lesson_item` (`MEMORY_CARD`).
+3. After tool execution, write a warm, sharp, engineering-focused **Persian** reply summarizing the exact tasks, WorkLines, Outcomes, SOPs, lessons, and memory cards you extracted/updated.
+4. If key ambiguities remain about priorities, Outcomes, or Definition of Done, end your Persian reply with 1 to 3 concise numbered questions.
+5. Write natural, readable Persian Markdown (no JSON wrapper required)."#
     );
 
     let bounded_input: String = user_message_or_doc.chars().take(48000).collect();
@@ -495,4 +512,422 @@ Output ONLY a single valid JSON object (no markdown fences) matching this exact 
         docs_summary.join("\n"),
         fts_context.join("\n---\n")
     )
+}
+
+/// Builds a structured, continuous 6-layer Live Ecosystem State Snapshot
+/// formatted in Markdown for injection into LLM system prompts and chat turns.
+pub fn build_live_ecosystem_snapshot(conn: &Connection, project_id: &str) -> Result<String> {
+    let mut out = String::with_capacity(4096);
+    out.push_str("# LIVE ECOSYSTEM STATE SNAPSHOT\n\n");
+
+    // --------------------------------------------------------------------------
+    // 1. Life Domains (CADM v2.0 - 8 Dimensions)
+    // --------------------------------------------------------------------------
+    out.push_str("## 1. Life Domains (8 CADM Dimensions)\n");
+    let mut dom_stmt = conn.prepare(
+        "SELECT code, title, maturity_state, maintenance_floor, is_growth_focus
+         FROM life_domains ORDER BY code ASC",
+    )?;
+    let domains: Vec<(String, String, i32, String, bool)> = dom_stmt
+        .query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get::<_, i32>(2).unwrap_or(2),
+                r.get::<_, String>(3).unwrap_or_default(),
+                r.get::<_, i32>(4).unwrap_or(0) == 1,
+            ))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if domains.is_empty() {
+        out.push_str("*(No life domains configured)*\n\n");
+    } else {
+        out.push_str("| Domain Code | Title | Maturity (0..5) | Focus | Maintenance Floor |\n");
+        out.push_str("|---|---|:---:|:---:|---|\n");
+        for (code, title, maturity, floor, is_focus) in &domains {
+            let focus_str = if *is_focus { "🎯 YES" } else { "NO" };
+            let floor_str = if floor.trim().is_empty() {
+                "—"
+            } else {
+                floor.trim()
+            };
+            out.push_str(&format!(
+                "| {} | {} | {} | {} | {} |\n",
+                code, title, maturity, focus_str, floor_str
+            ));
+        }
+        out.push('\n');
+    }
+
+    // --------------------------------------------------------------------------
+    // 2. Active Outcomes
+    // --------------------------------------------------------------------------
+    out.push_str("## 2. Active Outcomes\n");
+    let mut out_stmt = conn.prepare(
+        "SELECT id, domain_code, title, desired_reality_change, evidence_kr, status, progress_percent
+         FROM outcomes
+         WHERE status != 'DROPPED'
+         ORDER BY domain_code, id ASC",
+    )?;
+    let outcomes: Vec<(String, String, String, String, String, String, i32)> = out_stmt
+        .query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get::<_, String>(3).unwrap_or_default(),
+                r.get::<_, String>(4).unwrap_or_default(),
+                r.get::<_, String>(5).unwrap_or_else(|_| "ACTIVE".into()),
+                r.get::<_, i32>(6).unwrap_or(0),
+            ))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if outcomes.is_empty() {
+        out.push_str("*(No active outcomes defined)*\n\n");
+    } else {
+        for (id, dom, title, reality, kr, status, prog) in &outcomes {
+            out.push_str(&format!(
+                "- [{}] ({}) \"{}\" (Status: {}, Progress: {}%)\n",
+                id, dom, title, status, prog
+            ));
+            if !reality.is_empty() {
+                out.push_str(&format!("  - Desired Reality: {}\n", reality));
+            }
+            if !kr.is_empty() {
+                out.push_str(&format!("  - Key Result (Evidence): {}\n", kr));
+            }
+        }
+        out.push('\n');
+    }
+
+    // --------------------------------------------------------------------------
+    // 3. Active Projects & Work Lines (Sequential Chains)
+    // --------------------------------------------------------------------------
+    out.push_str("## 3. Active Projects & Work Lines\n");
+    let mut p_stmt = conn.prepare(
+        "SELECT id, name, domain_code, lifecycle_status, priority_weight, is_active
+         FROM projects
+         WHERE lifecycle_status != 'ARCHIVED'
+         ORDER BY is_active DESC, priority_weight DESC, id ASC",
+    )?;
+    let projects: Vec<(String, String, String, String, i32, bool)> = p_stmt
+        .query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get::<_, String>(2).unwrap_or_else(|_| "WEALTH_FINANCE".into()),
+                r.get::<_, String>(3).unwrap_or_else(|_| "ACTIVE".into()),
+                r.get::<_, i32>(4).unwrap_or(5),
+                r.get::<_, i32>(5).unwrap_or(0) == 1,
+            ))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let target_pid = if projects.iter().any(|p| p.0 == project_id) {
+        project_id
+    } else {
+        projects
+            .iter()
+            .find(|p| p.5)
+            .map(|p| p.0.as_str())
+            .unwrap_or(project_id)
+    };
+
+    if let Some(target_p) = projects.iter().find(|p| p.0 == target_pid) {
+        out.push_str(&format!(
+            "### Project: {} [{}] (Status: {}, Domain: {}, Priority: {})\n",
+            target_p.1, target_p.0, target_p.3, target_p.2, target_p.4
+        ));
+    } else {
+        out.push_str(&format!("### Project: [{}]\n", target_pid));
+    }
+
+    let mut wl_stmt = conn.prepare(
+        "SELECT id, title, goal_statement, line_mode, status
+         FROM work_lines
+         WHERE project_id = ?1
+         ORDER BY status ASC, id ASC",
+    )?;
+    let work_lines: Vec<(String, String, String, String, String)> = wl_stmt
+        .query_map(params![target_pid], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get::<_, String>(2).unwrap_or_default(),
+                r.get::<_, String>(3).unwrap_or_else(|_| "SEQUENTIAL_CHAIN".into()),
+                r.get::<_, String>(4).unwrap_or_else(|_| "ACTIVE".into()),
+            ))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if work_lines.is_empty() {
+        out.push_str("*(No work lines defined for this project)*\n\n");
+    } else {
+        for (w_id, title, goal, mode, status) in &work_lines {
+            // Fetch steps for this line
+            let mut steps_stmt = conn.prepare(
+                "SELECT id, sequence_order, title, status, is_locked_by_chain, duration_minutes, device_tag
+                 FROM work_entities
+                 WHERE work_line_id = ?1
+                 ORDER BY sequence_order ASC",
+            )?;
+            let steps: Vec<(String, i32, String, String, bool, i32, String)> = steps_stmt
+                .query_map(params![w_id], |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get::<_, String>(3).unwrap_or_else(|_| "OPEN".into()),
+                        r.get::<_, i32>(4).unwrap_or(0) == 1,
+                        r.get::<_, i32>(5).unwrap_or(25),
+                        r.get::<_, String>(6).unwrap_or_else(|_| "LAPTOP_ONLY".into()),
+                    ))
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            let total_steps = steps.len();
+            let completed_steps = steps.iter().filter(|s| s.3 == "CLOSED").count();
+            let active_step = steps.iter().find(|s| s.3 == "IN_PROGRESS");
+            let queued_count = steps
+                .iter()
+                .filter(|s| s.3 == "QUEUED_IN_CHAIN" || s.4)
+                .count();
+
+            out.push_str(&format!(
+                "- WorkLine [{}] \"{}\" [{}] (Status: {}, Progress: {}/{} completed)\n",
+                w_id, title, mode, status, completed_steps, total_steps
+            ));
+            if !goal.is_empty() {
+                out.push_str(&format!("  - Goal: {}\n", goal));
+            }
+            if let Some(active) = active_step {
+                out.push_str(&format!(
+                    "  - Active Step (#{}: [{}] \"{}\" ({}, {}m, {}))\n",
+                    active.1, active.0, active.2, active.3, active.5, active.6
+                ));
+            }
+            if queued_count > 0 {
+                out.push_str(&format!(
+                    "  - Queued: {} steps waiting in chain\n",
+                    queued_count
+                ));
+            }
+        }
+        out.push('\n');
+    }
+
+    // --------------------------------------------------------------------------
+    // 4. Today's Calendar Capacity & Scheduled Tasks
+    // --------------------------------------------------------------------------
+    let today_key = Local::now().format("%Y-%m-%d").to_string();
+    out.push_str(&format!(
+        "## 4. Today's Calendar Capacity & Scheduled Tasks ({})\n",
+        today_key
+    ));
+
+    let cal_row = conn
+        .query_row(
+            "SELECT total_capacity_minutes, deep_capacity_minutes, is_off_day, day_note
+         FROM calendar_days WHERE date_key = ?1",
+            params![today_key],
+            |r| {
+                Ok((
+                    r.get::<_, i32>(0).unwrap_or(300),
+                    r.get::<_, i32>(1).unwrap_or(150),
+                    r.get::<_, i32>(2).unwrap_or(0) == 1,
+                    r.get::<_, String>(3).unwrap_or_default(),
+                ))
+            },
+        )
+        .unwrap_or((300, 150, false, String::new()));
+
+    let (total_cap, deep_cap, is_off, day_note) = cal_row;
+
+    let mut sched_stmt = conn.prepare(
+        "SELECT id, title, scheduled_slot, duration_minutes, status
+         FROM work_entities
+         WHERE scheduled_date = ?1
+         ORDER BY
+             CASE scheduled_slot
+                 WHEN 'MORNING_DEEP' THEN 1
+                 WHEN 'MIDDAY_EXEC' THEN 2
+                 WHEN 'AFTERNOON_LIGHT' THEN 3
+                 WHEN 'COMMUTE_SLOT' THEN 4
+                 ELSE 5 END ASC,
+             sequence_order ASC",
+    )?;
+    let sched_tasks: Vec<(String, String, String, i32, String)> = sched_stmt
+        .query_map(params![today_key], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get::<_, String>(2).unwrap_or_else(|_| "MIDDAY_EXEC".into()),
+                r.get::<_, i32>(3).unwrap_or(25),
+                r.get::<_, String>(4).unwrap_or_else(|_| "OPEN".into()),
+            ))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let booked_minutes: i32 = sched_tasks.iter().map(|t| t.3).sum();
+    let available_minutes = total_cap.saturating_sub(booked_minutes);
+    let off_str = if is_off { "YES (Off Day)" } else { "NO" };
+
+    out.push_str(&format!(
+        "- Capacity: {}m total / {}m deep | Booked: {}m | Available: {}m | Off Day: {}\n",
+        total_cap, deep_cap, booked_minutes, available_minutes, off_str
+    ));
+    if !day_note.is_empty() {
+        out.push_str(&format!("- Day Note: {}\n", day_note));
+    }
+
+    if sched_tasks.is_empty() {
+        out.push_str("- Scheduled Tasks: *(No tasks scheduled for today)*\n\n");
+    } else {
+        out.push_str("- Scheduled Tasks:\n");
+        for (tid, title, slot, dur, status) in &sched_tasks {
+            out.push_str(&format!(
+                "  - [{}] \"{}\" (Slot: {}, {}m, Status: {})\n",
+                tid, title, slot, dur, status
+            ));
+        }
+        out.push('\n');
+    }
+
+    // --------------------------------------------------------------------------
+    // 5. Pending Proposals (Human-in-the-Loop)
+    // --------------------------------------------------------------------------
+    out.push_str("## 5. Pending Proposals\n");
+    let mut prop_stmt = conn.prepare(
+        "SELECT id, project_id, proposal_type, title, rationale_markdown
+         FROM pending_proposals
+         WHERE status = 'PENDING'
+         ORDER BY created_at DESC
+         LIMIT 5",
+    )?;
+    let proposals: Vec<(String, Option<String>, String, String, String)> = prop_stmt
+        .query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1).ok(),
+                r.get(2)?,
+                r.get(3)?,
+                r.get::<_, String>(4).unwrap_or_default(),
+            ))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if proposals.is_empty() {
+        out.push_str("*(No pending proposals awaiting decision)*\n\n");
+    } else {
+        for (prp_id, pid_opt, ptype, title, rationale) in &proposals {
+            let p_tag = pid_opt.as_deref().unwrap_or("GLOBAL");
+            out.push_str(&format!(
+                "- [{}] [{}] \"{}\" (Project: {})\n  - Rationale: {}\n",
+                prp_id, ptype, title, p_tag, rationale
+            ));
+        }
+        out.push('\n');
+    }
+
+    // --------------------------------------------------------------------------
+    // 6. Recent Personal Vault Items (Lessons & Notes)
+    // --------------------------------------------------------------------------
+    out.push_str("## 6. Recent Personal Vault Items\n");
+    let mut v_stmt = conn.prepare(
+        "SELECT id, realm, domain_code, item_type, title, content_markdown
+         FROM personal_vault_items
+         ORDER BY updated_at DESC, id DESC
+         LIMIT 6",
+    )?;
+    let vault_items: Vec<(String, String, String, String, String, String)> = v_stmt
+        .query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                r.get::<_, String>(1).unwrap_or_else(|_| "LIFE".into()),
+                r.get::<_, String>(2).unwrap_or_else(|_| "MIND_LEARNING".into()),
+                r.get(3)?,
+                r.get(4)?,
+                r.get::<_, String>(5).unwrap_or_default(),
+            ))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if vault_items.is_empty() {
+        out.push_str("*(Personal vault is empty)*\n\n");
+    } else {
+        for (v_id, realm, dom, itype, title, content) in &vault_items {
+            let snippet: String = content.chars().take(120).collect();
+            out.push_str(&format!(
+                "- [{}] [{}] \"{}\" (Domain: {}, Realm: {}): {}\n",
+                v_id,
+                itype,
+                title,
+                dom,
+                realm,
+                snippet.trim()
+            ));
+        }
+        out.push('\n');
+    }
+
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_live_ecosystem_snapshot_coverage() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::schema::init_database(&dir.path().join("test.sqlite"), dir.path()).unwrap();
+        // 1. Snapshot on freshly seeded DB (empty tables except life_domains)
+        let snap = build_live_ecosystem_snapshot(&conn, "GERDALO").unwrap();
+        assert!(snap.contains("1. Life Domains (8 CADM Dimensions)"));
+        assert!(snap.contains("MIND_LEARNING"));
+        assert!(snap.contains("HEALTH_ENERGY"));
+        assert!(snap.contains("2. Active Outcomes"));
+        assert!(snap.contains("3. Active Projects & Work Lines"));
+        assert!(snap.contains("4. Today's Calendar Capacity"));
+        assert!(snap.contains("5. Pending Proposals"));
+        assert!(snap.contains("6. Recent Personal Vault Items"));
+
+        // 2. Snapshot on populated DB
+        let now = chrono::Local::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO outcomes (id, domain_code, title, desired_reality_change, evidence_kr, time_window, status, progress_percent, created_at, updated_at)
+             VALUES ('OUT-UNIT-01', 'MIND_LEARNING', 'Learn Systems Rust', 'Deep mastery', '100% test pass', '1405-Q3', 'ACTIVE', 50, ?1, ?1)",
+            params![now],
+        ).unwrap();
+
+        conn.execute(
+            "INSERT INTO pending_proposals (id, project_id, proposal_type, title, rationale_markdown, payload_json, status, created_at)
+             VALUES ('PRP-UNIT-01', 'GERDALO', 'PAUSE_PROJECT', 'Pause Unit', 'Focus rationale', '{}', 'PENDING', ?1)",
+            params![now],
+        ).unwrap();
+
+        conn.execute(
+            "INSERT INTO personal_vault_items (id, realm, domain_code, item_type, title, content_markdown, created_at, updated_at)
+             VALUES ('PVI-UNIT-01', 'LIFE', 'MIND_LEARNING', 'LESSON_LEARNED', 'Test Lesson', 'Content of lesson', ?1, ?1)",
+            params![now],
+        ).unwrap();
+
+        let populated_snap = build_live_ecosystem_snapshot(&conn, "GERDALO").unwrap();
+        assert!(populated_snap.contains("OUT-UNIT-01"));
+        assert!(populated_snap.contains("Learn Systems Rust"));
+        assert!(populated_snap.contains("PRP-UNIT-01"));
+        assert!(populated_snap.contains("Pause Unit"));
+        assert!(populated_snap.contains("PVI-UNIT-01"));
+        assert!(populated_snap.contains("Test Lesson"));
+    }
 }
