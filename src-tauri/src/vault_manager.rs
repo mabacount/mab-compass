@@ -8,6 +8,7 @@ pub const SUBFOLDERS: &[&str] = &[
     "02_path_ahead",
     "03_decisions_adr",
     "04_sops_playbooks",
+    "04_methods_playbooks",
     "05_meetings_minutes",
     "06_lessons_antipatterns",
     "07_client_reports",
@@ -110,6 +111,35 @@ pub fn archive_onboarding_document(
 
     fs::write(&target_path, full_doc).map_err(|e| e.to_string())?;
     Ok(target_path.to_string_lossy().to_string())
+}
+
+/// Write or update a Method / Playbook Markdown file and its companion BPMN 2.0 XML file
+/// inside `<project_workspace>/04_methods_playbooks/`.
+pub fn write_method_playbook_files(
+    project_workspace_path: &str,
+    slug: &str,
+    markdown_content: &str,
+    bpmn_xml: &str,
+) -> Result<(String, String), String> {
+    let root = ensure_project_directories(project_workspace_path)?;
+    let dir = root.join("04_methods_playbooks");
+    if !dir.exists() {
+        fs::create_dir_all(&dir)
+            .map_err(|e| format!("خطا در ساخت پوشه 04_methods_playbooks: {}", e))?;
+    }
+    let safe_slug = sanitize_filename(slug);
+    let md_path = dir.join(format!("{}.md", safe_slug));
+    let bpmn_path = dir.join(format!("{}.bpmn", safe_slug));
+
+    fs::write(&md_path, markdown_content)
+        .map_err(|e| format!("خطا در ذخیره فایل دستورالعمل Markdown: {}", e))?;
+    fs::write(&bpmn_path, bpmn_xml)
+        .map_err(|e| format!("خطا در ذخیره فایل BPMN 2.0: {}", e))?;
+
+    Ok((
+        md_path.to_string_lossy().to_string(),
+        bpmn_path.to_string_lossy().to_string(),
+    ))
 }
 
 #[cfg(test)]

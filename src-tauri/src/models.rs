@@ -41,6 +41,16 @@ where
     Ok(opt.unwrap_or_default())
 }
 
+fn deserialize_vec_methods_lenient<'de, D>(
+    deserializer: D,
+) -> Result<Vec<MethodPlaybookInput>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let opt = Option::<Vec<MethodPlaybookInput>>::deserialize(deserializer)?;
+    Ok(opt.unwrap_or_default())
+}
+
 fn deserialize_bool_lenient<'de, D>(deserializer: D) -> Result<bool, D::Error>
 where
     D: Deserializer<'de>,
@@ -394,6 +404,21 @@ fn default_gemini_model() -> String {
     "gemini-2.5-flash".to_string()
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WrittenArtifactRef {
+    pub artifact_type: String, // "METHOD_PLAYBOOK" | "KNOWLEDGE_DOC" | "MEETING_MINUTES" | "DECISION_ADR" | "SOP_RULE" | "VAULT_CARD" | "WORK_LINE" | "MARKDOWN_FILE"
+    pub entity_id: String,
+    pub title: String,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub file_path: Option<String>,
+    #[serde(default)]
+    pub action: String, // "CREATED" | "UPDATED"
+    #[serde(default)]
+    pub version: Option<i32>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub id: i64,
@@ -408,6 +433,8 @@ pub struct ChatMessage {
     pub applied_mutations_badge: Option<String>,
     #[serde(default)]
     pub clarifying_questions: Vec<String>,
+    #[serde(default)]
+    pub written_artifacts: Vec<WrittenArtifactRef>,
     pub created_at: String,
 }
 
@@ -576,6 +603,152 @@ pub struct DashboardState {
     pub pending_proposals: Vec<PendingProposal>,
     #[serde(default)]
     pub personal_vault_items: Vec<PersonalVaultItem>,
+    #[serde(default)]
+    pub methods_playbooks: Vec<MethodPlaybook>,
+}
+
+fn default_bpmn_element_type() -> String {
+    "task".to_string()
+}
+
+fn default_method_version() -> i32 {
+    1
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MethodStep {
+    #[serde(default, deserialize_with = "deserialize_string_lenient")]
+    pub id: String,
+    #[serde(default = "default_sequence_order")]
+    pub order: i32,
+    #[serde(default, deserialize_with = "deserialize_string_lenient")]
+    pub title: String,
+    #[serde(default, deserialize_with = "deserialize_string_lenient")]
+    pub description: String,
+    #[serde(default = "default_bpmn_element_type", deserialize_with = "deserialize_string_lenient")]
+    pub element_type: String, // "task" | "userTask" | "serviceTask" | "subProcess" | "exclusiveGateway" | "parallelGateway" | "callActivity"
+    #[serde(default, deserialize_with = "deserialize_string_lenient")]
+    pub role: String,
+    #[serde(default, deserialize_with = "deserialize_vec_string_lenient")]
+    pub inputs: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_vec_string_lenient")]
+    pub outputs: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_vec_string_lenient")]
+    pub checklist: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_string_lenient")]
+    pub notes: String,
+    #[serde(default, deserialize_with = "deserialize_opt_string_lenient")]
+    pub condition_label: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_opt_string_lenient")]
+    pub sub_method_id: Option<String>,
+    #[serde(default)]
+    pub sub_steps: Vec<MethodStep>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MethodPlaybook {
+    pub id: String, // MTH-XXXX
+    pub project_id: String,
+    pub slug: String,
+    pub title: String,
+    #[serde(default = "default_step_category")]
+    pub category: String,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub objective: String,
+    #[serde(default)]
+    pub prerequisites: Vec<String>,
+    #[serde(default)]
+    pub steps: Vec<MethodStep>,
+    #[serde(default)]
+    pub checklist: Vec<String>,
+    #[serde(default)]
+    pub notes_markdown: String,
+    #[serde(default)]
+    pub markdown_content: String,
+    #[serde(default)]
+    pub bpmn_xml: String,
+    #[serde(default)]
+    pub parent_method_id: Option<String>,
+    #[serde(default)]
+    pub parent_element_id: Option<String>,
+    #[serde(default = "default_method_version")]
+    pub version: i32,
+    #[serde(default)]
+    pub archived_path: String,
+    #[serde(default)]
+    pub bpmn_file_path: String,
+    #[serde(default)]
+    pub source_refs: Vec<String>,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MethodPlaybookInput {
+    #[serde(default, deserialize_with = "deserialize_opt_string_lenient")]
+    pub method_id: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_string_lenient")]
+    pub title: String,
+    #[serde(default, deserialize_with = "deserialize_opt_string_lenient")]
+    pub category: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_opt_string_lenient")]
+    pub summary: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_opt_string_lenient")]
+    pub objective: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_vec_string_lenient")]
+    pub prerequisites: Vec<String>,
+    #[serde(default)]
+    pub steps: Vec<MethodStep>,
+    #[serde(default, deserialize_with = "deserialize_vec_string_lenient")]
+    pub checklist: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_opt_string_lenient")]
+    pub notes_markdown: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_opt_string_lenient")]
+    pub bpmn_xml: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_opt_string_lenient")]
+    pub parent_method_id: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_opt_string_lenient")]
+    pub parent_element_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LegacyReprocessCandidate {
+    pub source_kind: String, // "KNOWLEDGE_DOC" | "RAW_EVENT"
+    pub source_id: i64,
+    pub project_id: String,
+    pub title: String,
+    pub doc_type: String,
+    pub snippet: String,
+    pub created_at: String,
+    pub processing_status: String,
+    pub already_upgraded: bool,
+    pub upgraded_at: Option<String>,
+    pub archived_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LegacyReprocessSelection {
+    pub source_kind: String,
+    pub source_id: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatabaseBackupResult {
+    pub backup_path: String,
+    pub backup_size_bytes: u64,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LegacyReprocessEnqueueResult {
+    pub backup_path: String,
+    pub backup_size_bytes: u64,
+    pub enqueued_count: usize,
+    pub dashboard: DashboardState,
 }
 
 // 1. LifeDomain
@@ -868,6 +1041,8 @@ pub struct CopilotEnvelope {
     pub executive_doc_summary: Option<String>,
     #[serde(default, deserialize_with = "deserialize_vec_mutations_lenient")]
     pub mutations: Vec<AtomicMutation>,
+    #[serde(default, deserialize_with = "deserialize_vec_methods_lenient")]
+    pub method_playbooks: Vec<MethodPlaybookInput>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

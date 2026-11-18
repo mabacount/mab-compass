@@ -267,6 +267,14 @@
   .tauri-drag {
     -webkit-app-region: drag;
   }
+
+  .scrollbar-none {
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+  .scrollbar-none::-webkit-scrollbar {
+    display: none;
+  }
 }
 
 /* Anytype Refined Ultra-slim Scrollbars */

@@ -1,4 +1,4 @@
-use crate::models::{ChatMessage, KnowledgeDocument, SopRule, WorkEntity};
+use crate::models::{ChatMessage, KnowledgeDocument, MethodPlaybook, SopRule, WorkEntity};
 use chrono::Local;
 use rusqlite::{params, Connection, Result};
 
@@ -81,6 +81,29 @@ fn compact_tasks_summary(open_tasks: &[WorkEntity]) -> String {
     serde_json::to_string(&summary).unwrap_or_else(|_| "[]".into())
 }
 
+pub fn format_existing_methods_summary(methods: &[MethodPlaybook]) -> String {
+    if methods.is_empty() {
+        return "*(No methods/playbooks saved yet)*".to_string();
+    }
+    methods
+        .iter()
+        .take(20)
+        .map(|m| {
+            format!(
+                "- [{} | v{} | {}] {} ({} steps): {}",
+                m.id,
+                m.version,
+                m.category,
+                m.title,
+                m.steps.len(),
+                m.summary.chars().take(120).collect::<String>()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn build_mcp_tool_turn_prompts(
     project_id: &str,
     channel: &str,
@@ -93,8 +116,40 @@ pub fn build_mcp_tool_turn_prompts(
     fts_snippets: &[(String, String)],
     doc_meta: Option<(&str, &str, &str)>, // (title, doc_type, filename)
 ) -> (String, String) {
+    build_mcp_tool_turn_prompts_with_methods(
+        project_id,
+        channel,
+        user_message_or_doc,
+        recent_history,
+        open_tasks,
+        active_decisions,
+        active_sops,
+        recent_docs,
+        &[],
+        fts_snippets,
+        doc_meta,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_mcp_tool_turn_prompts_with_methods(
+    project_id: &str,
+    channel: &str,
+    user_message_or_doc: &str,
+    recent_history: &[ChatMessage],
+    open_tasks: &[WorkEntity],
+    active_decisions: &[WorkEntity],
+    active_sops: &[SopRule],
+    recent_docs: &[KnowledgeDocument],
+    existing_methods: &[MethodPlaybook],
+    fts_snippets: &[(String, String)],
+    doc_meta: Option<(&str, &str, &str)>, // (title, doc_type, filename)
+    is_legacy_reprocess: bool,
+) -> (String, String) {
     let current_hero = format_active_next_step_summary(open_tasks);
     let tasks_compact = compact_tasks_summary(open_tasks);
+    let methods_summary = format_existing_methods_summary(existing_methods);
     let adrs_compact: Vec<String> = active_decisions
         .iter()
         .take(12)
@@ -117,49 +172,60 @@ pub fn build_mcp_tool_turn_prompts(
         .collect();
     let history = format_chat_transcript(recent_history, 12);
 
-    let mode_desc = match (channel, doc_meta) {
-        (_, Some((title, doc_type, fname))) => format!(
-            "Document / Content Onboarding (Channel: {}, Title: \"{}\", Type: {}, File: \"{}\")",
-            channel, title, doc_type, fname
-        ),
-        ("VAULT", None) => "Knowledge Vault Multi-Turn Refinement".to_string(),
-        _ => "Project Copilot & Path Ahead Architect".to_string(),
+    let mode_desc = if is_legacy_reprocess {
+        "LEGACY MEMORY UPGRADE & ANTI-DUPLICATE EXTRACTION".to_string()
+    } else {
+        match (channel, doc_meta) {
+            (_, Some((title, doc_type, fname))) => format!(
+                "Document / Content Onboarding (Channel: {}, Title: \"{}\", Type: {}, File: \"{}\")",
+                channel, title, doc_type, fname
+            ),
+            ("VAULT", None) => "Knowledge Vault Multi-Turn Refinement".to_string(),
+            _ => "Project Copilot & Path Ahead Architect".to_string(),
+        }
+    };
+
+    let legacy_rules = if is_legacy_reprocess {
+        r#"
+CRITICAL ANTI-DUPLICATE LEGACY REPROCESSING RULES:
+- You are re-analyzing a HISTORICAL document or past work report to extract capabilities that did not exist before.
+- DO NOT create duplicate tasks that already exist in CURRENT OPEN TASKS or were already completed.
+- FOCUS heavily on extracting MISSING:
+  1. Repeatable Work Methods / Playbooks + BPMN 2.0 Workflows (`upsert_method_playbook`) — enrich existing methods if similar!
+  2. Atomic Memory Cards (`MEMORY_CARD`), Lessons Learned (`LESSON`), Instructions (`INSTRUCTION`) via `save_personal_or_lesson_item`.
+  3. Missing WorkLines (`create_work_line_chain`) or Outcomes (`upsert_domain_or_outcome`) ONLY if genuinely absent.
+"#
+    } else {
+        ""
     };
 
     let system_prompt = format!(
-        r#"You are Mab-Compass v3.0's interactive AI Copilot, Knowledge Extractor & Path Architect for project "{project_id}" ({mode_desc}).
-
-YOU HAVE NATIVE MCP TOOLS TO READ & UPDATE THE FULL 5-LAYER ECOSYSTEM DIRECTLY:
-1. Strategic Domains & Outcomes:
-   - `upsert_domain_or_outcome`: Create or update Outcomes (`OUT-xxxx`) linked to CADM life domains (`MIND_LEARNING`, `HEALTH_ENERGY`, `WEALTH_FINANCE`, `RELATIONS`, `RESILIENCE`, `PURPOSE`, `SPIRITUALITY`, `SANCTUARY`), with `desired_reality_change` and measurable `evidence_kr`.
-2. WorkLines (Sequential Chains & Goal Clusters):
-   - `create_work_line_chain`: Group back-to-back tasks into a `SEQUENTIAL_CHAIN` (Step 1 active, Steps 2..N locked until previous closes) or `GOAL_CLUSTER` WorkLine (`WLN-xxxx`) linked to an `outcome_id`. Prefer WorkLines whenever extracting multi-step workflows from documents!
-   - `append_or_reorder_work_line`: Append new steps or reorder steps inside an existing `WLN-xxxx`.
-3. Tasks, Decisions & Blockers:
-   - `create_work_entity`: Create a standalone TASK, DECISION (ADR), or BLOCKER with concrete Persian `title`, `definition_of_done`, and 2-minute `first_physical_action`.
-   - `update_work_entity` / `set_next_step` / `complete_task` / `delete_work_entity`: Modify, prioritize, complete, or delete existing `TSK-xxxx` / `ADR-xxxx` / `BLK-xxxx`. Never create duplicates when modifying an existing item!
-   - `schedule_task_on_calendar`: Assign a task to a `scheduled_date` / `scheduled_slot`.
-4. Atomic Knowledge Cards, Lessons Learned, Instructions & Guardrails:
-   - `save_personal_or_lesson_item`: Extract atomic knowledge cards into the Personal Knowledge Vault! Use:
-     * `item_type: "MEMORY_CARD"` for concise Question/Answer or Concept/Explanation flashcards (کارت حافظه و دانش اتمیک)
-     * `item_type: "LESSON"` for lessons learned (درس‌آموخته)
-     * `item_type: "INSTRUCTION"` for step-by-step instructions / playbooks (دستورالعمل)
-     * `item_type: "NOTE"` for key insights & tips (نکته کلیدی)
-   - `log_work_and_knowledge`: Record `LOG_WORK`, `UPSERT_SOP` (reusable project SOP rule), `REGISTER_ANTIPATTERN` (mistake/trap guardrail), or `INGEST_NOTE`.
-5. Project Lifecycle & Memory Search:
-   - `propose_project_lifecycle`: Propose creating, pausing, archiving, or splitting sub-projects for human approval.
-   - `get_path_ahead` / `search_memory` / `sync_mab_focus` / `undo_last_change`.
+        r#"You are Mab-Compass v4.0's interactive AI Copilot, Knowledge & Method Architect for project "{project_id}" ({mode_desc}).
+{legacy_rules}
+YOU HAVE NATIVE MCP TOOLS TO READ & UPDATE THE FULL ECOSYSTEM DIRECTLY:
+1. Methods, Playbooks & BPMN 2.0 Workflows (دستورالعمل و متد انجام کار):
+   - `upsert_method_playbook`: WHENEVER you detect a repeatable work pattern, procedure, workflow, or method in a work report, incremental messages, or document — OR whenever the user explicitly asks for a method/playbook/workflow — call `upsert_method_playbook`!
+   - If a similar method ALREADY exists in `EXISTING METHODS & PLAYBOOKS`, pass its `method_id` (or matching title) so it automatically enriches & bumps version (`v1 -> v2`) instead of duplicating!
+   - Include Persian `title`, `summary`, `objective` (هدف), `prerequisites` (پیش‌نیازها), ordered `steps` (with `element_type`: `task`/`userTask`/`serviceTask`/`subProcess`/`exclusiveGateway`/`parallelGateway`, `role`, `inputs`, `outputs`, `checklist`, `notes`), overall `checklist`, and `notes_markdown`.
+   - For composite stages/groups of tasks, set `element_type: "subProcess"` and populate `sub_steps` so the user can visually click and drill down into the internal BPMN 2.0 sub-workflow!
+   - Files are automatically written to `04_methods_playbooks/` (.md + .bpmn) and displayed as clickable Artifact Cards beneath your chat reply.
+2. Strategic Domains & Outcomes:
+   - `upsert_domain_or_outcome`: Create or update Outcomes (`OUT-xxxx`) linked to CADM life domains (`MIND_LEARNING`, `HEALTH_ENERGY`, `WEALTH_FINANCE`, `RELATIONS`, `RESILIENCE`, `PURPOSE`, `SPIRITUALITY`, `SANCTUARY`).
+3. WorkLines (Sequential Chains & Goal Clusters):
+   - `create_work_line_chain` & `append_or_reorder_work_line`: Group multi-step work into `SEQUENTIAL_CHAIN` or `GOAL_CLUSTER` WorkLines (`WLN-xxxx`).
+4. Tasks, Decisions & Blockers:
+   - `create_work_entity`, `update_work_entity`, `set_next_step`, `complete_task`, `delete_work_entity`, `schedule_task_on_calendar`.
+5. Atomic Knowledge Cards, Lessons Learned, Instructions & Guardrails:
+   - `save_personal_or_lesson_item`: Use `item_type`: `"MEMORY_CARD"`, `"LESSON"`, `"INSTRUCTION"`, `"NOTE"`.
+   - `log_work_and_knowledge`: Record `LOG_WORK`, `UPSERT_SOP`, `REGISTER_ANTIPATTERN`, or `INGEST_NOTE`.
+6. Project Lifecycle & Memory Search:
+   - `propose_project_lifecycle`, `get_path_ahead`, `search_memory`, `sync_mab_focus`, `undo_last_change`.
 
 DOCUMENT & INPUT PROCESSING RULES:
-1. Analyze the user's message or document carefully against existing tasks, WorkLines, Outcomes, SOPs, and conversation history.
-2. When processing a document or rich input, extract EVERY valuable atomic piece using MCP tools BEFORE replying:
-   - Actionable work → `create_work_line_chain` (or `create_work_entity`), linked to an `Outcome` when appropriate.
-   - Reusable rules / instructions → `log_work_and_knowledge` (`UPSERT_SOP`) or `save_personal_or_lesson_item` (`INSTRUCTION`).
-   - Lessons / pitfalls → `save_personal_or_lesson_item` (`LESSON`) and `REGISTER_ANTIPATTERN`.
-   - Core facts / concepts to remember → `save_personal_or_lesson_item` (`MEMORY_CARD`).
-3. After tool execution, write a warm, sharp, engineering-focused **Persian** reply summarizing the exact tasks, WorkLines, Outcomes, SOPs, lessons, and memory cards you extracted/updated.
-4. If key ambiguities remain about priorities, Outcomes, or Definition of Done, end your Persian reply with 1 to 3 concise numbered questions.
-5. Write natural, readable Persian Markdown (no JSON wrapper required)."#
+1. Analyze the user's message, work report, or document carefully against existing tasks, Methods/Playbooks, WorkLines, Outcomes, SOPs, and conversation history.
+2. Extract EVERY valuable atomic piece using MCP tools BEFORE replying (especially repeatable Methods/Playbooks + BPMN workflows, WorkLines, Tasks, Memory Cards, Lessons, Guardrails).
+3. After tool execution, write a warm, sharp, engineering-focused **Persian Markdown** reply explicitly noting every document/method/playbook/workflow you wrote or updated (their clickable cards will appear right below your message).
+4. If key ambiguities remain, end your Persian reply with 1 to 3 concise numbered questions."#
     );
 
     let bounded_input: String = user_message_or_doc.chars().take(48000).collect();
@@ -167,6 +233,9 @@ DOCUMENT & INPUT PROCESSING RULES:
     let user_prompt = format!(
         r#"CURRENT #1 ACTIVE STEP ON PATH AHEAD:
 {current_hero}
+
+EXISTING METHODS & PLAYBOOKS (UPDATE/ENRICH BY method_id IF SIMILAR):
+{methods_summary}
 
 CURRENT OPEN TASKS:
 {tasks_compact}
@@ -307,6 +376,32 @@ Respond with ONLY a single valid JSON object (no markdown fences) matching this 
       "deliverable_summary": "string or null",
       "internal_friction_note": "string or null",
       "client_sanitized_note": "string or null"
+    }}
+  ],
+  "method_playbooks": [
+    {{
+      "method_id": "string or null (existing MTH-xxxx ID if enriching an existing method)",
+      "title": "عنوان دستورالعمل و متد انجام کار به فارسی (اگر الگوی کاری تکرارپذیر در گزارش کار یا درخواست کاربر وجود دارد)",
+      "category": "BACKEND" | "UI_UX" | "DEPLOY" | "VIDEO" | "ARCHITECTURE" | "GENERAL",
+      "summary": "خلاصه ۱ تا ۲ خطی برای کارت قابل کلیک در چت",
+      "objective": "هدف دقیق این روش و دستورالعمل",
+      "prerequisites": ["پیش‌نیاز ۱", "پیش‌نیاز ۲"],
+      "steps": [
+        {{
+          "id": "S1",
+          "order": 1,
+          "title": "عنوان گام",
+          "description": "توضیح کامل گام",
+          "element_type": "task" | "userTask" | "serviceTask" | "subProcess" | "exclusiveGateway" | "parallelGateway",
+          "role": "مسئول یا نقش",
+          "checklist": ["مورد کنترل ۱"],
+          "notes": "نکته کلیدی",
+          "sub_steps": [{{ "title": "زیرگام داخلی در صورت subProcess بودن", "description": "شرح", "element_type": "task" }}]
+        }}
+      ],
+      "checklist": ["چک‌لیست نهایی"],
+      "notes_markdown": "نکات و هشدارها",
+      "bpmn_xml": "optional valid BPMN 2.0 XML or null"
     }}
   ]
 }}"#,
@@ -506,11 +601,96 @@ Output ONLY a single valid JSON object (no markdown fences) matching this exact 
       "internal_friction_note": "string or null",
       "client_sanitized_note": "string or null"
     }}
+  ],
+  "method_playbooks": [
+    {{
+      "method_id": "string or null (existing MTH-xxxx ID if enriching an existing method)",
+      "title": "عنوان دستورالعمل و متد انجام کار به فارسی (اگر الگوی کاری تکرارپذیر در گزارش کار یا درخواست کاربر وجود دارد)",
+      "category": "BACKEND" | "UI_UX" | "DEPLOY" | "VIDEO" | "ARCHITECTURE" | "GENERAL",
+      "summary": "خلاصه ۱ تا ۲ خطی برای کارت قابل کلیک در چت",
+      "objective": "هدف دقیق این روش و دستورالعمل",
+      "prerequisites": ["پیش‌نیاز ۱", "پیش‌نیاز ۲"],
+      "steps": [
+        {{
+          "id": "S1",
+          "order": 1,
+          "title": "عنوان گام",
+          "description": "توضیح کامل گام",
+          "element_type": "task" | "userTask" | "serviceTask" | "subProcess" | "exclusiveGateway" | "parallelGateway",
+          "role": "مسئول یا نقش",
+          "checklist": ["مورد کنترل ۱"],
+          "notes": "نکته کلیدی",
+          "sub_steps": [{{ "title": "زیرگام داخلی در صورت subProcess بودن", "description": "شرح", "element_type": "task" }}]
+        }}
+      ],
+      "checklist": ["چک‌لیست نهایی"],
+      "notes_markdown": "نکات و هشدارها",
+      "bpmn_xml": "optional valid BPMN 2.0 XML or null"
+    }}
   ]
 }}"#,
         sops_summary.join("\n"),
         docs_summary.join("\n"),
         fts_context.join("\n---\n")
+    )
+}
+
+/// Specialized Anti-Duplicate Legacy Reprocessing Prompt for structured JSON fallback models.
+#[allow(clippy::too_many_arguments)]
+pub fn build_legacy_reprocess_prompt(
+    project_id: &str,
+    source_label: &str,
+    historical_content: &str,
+    open_tasks: &[WorkEntity],
+    active_decisions: &[WorkEntity],
+    active_sops: &[SopRule],
+    existing_methods: &[MethodPlaybook],
+) -> String {
+    let tasks_compact = compact_tasks_summary(open_tasks);
+    let methods_summary = format_existing_methods_summary(existing_methods);
+    let adrs_compact: Vec<String> = active_decisions
+        .iter()
+        .take(12)
+        .map(|d| format!("- [{}] {}", d.id, d.title))
+        .collect();
+    let sops_summary: Vec<String> = active_sops
+        .iter()
+        .take(10)
+        .map(|s| format!("- [{}]: {}", s.category, s.rule_statement))
+        .collect();
+    let bounded_content: String = historical_content.chars().take(48000).collect();
+
+    format!(
+        r#"You are performing an IDEMPOTENT / ANTI-DUPLICATE LEGACY MEMORY UPGRADE on a historical document or work report for project "{project_id}" ({source_label}).
+
+STRICT RULES:
+1. DO NOT duplicate any task that already exists in CURRENT OPEN TASKS (or is already completed). Leave `mutations` empty for tasks unless a truly missing critical item is found.
+2. YOUR PRIMARY MISSION IS TO EXTRACT MISSING:
+   - Repeatable Methods / Playbooks + BPMN 2.0 Workflows inside `method_playbooks[]` (enrich an existing method by passing its `method_id` if a similar one exists in EXISTING METHODS & PLAYBOOKS!). Use `element_type: "subProcess"` + `sub_steps` for composite work groups.
+   - Reusable SOP rules (`UPSERT_SOP`) and Mistake Guardrails (`REGISTER_ANTIPATTERN`) if missing.
+   - Missing Architecture Decisions (`CREATE_ENTITY` with `entity_type: "DECISION"`) if missing.
+3. Summarize concisely in Persian what new methods, playbooks, BPMN workflows, or guardrails were extracted from this legacy memory item (or state cleanly if everything was already covered).
+
+EXISTING METHODS & PLAYBOOKS:
+{methods_summary}
+
+CURRENT OPEN TASKS (DO NOT DUPLICATE):
+{tasks_compact}
+
+ACTIVE DECISIONS:
+{adrs}
+
+ACTIVE SOPS:
+{sops}
+
+HISTORICAL CONTENT TO UPGRADE:
+"""
+{bounded_content}
+"""
+
+Output ONLY a single valid JSON object (no markdown fences) matching the CopilotEnvelope schema (`conversational_reply`, `clarifying_questions`, `needs_user_clarification`, `meeting_detected`, `meeting_title`, `meeting_summary_markdown`, `executive_doc_summary`, `mutations`, `method_playbooks`)."#,
+        adrs = adrs_compact.join("\n"),
+        sops = sops_summary.join("\n"),
     )
 }
 

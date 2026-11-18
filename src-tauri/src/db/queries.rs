@@ -433,6 +433,8 @@ pub fn get_dashboard_state_for_project(
     let calendar_days = query_all_calendar_days(conn).unwrap_or_default();
     let pending_proposals = query_all_pending_proposals(conn).unwrap_or_default();
     let personal_vault_items = query_all_personal_vault_items(conn).unwrap_or_default();
+    let methods_playbooks =
+        crate::method_engine::query_all_methods_playbooks(conn, pid).unwrap_or_default();
 
     Ok(DashboardState {
         projects,
@@ -465,6 +467,7 @@ pub fn get_dashboard_state_for_project(
         calendar_days,
         pending_proposals,
         personal_vault_items,
+        methods_playbooks,
     })
 }
 
@@ -869,18 +872,24 @@ fn query_session_messages(
     session_id: &str,
     vault_only: bool,
 ) -> Result<Vec<ChatMessage>> {
+    let _ = crate::db::schema::ensure_column_exists(
+        conn,
+        "chat_messages",
+        "written_artifacts_json",
+        "ALTER TABLE chat_messages ADD COLUMN written_artifacts_json TEXT NOT NULL DEFAULT '[]'",
+    );
     let sql = if vault_only {
-        "SELECT id, project_id, COALESCE(session_id, ''), sender, channel, message_text, archived_file_path, applied_mutations_badge, clarifying_questions_json, created_at
+        "SELECT id, project_id, COALESCE(session_id, ''), sender, channel, message_text, archived_file_path, applied_mutations_badge, clarifying_questions_json, created_at, COALESCE(written_artifacts_json, '[]')
          FROM (
-            SELECT id, project_id, session_id, sender, channel, message_text, archived_file_path, applied_mutations_badge, clarifying_questions_json, created_at
+            SELECT id, project_id, session_id, sender, channel, message_text, archived_file_path, applied_mutations_badge, clarifying_questions_json, created_at, written_artifacts_json
             FROM chat_messages
             WHERE project_id = ?1 AND channel = 'VAULT' AND (session_id = ?2 OR COALESCE(session_id, '') = '')
             ORDER BY id DESC LIMIT 80
          ) ORDER BY id ASC"
     } else {
-        "SELECT id, project_id, COALESCE(session_id, ''), sender, channel, message_text, archived_file_path, applied_mutations_badge, clarifying_questions_json, created_at
+        "SELECT id, project_id, COALESCE(session_id, ''), sender, channel, message_text, archived_file_path, applied_mutations_badge, clarifying_questions_json, created_at, COALESCE(written_artifacts_json, '[]')
          FROM (
-            SELECT id, project_id, session_id, sender, channel, message_text, archived_file_path, applied_mutations_badge, clarifying_questions_json, created_at
+            SELECT id, project_id, session_id, sender, channel, message_text, archived_file_path, applied_mutations_badge, clarifying_questions_json, created_at, written_artifacts_json
             FROM chat_messages
             WHERE project_id = ?1 AND channel != 'VAULT' AND (session_id = ?2 OR COALESCE(session_id, '') = '')
             ORDER BY id DESC LIMIT 80
@@ -892,6 +901,9 @@ fn query_session_messages(
             let q_json: String = r.get(8)?;
             let clarifying_questions: Vec<String> =
                 serde_json::from_str(&q_json).unwrap_or_default();
+            let art_json: String = r.get(10).unwrap_or_else(|_| "[]".into());
+            let written_artifacts: Vec<WrittenArtifactRef> =
+                serde_json::from_str(&art_json).unwrap_or_default();
             Ok(ChatMessage {
                 id: r.get(0)?,
                 project_id: r.get(1)?,
@@ -902,6 +914,7 @@ fn query_session_messages(
                 archived_file_path: r.get(6)?,
                 applied_mutations_badge: r.get(7)?,
                 clarifying_questions,
+                written_artifacts,
                 created_at: r.get(9)?,
             })
         })?
@@ -1147,8 +1160,38 @@ pub fn apply_copilot_envelope_with_event(
     envelope: &CopilotEnvelope,
     existing_event_id: Option<i64>,
 ) -> Result<String> {
+    let (badge, _artifacts) = apply_copilot_envelope_with_artifacts(
+        conn,
+        project_id,
+        raw_text,
+        archived_path,
+        source_origin,
+        envelope,
+        existing_event_id,
+    )?;
+    Ok(badge)
+}
+
+pub fn apply_copilot_envelope_with_artifacts(
+    conn: &mut Connection,
+    project_id: &str,
+    raw_text: &str,
+    archived_path: Option<&str>,
+    source_origin: &str,
+    envelope: &CopilotEnvelope,
+    existing_event_id: Option<i64>,
+) -> Result<(String, Vec<WrittenArtifactRef>)> {
     let now = Local::now().to_rfc3339();
     let snapshot_json = capture_undo_snapshot(conn, project_id)?;
+    let workspace_path: String = conn
+        .query_row(
+            "SELECT workspace_path FROM projects WHERE id = ?1",
+            params![project_id],
+            |r| r.get(0),
+        )
+        .unwrap_or_default();
+    let is_legacy_reprocess = source_origin.starts_with("LEGACY_REPROCESS");
+    let mut written_artifacts: Vec<WrittenArtifactRef> = Vec::new();
 
     let tx = conn.transaction()?;
 
@@ -1300,6 +1343,13 @@ pub fn apply_copilot_envelope_with_event(
                     .filter(|s| !s.trim().is_empty())
                     .unwrap_or("TASK")
                     .to_string();
+                let cand_title = m.title.clone().unwrap_or_else(|| "گام جدید".into());
+                if is_legacy_reprocess
+                    && etype == "TASK"
+                    && crate::method_engine::is_duplicate_task_title(&tx, project_id, &cand_title)
+                {
+                    continue;
+                }
                 let prefix = match etype.as_str() {
                     "DECISION" => "ADR",
                     "BLOCKER" => "BLK",
@@ -1347,7 +1397,7 @@ pub fn apply_copilot_envelope_with_event(
                         project_id,
                         etype,
                         cat,
-                        m.title.clone().unwrap_or_else(|| "گام جدید".into()),
+                        cand_title,
                         m.definition_of_done.clone().unwrap_or_default(),
                         m.first_physical_action.clone().unwrap_or_default(),
                         status,
@@ -1363,6 +1413,25 @@ pub fn apply_copilot_envelope_with_event(
                 )?;
                 if etype == "DECISION" {
                     decisions += 1;
+                    written_artifacts.push(WrittenArtifactRef {
+                        artifact_type: "DECISION_ADR".to_string(),
+                        entity_id: new_id,
+                        title: cand_title,
+                        summary: m.definition_of_done.clone().unwrap_or_else(|| "تصمیم معماری ثبت‌شده در ADR Registry".into()),
+                        file_path: if workspace_path.is_empty() {
+                            None
+                        } else {
+                            Some(
+                                Path::new(&workspace_path)
+                                    .join("03_decisions_adr")
+                                    .join("ADR_REGISTRY.md")
+                                    .to_string_lossy()
+                                    .to_string(),
+                            )
+                        },
+                        action: "CREATED".to_string(),
+                        version: None,
+                    });
                 } else {
                     created += 1;
                 }
@@ -1628,7 +1697,37 @@ pub fn apply_copilot_envelope_with_event(
     }
 
     tx.commit()?;
-    Ok(badge)
+
+    // Apply any extracted Method / Playbooks + BPMN 2.0 workflows outside the tx so files + DB sync cleanly
+    let mut methods_count = 0usize;
+    let source_ref_str = format!("event:{}", event_id);
+    for method_in in &envelope.method_playbooks {
+        if method_in.title.trim().is_empty() {
+            continue;
+        }
+        if let Ok((_saved, _is_new, art_ref)) = crate::method_engine::upsert_method_playbook(
+            conn,
+            project_id,
+            &workspace_path,
+            method_in.clone(),
+            Some(&source_ref_str),
+        ) {
+            written_artifacts.push(art_ref);
+            methods_count += 1;
+        }
+    }
+
+    let final_badge = if methods_count > 0 {
+        if badge == "پرسش/پاسخ (بدون تغییر گراف)" {
+            format!("متد/دستورالعمل BPMN: {}", methods_count)
+        } else {
+            format!("{} | متد/BPMN: {}", badge, methods_count)
+        }
+    } else {
+        badge
+    };
+
+    Ok((final_badge, written_artifacts))
 }
 
 pub fn commit_user_chat_turn(
@@ -1722,6 +1821,33 @@ pub fn append_assistant_chat_message(
     badge: &str,
     clarifying_questions: &[String],
 ) -> Result<i64> {
+    append_assistant_chat_message_with_artifacts(
+        conn,
+        project_id,
+        session_id,
+        channel,
+        sender,
+        assistant_reply,
+        archived_path,
+        badge,
+        clarifying_questions,
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn append_assistant_chat_message_with_artifacts(
+    conn: &Connection,
+    project_id: &str,
+    session_id: &str,
+    channel: &str,
+    sender: &str,
+    assistant_reply: &str,
+    archived_path: Option<&str>,
+    badge: &str,
+    clarifying_questions: &[String],
+    written_artifacts: &[WrittenArtifactRef],
+) -> Result<i64> {
     let norm_ch = normalize_chat_channel(channel);
     let now = Local::now().to_rfc3339();
     let cleaned_questions: Vec<String> = clarifying_questions
@@ -1730,6 +1856,7 @@ pub fn append_assistant_chat_message(
         .filter(|q| !q.is_empty())
         .collect();
     let questions_json = serde_json::to_string(&cleaned_questions).unwrap_or_else(|_| "[]".into());
+    let artifacts_json = serde_json::to_string(written_artifacts).unwrap_or_else(|_| "[]".into());
 
     let effective_sid = if session_id.trim().is_empty() {
         ensure_active_chat_session(conn, project_id, norm_ch)?
@@ -1737,11 +1864,17 @@ pub fn append_assistant_chat_message(
         session_id.to_string()
     };
 
+    let _ = crate::db::schema::ensure_column_exists(
+        conn,
+        "chat_messages",
+        "written_artifacts_json",
+        "ALTER TABLE chat_messages ADD COLUMN written_artifacts_json TEXT NOT NULL DEFAULT '[]'",
+    );
     conn.execute(
         "INSERT INTO chat_messages (
             project_id, session_id, sender, channel, message_text,
-            archived_file_path, applied_mutations_badge, clarifying_questions_json, created_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            archived_file_path, applied_mutations_badge, clarifying_questions_json, written_artifacts_json, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             project_id,
             effective_sid,
@@ -1751,6 +1884,7 @@ pub fn append_assistant_chat_message(
             archived_path,
             badge,
             questions_json,
+            artifacts_json,
             now
         ],
     )?;
@@ -2455,7 +2589,7 @@ pub fn sync_unprocessed_items_into_queue(conn: &Connection) -> Result<usize> {
         params![now],
     )?;
 
-    // Auto-close pending knowledge_doc items that are now marked PROCESSED
+    // Auto-close pending knowledge_doc items that are now marked PROCESSED (except explicit LEGACY_REPROCESS jobs)
     let like_prefix = format!("{}%", UNANALYZED_DOC_SUMMARY_PREFIX);
     conn.execute(
         "UPDATE pending_ai_queue
@@ -2463,6 +2597,7 @@ pub fn sync_unprocessed_items_into_queue(conn: &Connection) -> Result<usize> {
          WHERE status IN ('PENDING', 'PROCESSING')
            AND user_message_id IS NULL
            AND knowledge_doc_id IS NOT NULL
+           AND source_type NOT LIKE 'LEGACY_REPROCESS%'
            AND EXISTS (
                SELECT 1 FROM knowledge_documents k
                WHERE k.id = pending_ai_queue.knowledge_doc_id
@@ -3938,6 +4073,7 @@ mod tests {
             meeting_title: Some("جلسه طراحی معماری".into()),
             meeting_summary_markdown: Some("توافق روی پایگاه‌داده انجام شد.".into()),
             executive_doc_summary: None,
+            method_playbooks: vec![],
             mutations: vec![
                 AtomicMutation {
                     op: "CREATE_ENTITY".into(),

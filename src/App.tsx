@@ -5,18 +5,24 @@ import {
   CompassApi,
   DashboardState,
   LlmConnectionStatus,
+  MethodPlaybook,
+  MethodPlaybookInput,
   Outcome,
   WorkEntity,
   WorkLine,
+  WrittenArtifactRef,
   fileToBase64,
 } from "./lib/tauri_api";
-import { HeaderBar } from "./components/HeaderBar";
-import { SidebarRail, AppTab } from "./components/SidebarRail";
-import { PathAndChatView } from "./components/PathAndChatView";
-import { KnowledgeVaultView } from "./components/KnowledgeVaultView";
-import { WbsAndDocsView } from "./components/WbsAndDocsView";
-import { EcosystemAndCardsView } from "./components/EcosystemAndCardsView";
-import { SettingsView } from "./components/SettingsView";
+import { AntigravityTitlebar } from "./components/AntigravityTitlebar";
+import {
+  AntigravitySidebar,
+  BuiltinCanvasViewId,
+} from "./components/AntigravitySidebar";
+import { AntigravityChatPane } from "./components/AntigravityChatPane";
+import {
+  AntigravityRightCanvas,
+  CanvasTab,
+} from "./components/AntigravityRightCanvas";
 import { NewProjectModal } from "./components/NewProjectModal";
 import { OutcomeModal, OutcomeFormValues } from "./components/OutcomeModal";
 import {
@@ -29,27 +35,63 @@ import {
   ManualTaskPayload,
   TaskAssignPayload,
 } from "./components/TaskModal";
-import { PendingQueueBanner } from "./components/PendingQueueBanner";
+
+const BUILTIN_TAB_TITLES: Record<BuiltinCanvasViewId, string> = {
+  PATH_AHEAD: "مسیر پیش‌رو",
+  METHODS_BPMN: "متدها و BPMN 2.0",
+  WBS: "ساختار WBS و لاین‌ها",
+  KNOWLEDGE_ARCHIVE: "اسناد و بازپردازش",
+  ECOSYSTEM_CARDS: "اهداف و کارت‌ها",
+  SETTINGS: "تنظیمات",
+};
 
 export default function App() {
   const [dash, setDash] = useState<DashboardState | null>(null);
-  const [activeTab, setActiveTab] = useState<AppTab>("PATH_AND_CHAT");
-  const [isFullChatMode, setIsFullChatMode] = useState(false);
+
+  // Antigravity 3-Column Layout State (LTR: Left Sidebar | Center Chat | Right Tabbed Canvas)
   const [isNarrowViewport, setIsNarrowViewport] = useState<boolean>(() =>
-    typeof window !== "undefined" ? window.innerWidth < 768 : false
+    typeof window !== "undefined" ? window.innerWidth < 860 : false
   );
-  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState<boolean>(() =>
-    typeof window !== "undefined" ? window.innerWidth < 1024 : false
+  const [isSidebarOpen, setIsSidebarOpen] = useState<boolean>(() =>
+    typeof window !== "undefined" ? window.innerWidth >= 960 : true
   );
   const [sidebarWidth, setSidebarWidth] = useState<number>(() => {
-    if (typeof window === "undefined") return 255;
-    const saved = Number(window.localStorage.getItem("mab_compass_sidebar_width"));
-    return Number.isFinite(saved) && saved >= 190 && saved <= 440 ? saved : 255;
+    if (typeof window === "undefined") return 244;
+    const saved = Number(window.localStorage.getItem("mab_ag_sidebar_width"));
+    return Number.isFinite(saved) && saved >= 190 && saved <= 380 ? saved : 244;
   });
   const [isDraggingSidebar, setIsDraggingSidebar] = useState(false);
   const sidebarDragRef = useRef<{ startX: number; startWidth: number } | null>(null);
 
-  // Modals for manual 5-Layer management
+  const [isRightCanvasOpen, setIsRightCanvasOpen] = useState<boolean>(() =>
+    typeof window !== "undefined" ? window.innerWidth >= 900 : true
+  );
+  const [isRightCanvasMaximized, setIsRightCanvasMaximized] = useState(false);
+  const [rightCanvasPct, setRightCanvasPct] = useState<number>(() => {
+    if (typeof window === "undefined") return 48;
+    const saved = Number(window.localStorage.getItem("mab_ag_canvas_pct"));
+    return Number.isFinite(saved) && saved >= 26 && saved <= 72 ? saved : 48;
+  });
+  const [isDraggingCanvas, setIsDraggingCanvas] = useState(false);
+  const workspaceBodyRef = useRef<HTMLDivElement | null>(null);
+
+  // Right Tabbed Canvas State + Back/Forward Tab History
+  const [canvasTabs, setCanvasTabs] = useState<CanvasTab[]>([
+    { id: "PATH_AHEAD", kind: "PATH_AHEAD", title: BUILTIN_TAB_TITLES.PATH_AHEAD },
+    { id: "METHODS_BPMN", kind: "METHODS_BPMN", title: BUILTIN_TAB_TITLES.METHODS_BPMN },
+  ]);
+  const [activeCanvasTabId, setActiveCanvasTabId] = useState<string | null>("PATH_AHEAD");
+  const [tabHistory, setTabHistory] = useState<string[]>(["PATH_AHEAD"]);
+  const [tabHistoryIdx, setTabHistoryIdx] = useState<number>(0);
+
+  // Active Chat Channel inside Center Column
+  const [activeChatChannel, setActiveChatChannel] = useState<"COPILOT" | "VAULT">("COPILOT");
+  const [chatInput, setChatInput] = useState("");
+  const [isSendingChat, setIsSendingChat] = useState(false);
+  const [retryingMessageId, setRetryingMessageId] = useState<number | null>(null);
+
+  // Manual 5-Layer Modals
+  const [showNewProjModal, setShowNewProjModal] = useState(false);
   const [showOutcomeModal, setShowOutcomeModal] = useState(false);
   const [editingOutcome, setEditingOutcome] = useState<Outcome | null>(null);
   const [showWorkLineModal, setShowWorkLineModal] = useState(false);
@@ -57,23 +99,13 @@ export default function App() {
   const [showTaskModal, setShowTaskModal] = useState(false);
   const [editingTask, setEditingTask] = useState<WorkEntity | null>(null);
 
-  const [chatInput, setChatInput] = useState("");
-  const [isSendingChat, setIsSendingChat] = useState(false);
-
-  const [vaultChatInput, setVaultChatInput] = useState("");
-  const [isSendingVaultChat, setIsSendingVaultChat] = useState(false);
-  const [retryingMessageId, setRetryingMessageId] = useState<number | null>(null);
-
   const [isSyncing, setIsSyncing] = useState(false);
-
   const [checkedGates, setCheckedGates] = useState<Record<number, boolean>>({});
-  const [showNewProjModal, setShowNewProjModal] = useState(false);
   const [docQueueStatus, setDocQueueStatus] = useState<string | null>(null);
-
   const [settingsForm, setSettingsForm] = useState<AppSettings | null>(null);
   const [toastMsg, setToastMsg] = useState<string | null>(null);
 
-  // وضعیت اتصال مدل و صف انتظار پردازش خودکار
+  // LLM Connection & Chronological Pending Queue State
   const [connectionStatus, setConnectionStatus] = useState<LlmConnectionStatus | null>(null);
   const [isCheckingConnection, setIsCheckingConnection] = useState(false);
   const [autoQueueEnabled, setAutoQueueEnabled] = useState(true);
@@ -88,7 +120,7 @@ export default function App() {
 
   const isUserBusyRef = useRef(false);
   isUserBusyRef.current =
-    isSendingChat || isSendingVaultChat || !!docQueueStatus || retryingMessageId !== null;
+    isSendingChat || !!docQueueStatus || retryingMessageId !== null;
 
   const showToast = useCallback((msg: string) => {
     setToastMsg(msg);
@@ -96,6 +128,131 @@ export default function App() {
       setToastMsg((prev) => (prev === msg ? null : prev));
     }, 5500);
   }, []);
+
+  const pushTabHistory = useCallback(
+    (tabId: string) => {
+      setTabHistory((prev) => {
+        const sliced = prev.slice(0, tabHistoryIdx + 1);
+        if (sliced[sliced.length - 1] === tabId) return sliced;
+        const next = [...sliced, tabId].slice(-30);
+        setTabHistoryIdx(next.length - 1);
+        return next;
+      });
+    },
+    [tabHistoryIdx]
+  );
+
+  const activateTab = useCallback(
+    (tabId: string) => {
+      setActiveCanvasTabId(tabId);
+      setIsRightCanvasOpen(true);
+      pushTabHistory(tabId);
+    },
+    [pushTabHistory]
+  );
+
+  const openBuiltinView = useCallback(
+    (viewId: BuiltinCanvasViewId) => {
+      setCanvasTabs((prev) => {
+        if (prev.some((t) => t.id === viewId)) return prev;
+        return [
+          ...prev,
+          { id: viewId, kind: viewId, title: BUILTIN_TAB_TITLES[viewId] },
+        ];
+      });
+      activateTab(viewId);
+    },
+    [activateTab]
+  );
+
+  const openArtifactTab = useCallback(
+    (artifact: WrittenArtifactRef) => {
+      const tabId = `ART:${artifact.artifact_type}:${artifact.entity_id}`;
+      setCanvasTabs((prev) => {
+        const existingIdx = prev.findIndex((t) => t.id === tabId);
+        if (existingIdx >= 0) {
+          const copy = [...prev];
+          copy[existingIdx] = {
+            ...copy[existingIdx],
+            title: artifact.title,
+            artifact,
+          };
+          return copy;
+        }
+        return [
+          ...prev,
+          { id: tabId, kind: "ARTIFACT", title: artifact.title, artifact },
+        ];
+      });
+      activateTab(tabId);
+    },
+    [activateTab]
+  );
+
+  const openMethodTab = useCallback(
+    (method: MethodPlaybook) => {
+      openArtifactTab({
+        artifact_type: "METHOD_PLAYBOOK",
+        entity_id: method.id,
+        title: method.title,
+        summary: method.summary,
+        file_path: method.archived_path,
+        action: "UPDATED",
+        version: method.version,
+      });
+    },
+    [openArtifactTab]
+  );
+
+  const closeCanvasTab = useCallback(
+    (tabId: string) => {
+      setCanvasTabs((prev) => {
+        const idx = prev.findIndex((t) => t.id === tabId);
+        if (idx < 0) return prev;
+        const next = prev.filter((t) => t.id !== tabId);
+        if (activeCanvasTabId === tabId) {
+          const fallback = next[Math.max(0, idx - 1)]?.id ?? null;
+          setActiveCanvasTabId(fallback);
+          if (!fallback) {
+            setIsRightCanvasMaximized(false);
+          }
+        }
+        return next;
+      });
+      setTabHistory((prev) => {
+        const filtered = prev.filter((id) => id !== tabId);
+        setTabHistoryIdx((curIdx) =>
+          Math.max(0, Math.min(curIdx, Math.max(0, filtered.length - 1)))
+        );
+        return filtered;
+      });
+    },
+    [activeCanvasTabId]
+  );
+
+  const handleGoBackTab = () => {
+    for (let idx = tabHistoryIdx - 1; idx >= 0; idx--) {
+      const targetId = tabHistory[idx];
+      if (targetId && canvasTabs.some((t) => t.id === targetId)) {
+        setTabHistoryIdx(idx);
+        setActiveCanvasTabId(targetId);
+        setIsRightCanvasOpen(true);
+        return;
+      }
+    }
+  };
+
+  const handleGoForwardTab = () => {
+    for (let idx = tabHistoryIdx + 1; idx < tabHistory.length; idx++) {
+      const targetId = tabHistory[idx];
+      if (targetId && canvasTabs.some((t) => t.id === targetId)) {
+        setTabHistoryIdx(idx);
+        setActiveCanvasTabId(targetId);
+        setIsRightCanvasOpen(true);
+        return;
+      }
+    }
+  };
 
   const refreshConnection = useCallback(async (): Promise<LlmConnectionStatus | null> => {
     setIsCheckingConnection(true);
@@ -110,29 +267,29 @@ export default function App() {
     }
   }, []);
 
-  // شنود تغییر اندازه پنجره برای ریسپانسیو هوشمند سایدبار و پنل‌ها
+  // Responsive viewport listener
   useEffect(() => {
     const onResize = () => {
       const w = window.innerWidth;
-      setIsNarrowViewport(w < 768);
-      if (w < 1024) {
-        setIsSidebarCollapsed(true);
+      setIsNarrowViewport(w < 860);
+      if (w < 960) {
+        setIsSidebarOpen(false);
       }
     };
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
   }, []);
 
-  // کشیدن لبه سایدبار راست (سبک VS Code) برای تغییر عرض
+  // Left Sidebar LTR drag resizer
   useEffect(() => {
     if (!isDraggingSidebar) return;
     const handleMouseMove = (e: MouseEvent) => {
       const ref = sidebarDragRef.current;
       if (!ref) return;
-      // در RTL سایدبار در سمت راست است؛ کشیدن به چپ عرض را افزایش می‌دهد
+      // LTR: sidebar is on the left, dragging right increases width
       const nextWidth = Math.max(
         190,
-        Math.min(440, ref.startWidth + (ref.startX - e.clientX))
+        Math.min(380, ref.startWidth + (e.clientX - ref.startX))
       );
       setSidebarWidth(nextWidth);
     };
@@ -157,17 +314,57 @@ export default function App() {
   useEffect(() => {
     if (!isDraggingSidebar) {
       try {
-        window.localStorage.setItem(
-          "mab_compass_sidebar_width",
-          String(Math.round(sidebarWidth))
-        );
+        window.localStorage.setItem("mab_ag_sidebar_width", String(Math.round(sidebarWidth)));
       } catch {
-        // Ignore storage errors
+        // ignore
       }
     }
   }, [isDraggingSidebar, sidebarWidth]);
 
-  // بارگذاری اولیه داشبورد + اسکن پیام‌ها/اسناد پردازش‌نشده + تست اولیه اتصال
+  // Right Tabbed Canvas LTR drag resizer (between Center Chat & Right Canvas)
+  useEffect(() => {
+    if (!isDraggingCanvas) return;
+    const handleMouseMove = (e: MouseEvent) => {
+      const el = workspaceBodyRef.current;
+      if (!el) return;
+      const rect = el.getBoundingClientRect();
+      if (rect.width <= 0) return;
+      // LTR: right canvas width is measured from right edge
+      const rawPct = ((rect.right - e.clientX) / rect.width) * 100;
+      const clamped = Math.max(26, Math.min(72, rawPct));
+      setRightCanvasPct(clamped);
+    };
+    const handleMouseUp = () => {
+      setIsDraggingCanvas(false);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    window.addEventListener("mousemove", handleMouseMove);
+    window.addEventListener("mouseup", handleMouseUp);
+    return () => {
+      window.removeEventListener("mousemove", handleMouseMove);
+      window.removeEventListener("mouseup", handleMouseUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+  }, [isDraggingCanvas]);
+
+  useEffect(() => {
+    if (!isDraggingCanvas) {
+      try {
+        window.localStorage.setItem(
+          "mab_ag_canvas_pct",
+          String(Math.round(rightCanvasPct * 10) / 10)
+        );
+      } catch {
+        // ignore
+      }
+    }
+  }, [isDraggingCanvas, rightCanvasPct]);
+
+  // Initial load + queue scan + LLM check
   useEffect(() => {
     (async () => {
       try {
@@ -188,7 +385,7 @@ export default function App() {
     })();
   }, [refreshConnection, showToast]);
 
-  // تایمر شمارش معکوس کول‌داون خطای صف
+  // Cooldown countdown
   useEffect(() => {
     if (cooldownUntil <= Date.now()) {
       setCooldownSecondsLeft(0);
@@ -203,7 +400,7 @@ export default function App() {
     return () => window.clearInterval(id);
   }, [cooldownUntil]);
 
-  // پردازشگر ترتیبی صف انتظار
+  // Chronological Pending Queue Drain
   const runQueueDrain = useCallback(
     async (manualTrigger: boolean) => {
       if (queueRunningRef.current || isUserBusyRef.current) return;
@@ -211,9 +408,7 @@ export default function App() {
       setIsProcessingQueue(true);
       try {
         const conn = await refreshConnection();
-        if (!conn?.connected && !manualTrigger) {
-          return;
-        }
+        if (!conn?.connected && !manualTrigger) return;
 
         let processedCount = 0;
         while (true) {
@@ -247,9 +442,7 @@ export default function App() {
         }
 
         if (processedCount > 0) {
-          showToast(
-            `${processedCount} پیام/سند در انتظار بررسی با موفقیت توسط مدل تحلیل شد.`
-          );
+          showToast(`${processedCount} مورد از صف با موفقیت توسط مدل تحلیل و ثبت شد.`);
         }
       } catch (e: unknown) {
         setCooldownUntil(Date.now() + 45_000);
@@ -263,12 +456,11 @@ export default function App() {
     [refreshConnection, showToast]
   );
 
-  // اجرای خودکار صف هنگام برقراری اتصال و وجود آیتم در صف انتظار
+  // Auto queue runner
   useEffect(() => {
     if (!dash || dash.pending_queue.length === 0) return;
     if (!autoQueueEnabled || queueRunningRef.current || isUserBusyRef.current) return;
     if (Date.now() < cooldownUntil) return;
-
     if (connectionStatus?.connected) {
       void runQueueDrain(false);
     }
@@ -282,7 +474,7 @@ export default function App() {
     dash,
   ]);
 
-  // بررسی دوره‌ای اتصال مدل وقتی موارد پردازش‌نشده در صف هستند (هر ۲۰ ثانیه)
+  // Periodic connectivity poll when queue has pending items
   useEffect(() => {
     if (!dash || dash.pending_queue.length === 0) return;
     const id = window.setInterval(() => {
@@ -293,7 +485,7 @@ export default function App() {
     return () => window.clearInterval(id);
   }, [dash?.pending_queue.length, refreshConnection, dash]);
 
-  // رفرش خودکار داشبورد هنگام تغییر دیتابیس از طریق فرایند بیرونی
+  // Auto refresh when external MCP process mutates SQLite
   useEffect(() => {
     let lastVersion: number | null = null;
     const intervalId = window.setInterval(async () => {
@@ -310,7 +502,7 @@ export default function App() {
           setDash(updated);
         }
       } catch {
-        // Ignore transient polling errors
+        // ignore
       }
     }, 3000);
     return () => window.clearInterval(intervalId);
@@ -320,9 +512,9 @@ export default function App() {
     return (
       <div
         dir="rtl"
-        className="h-screen w-screen bg-mab-bg text-mab-text-primary flex items-center justify-center p-4"
+        className="h-screen w-screen bg-[#0D0E11] text-mab-text-primary flex items-center justify-center p-4"
       >
-        <span className="text-[14px] text-mab-text-secondary">
+        <span className="text-[13.5px] text-mab-text-secondary">
           در حال بارگذاری Mab-Compass و همگام‌سازی با Mab-Focus...
         </span>
       </div>
@@ -330,23 +522,40 @@ export default function App() {
   }
 
   const allGatesPassed = dash.active_guardrails.every((g) => checkedGates[g.id]);
+  const activeChatHistory =
+    activeChatChannel === "VAULT" ? dash.vault_chat_history : dash.chat_history;
+  const channelSessions = dash.chat_sessions.filter((s) =>
+    activeChatChannel === "VAULT" ? s.channel === "VAULT" : s.channel !== "VAULT"
+  );
+  const activeSession =
+    channelSessions.find(
+      (s) =>
+        s.id ===
+        (activeChatChannel === "VAULT"
+          ? dash.active_vault_session_id
+          : dash.active_copilot_session_id)
+    ) ?? channelSessions[0];
 
-  // ارسال فوری در ۲ فاز: ابتدا ثبت قطعی در حافظه (UI + SQLite + 00_raw_inputs)، سپس پردازش همیار
+  // Unified 2-phase Chat Send (supports both COPILOT & VAULT channels seamlessly)
   const handleSendChat = async () => {
     if (!chatInput.trim() || isSendingChat) return;
     const msg = chatInput;
     setChatInput("");
     setIsSendingChat(true);
+    const sessionId =
+      activeChatChannel === "VAULT"
+        ? dash.active_vault_session_id || null
+        : dash.active_copilot_session_id || null;
     try {
       const committed = await CompassApi.commitUserChatMessage(
-        "COPILOT",
-        dash.active_copilot_session_id || null,
+        activeChatChannel,
+        sessionId,
         msg
       );
       setDash(committed.dashboard);
 
       const outcome = await CompassApi.runAssistantTurn({
-        channel: "COPILOT",
+        channel: activeChatChannel,
         sessionId: committed.session_id,
         messageText: msg,
         archivedPath: committed.archived_path,
@@ -369,12 +578,16 @@ export default function App() {
     }
   };
 
-  const handleSendCopilotFiles = async (files: FileList) => {
+  const handleSendChatFiles = async (files: FileList) => {
     if (!files || files.length === 0 || isSendingChat) return;
     const fileArray = Array.from(files);
     const note = chatInput;
     setChatInput("");
     setIsSendingChat(true);
+    const sessionId =
+      activeChatChannel === "VAULT"
+        ? dash.active_vault_session_id || null
+        : dash.active_copilot_session_id || null;
     let succeeded = 0;
     let modelFailures = 0;
     try {
@@ -383,8 +596,8 @@ export default function App() {
         try {
           const base64 = await fileToBase64(file);
           const committed = await CompassApi.commitUserFileMessage({
-            channel: "COPILOT",
-            sessionId: dash.active_copilot_session_id || null,
+            channel: activeChatChannel,
+            sessionId,
             originalFilename: file.name,
             contentBase64: base64,
             userNote: i === 0 ? note : "",
@@ -393,7 +606,7 @@ export default function App() {
           succeeded += 1;
 
           const outcome = await CompassApi.runFileAssistantTurn({
-            channel: "COPILOT",
+            channel: activeChatChannel,
             sessionId: committed.session_id,
             rawEventId: committed.raw_event_id,
             userMessageId: committed.user_message_id,
@@ -409,7 +622,7 @@ export default function App() {
             modelFailures += 1;
             setCooldownUntil(Date.now() + 45_000);
             showToast(
-              `فایل ${file.name} در حافظه و صف انتظار ذخیره شد اما مدل خطا داد: ${outcome.assistant_error}`
+              `فایل ${file.name} در حافظه و صف ذخیره شد اما مدل خطا داد: ${outcome.assistant_error}`
             );
           }
         } catch (err: unknown) {
@@ -417,49 +630,10 @@ export default function App() {
         }
       }
       if (succeeded > 0 && modelFailures === 0) {
-        showToast(
-          `${succeeded} فایل بلافاصله در حافظه ثبت و در گفتگوی همیار تحلیل شد.`
-        );
+        showToast(`${succeeded} فایل بلافاصله در حافظه ثبت و توسط مدل تحلیل شد.`);
       }
     } finally {
       setIsSendingChat(false);
-    }
-  };
-
-  const handleSendVaultChat = async () => {
-    if (!vaultChatInput.trim() || isSendingVaultChat) return;
-    const msg = vaultChatInput;
-    setVaultChatInput("");
-    setIsSendingVaultChat(true);
-    try {
-      const committed = await CompassApi.commitUserChatMessage(
-        "VAULT",
-        dash.active_vault_session_id || null,
-        msg
-      );
-      setDash(committed.dashboard);
-
-      const outcome = await CompassApi.runAssistantTurn({
-        channel: "VAULT",
-        sessionId: committed.session_id,
-        messageText: msg,
-        archivedPath: committed.archived_path,
-        rawEventId: committed.raw_event_id,
-        userMessageId: committed.user_message_id,
-      });
-      setDash(outcome.dashboard);
-      if (outcome.assistant_error) {
-        setCooldownUntil(Date.now() + 45_000);
-        void refreshConnection();
-        showToast(
-          `پیام در حافظه و صف انتظار ذخیره شد اما خطای مدل رخ داد: ${outcome.assistant_error}`
-        );
-      }
-    } catch (e: unknown) {
-      setVaultChatInput(msg);
-      showToast(`خطا در گفتگوی Knowledge Vault: ${String(e)}`);
-    } finally {
-      setIsSendingVaultChat(false);
     }
   };
 
@@ -467,7 +641,6 @@ export default function App() {
     if (
       retryingMessageId !== null ||
       isSendingChat ||
-      isSendingVaultChat ||
       !!docQueueStatus ||
       isProcessingQueue
     ) {
@@ -479,9 +652,9 @@ export default function App() {
       setDash(outcome.dashboard);
       if (outcome.assistant_error) {
         setCooldownUntil(Date.now() + 45_000);
-        showToast(`خطا در ارسال مجدد به مدل: ${outcome.assistant_error}`);
+        showToast(`خطا در ارسال مجدد: ${outcome.assistant_error}`);
       } else {
-        showToast("پیام با موفقیت مجدد به مدل ارسال و پردازش شد.");
+        showToast("پیام با موفقیت مجدد پردازش شد.");
       }
     } catch (e: unknown) {
       showToast(`خطا در ارسال مجدد: ${String(e)}`);
@@ -501,7 +674,7 @@ export default function App() {
         setCooldownUntil(Date.now() + 45_000);
         showToast(`خطا در ارسال از صف: ${outcome.error}`);
       } else if (outcome.processed) {
-        showToast("آیتم صف با موفقیت توسط مدل تحلیل و ثبت شد.");
+        showToast("آیتم صف با موفقیت توسط مدل تحلیل شد.");
       }
     } catch (e: unknown) {
       showToast(`خطا در پردازش آیتم صف: ${String(e)}`);
@@ -515,9 +688,31 @@ export default function App() {
     try {
       const updated = await CompassApi.dismissPendingQueueItem(queueId);
       setDash(updated);
-      showToast("آیتم از صف انتظار حذف شد (نسخه اصلی در حافظه محفوظ است).");
+      showToast("آیتم از صف انتظار حذف شد.");
     } catch (e: unknown) {
       showToast(`خطا در حذف از صف: ${String(e)}`);
+    }
+  };
+
+  const handleReorderQueueItem = async (
+    queueId: number,
+    direction: "TOP" | "UP" | "DOWN"
+  ) => {
+    try {
+      const updated = await CompassApi.reorderPendingQueueItem(queueId, direction);
+      setDash(updated);
+    } catch (e: unknown) {
+      showToast(`خطا در تغییر اولویت صف: ${String(e)}`);
+    }
+  };
+
+  const handleResetQueueOrder = async () => {
+    try {
+      const updated = await CompassApi.resetPendingQueueOrder();
+      setDash(updated);
+      showToast("ترتیب صف به ترتیب زمانی ایجاد بازنشانی شد.");
+    } catch (e: unknown) {
+      showToast(`خطا در بازنشانی صف: ${String(e)}`);
     }
   };
 
@@ -526,9 +721,9 @@ export default function App() {
       const updated = await CompassApi.quickCompleteStep(taskId, pomosSpent);
       setDash(updated);
       setCheckedGates({});
-      showToast("گام فعلی مختومه شد و گام بعدی در ریل پیش‌رو قرار گرفت!");
+      showToast("گام فعلی تکمیل شد و گام بعدی در مسیر پیش‌رو قرار گرفت!");
     } catch (e: unknown) {
-      showToast(`خطا در بستن گام: ${String(e)}`);
+      showToast(`خطا در تکمیل گام: ${String(e)}`);
     }
   };
 
@@ -559,9 +754,7 @@ export default function App() {
       setSettingsForm(d.settings);
       setCheckedGates({});
       setShowNewProjModal(false);
-      showToast(
-        "پروژه جدید ساخته شد، پوشه‌های ۸گانه ایجاد شد و با Mab-Focus سینک گردید."
-      );
+      showToast("پروژه جدید با پوشه‌های استاندارد ساخته و با Mab-Focus سینک شد.");
     } catch (e: unknown) {
       showToast(`خطا در ساخت پروژه: ${String(e)}`);
     }
@@ -574,10 +767,10 @@ export default function App() {
     try {
       const d = await CompassApi.createChatSession(projectId, channel);
       setDash(d);
-      setActiveTab(channel === "VAULT" ? "KNOWLEDGE_VAULT" : "PATH_AND_CHAT");
+      setActiveChatChannel(channel);
       showToast("گفتگوی جدید آغاز شد.");
     } catch (e: unknown) {
-      showToast(`خطا در ایجاد گفتگوی جدید: ${String(e)}`);
+      showToast(`خطا در ایجاد گفتگو: ${String(e)}`);
     }
   };
 
@@ -586,21 +779,9 @@ export default function App() {
       const d = await CompassApi.switchChatSession(session.id);
       setDash(d);
       setCheckedGates({});
-      setActiveTab(
-        session.channel === "VAULT" ? "KNOWLEDGE_VAULT" : "PATH_AND_CHAT"
-      );
+      setActiveChatChannel(session.channel === "VAULT" ? "VAULT" : "COPILOT");
     } catch (e: unknown) {
       showToast(`خطا در بارگذاری گفتگو: ${String(e)}`);
-    }
-  };
-
-  const handleSwitchCopilotSessionById = async (sessionId: string) => {
-    if (!sessionId) return;
-    try {
-      const d = await CompassApi.switchChatSession(sessionId);
-      setDash(d);
-    } catch (e: unknown) {
-      showToast(`خطا در تغییر گفتگو: ${String(e)}`);
     }
   };
 
@@ -621,7 +802,7 @@ export default function App() {
       const [rep, d] = await CompassApi.syncMabFocusNow();
       setDash(d);
       showToast(
-        `سینک با Mab-Focus انجام شد: ${rep.notes_ingested_from_focus} یادداشت جدید و ${rep.projects_imported_from_focus} پروژه دریافت شد.`
+        `سینک Mab-Focus: ${rep.notes_ingested_from_focus} یادداشت جدید و ${rep.projects_imported_from_focus} پروژه دریافت شد.`
       );
     } catch (e: unknown) {
       showToast(`خطای همگام‌سازی Mab-Focus: ${String(e)}`);
@@ -643,7 +824,7 @@ export default function App() {
     try {
       const d = await CompassApi.undoLast();
       setDash(d);
-      showToast("آخرین تغییر به حالت قبل بازگردانده شد.");
+      showToast("آخرین تغییر بازگردانی شد.");
     } catch (e: unknown) {
       showToast(`خطا در بازگردانی: ${String(e)}`);
     }
@@ -651,7 +832,6 @@ export default function App() {
 
   const processBatchVaultFiles = async (files: FileList) => {
     if (!files || files.length === 0) return;
-
     const fileArray = Array.from(files);
     let succeeded = 0;
     let modelFailures = 0;
@@ -692,7 +872,7 @@ export default function App() {
           modelFailures += 1;
           setCooldownUntil(Date.now() + 45_000);
           showToast(
-            `فایل ${file.name} در حافظه و صف انتظار ذخیره شد اما مدل خطا داد: ${outcome.assistant_error}`
+            `فایل ${file.name} در حافظه و صف ذخیره شد اما مدل خطا داد: ${outcome.assistant_error}`
           );
         }
       } catch (err: unknown) {
@@ -701,15 +881,11 @@ export default function App() {
     }
     setDocQueueStatus(null);
     if (succeeded > 0 && modelFailures === 0) {
-      showToast(
-        `${succeeded} از ${fileArray.length} فایل در حافظه و آرشیو ثبت و تحلیل شد.`
-      );
+      showToast(`${succeeded} فایل با موفقیت ثبت و تحلیل شد.`);
     }
   };
 
-  const handleBatchFilesSelected = async (
-    e: React.ChangeEvent<HTMLInputElement>
-  ) => {
+  const handleBatchFilesSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
     if (!files || files.length === 0) return;
     await processBatchVaultFiles(files);
@@ -722,7 +898,7 @@ export default function App() {
     content: string
   ) => {
     const displayLabel = title.trim() || "متن آزاد";
-    setDocQueueStatus(`در حال ثبت در حافظه و کالبدشکافی «${displayLabel}»...`);
+    setDocQueueStatus(`در حال ثبت و تحلیل «${displayLabel}»...`);
     try {
       const committed = await CompassApi.commitVaultTextMessage({
         sessionId: dash.active_vault_session_id || null,
@@ -750,10 +926,10 @@ export default function App() {
         setCooldownUntil(Date.now() + 45_000);
         void refreshConnection();
         showToast(
-          `محتوا در حافظه و صف انتظار ثبت شد اما خطای مدل رخ داد: ${outcome.assistant_error}`
+          `محتوا در حافظه و صف ثبت شد اما خطای مدل رخ داد: ${outcome.assistant_error}`
         );
       } else {
-        showToast("محتوا با موفقیت تحلیل شد؛ سوالات تدقیق در گفتگو ثبت شدند.");
+        showToast("محتوا با موفقیت تحلیل و ذخیره شد.");
       }
     } catch (e: unknown) {
       showToast(`خطا: ${String(e)}`);
@@ -780,39 +956,17 @@ export default function App() {
             target = { ...target, local_model: live.models[0].id };
           }
         } catch {
-          // Ignore live pre-fetch error and save provider setting cleanly
+          // ignore
         }
       }
       const d = await CompassApi.saveSettings(target);
       setDash(d);
       setSettingsForm(d.settings);
       setCooldownUntil(0);
-      showToast("تنظیمات با موفقیت در دیتابیس ذخیره شد.");
+      showToast("تنظیمات با موفقیت ذخیره شد.");
       void refreshConnection();
     } catch (e: unknown) {
       showToast(`خطا در ذخیره تنظیمات: ${String(e)}`);
-    }
-  };
-
-  const handleReorderQueueItem = async (
-    queueId: number,
-    direction: "TOP" | "UP" | "DOWN"
-  ) => {
-    try {
-      const updated = await CompassApi.reorderPendingQueueItem(queueId, direction);
-      setDash(updated);
-    } catch (e: unknown) {
-      showToast(`خطا در تغییر اولویت صف: ${String(e)}`);
-    }
-  };
-
-  const handleResetQueueOrder = async () => {
-    try {
-      const updated = await CompassApi.resetPendingQueueOrder();
-      setDash(updated);
-      showToast("ترتیب صف به ترتیب زمانی ایجاد بازنشانی شد.");
-    } catch (e: unknown) {
-      showToast(`خطا در بازنشانی ترتیب صف: ${String(e)}`);
     }
   };
 
@@ -820,9 +974,30 @@ export default function App() {
     try {
       const updated = await CompassApi.requeueKnowledgeDoc(docId);
       setDash(updated);
-      showToast("سند به وضعیت «پردازش‌نشده» برگشت و وارد صف پردازش شد.");
+      showToast("سند وارد صف پردازش شد.");
     } catch (e: unknown) {
-      showToast(`خطا در ارسال مجدد سند به صف: ${String(e)}`);
+      showToast(`خطا در ارسال به صف: ${String(e)}`);
+    }
+  };
+
+  const handleUpsertMethod = async (input: MethodPlaybookInput) => {
+    try {
+      const updated = await CompassApi.upsertMethodPlaybook(input);
+      setDash(updated);
+      showToast("متد و نمودار BPMN 2.0 با موفقیت در SQLite و پوشه 04_methods_playbooks ذخیره شد.");
+    } catch (e: unknown) {
+      showToast(`خطا در ذخیره متد: ${String(e)}`);
+    }
+  };
+
+  const handleDeleteMethod = async (methodId: string) => {
+    try {
+      const updated = await CompassApi.deleteMethodPlaybook(methodId);
+      setDash(updated);
+      closeCanvasTab(`ART:METHOD_PLAYBOOK:${methodId}`);
+      showToast("متد از کتابخانه حذف شد.");
+    } catch (e: unknown) {
+      showToast(`خطا در حذف متد: ${String(e)}`);
     }
   };
 
@@ -830,11 +1005,7 @@ export default function App() {
     try {
       const updated = await CompassApi.upsertOutcome(values);
       setDash(updated);
-      showToast(
-        values.outcomeId
-          ? "Outcome با موفقیت ویرایش شد."
-          : "Outcome جدید با موفقیت ایجاد شد."
-      );
+      showToast(values.outcomeId ? "Outcome ویرایش شد." : "Outcome جدید ساخته شد.");
     } catch (e: unknown) {
       showToast(`خطا در ذخیره Outcome: ${String(e)}`);
     }
@@ -844,7 +1015,7 @@ export default function App() {
     try {
       const updated = await CompassApi.deleteOutcome(outcomeId);
       setDash(updated);
-      showToast("Outcome حذف شد (تسک‌ها و لاین‌های متصل حفظ شدند).");
+      showToast("Outcome حذف شد.");
     } catch (e: unknown) {
       showToast(`خطا در حذف Outcome: ${String(e)}`);
     }
@@ -856,12 +1027,7 @@ export default function App() {
         project_id: dash.active_project.id,
         ...payload,
       });
-      if (res.dashboard) {
-        setDash(res.dashboard);
-      } else {
-        const refreshed = await CompassApi.getDashboard();
-        setDash(refreshed);
-      }
+      setDash(res.dashboard ?? (await CompassApi.getDashboard()));
       showToast("لاین کاری جدید ساخته شد.");
     } catch (e: unknown) {
       showToast(`خطا در ساخت لاین کاری: ${String(e)}`);
@@ -882,7 +1048,7 @@ export default function App() {
     try {
       const updated = await CompassApi.createTaskManual(payload);
       setDash(updated);
-      showToast("تسک جدید با موفقیت ساخته شد.");
+      showToast("تسک جدید ساخته شد.");
     } catch (e: unknown) {
       showToast(`خطا در ساخت تسک: ${String(e)}`);
     }
@@ -892,7 +1058,7 @@ export default function App() {
     try {
       const updated = await CompassApi.assignTaskGrouping(payload);
       setDash(updated);
-      showToast("تخصیص تسک به لاین کاری / Outcome ذخیره شد.");
+      showToast("تخصیص تسک ذخیره شد.");
     } catch (e: unknown) {
       showToast(`خطا در تخصیص تسک: ${String(e)}`);
     }
@@ -910,7 +1076,7 @@ export default function App() {
     try {
       const updated = await CompassApi.createPersonalVaultItem(params);
       setDash(updated);
-      showToast("کارت دانش جدید با موفقیت ثبت شد.");
+      showToast("کارت دانش جدید ثبت شد.");
     } catch (e: unknown) {
       showToast(`خطا در ثبت کارت دانش: ${String(e)}`);
     }
@@ -926,15 +1092,9 @@ export default function App() {
     }
   };
 
-  const handleResolveProposal = async (
-    proposalId: string,
-    approve: boolean
-  ) => {
+  const handleResolveProposal = async (proposalId: string, approve: boolean) => {
     try {
-      const updated = await CompassApi.resolvePendingProposal(
-        proposalId,
-        approve
-      );
+      const updated = await CompassApi.resolvePendingProposal(proposalId, approve);
       setDash(updated);
       showToast(approve ? "پیشنهاد تایید شد." : "پیشنهاد رد شد.");
     } catch (e: unknown) {
@@ -958,49 +1118,65 @@ export default function App() {
     }
   };
 
-  const isSplitDesktopWorkspace =
-    activeTab === "PATH_AND_CHAT" || activeTab === "KNOWLEDGE_VAULT";
-
   return (
     <div
-      dir="rtl"
-      className="h-screen w-screen bg-mab-bg text-mab-text-primary flex flex-col overflow-hidden select-none"
+      dir="ltr"
+      className="h-screen w-screen bg-[#0D0E11] text-[#F3F4F6] flex flex-col overflow-hidden select-none"
     >
-      <HeaderBar
+      {/* Top Antigravity Frameless Titlebar */}
+      <AntigravityTitlebar
         dash={dash}
+        activeSessionTitle={activeSession?.title}
+        isSidebarOpen={isSidebarOpen}
+        isRightCanvasOpen={isRightCanvasOpen}
+        canGoBack={tabHistoryIdx > 0}
+        canGoForward={tabHistoryIdx + 1 < tabHistory.length}
         isSyncing={isSyncing}
-        isSidebarCollapsed={isSidebarCollapsed}
         connectionStatus={connectionStatus}
         isCheckingConnection={isCheckingConnection}
-        onToggleSidebar={() => setIsSidebarCollapsed((v) => !v)}
+        onToggleSidebar={() => setIsSidebarOpen((v) => !v)}
+        onToggleRightCanvas={() => {
+          setIsRightCanvasOpen((v) => {
+            if (v) setIsRightCanvasMaximized(false);
+            return !v;
+          });
+        }}
+        onGoBack={handleGoBackTab}
+        onGoForward={handleGoForwardTab}
         onRecheckConnection={() => void refreshConnection()}
-        onUndo={handleUndo}
-        onSyncMabFocus={handleSyncMabFocus}
-        onExportExcel={handleExportExcel}
+        onUndo={() => void handleUndo()}
+        onSyncMabFocus={() => void handleSyncMabFocus()}
+        onExportExcel={() => void handleExportExcel()}
       />
 
-      <div className="flex-1 flex overflow-hidden min-h-0 relative">
-        <SidebarRail
-          dash={dash}
-          activeTab={activeTab}
-          isCollapsed={isSidebarCollapsed}
-          isNarrowViewport={isNarrowViewport}
-          sidebarWidth={sidebarWidth}
-          onToggleCollapse={() => setIsSidebarCollapsed((v) => !v)}
-          onSelectTab={setActiveTab}
-          onSwitchProject={handleSwitchProject}
-          onOpenNewProject={() => setShowNewProjModal(true)}
-          onCreateChatSession={handleCreateChatSession}
-          onSwitchChatSession={handleSwitchChatSession}
-          onDeleteChatSession={handleDeleteChatSession}
-        />
+      {/* Antigravity 3-Column LTR Workbench Body: Left Sidebar | Center Chat | Right Tabbed Canvas */}
+      <div className="flex-1 flex min-h-0 overflow-hidden relative">
+        {/* Column 1: Left Sidebar */}
+        {isSidebarOpen && (
+          <AntigravitySidebar
+            dash={dash}
+            width={sidebarWidth}
+            activeCanvasTabId={isRightCanvasOpen ? activeCanvasTabId : null}
+            isNarrowViewport={isNarrowViewport}
+            onCloseMobile={() => setIsSidebarOpen(false)}
+            onNewConversation={() =>
+              void handleCreateChatSession(dash.active_project.id, activeChatChannel)
+            }
+            onOpenBuiltinView={openBuiltinView}
+            onSwitchProject={(pid) => void handleSwitchProject(pid)}
+            onOpenNewProject={() => setShowNewProjModal(true)}
+            onCreateChatSession={(pid, ch) => void handleCreateChatSession(pid, ch)}
+            onSwitchChatSession={(s) => void handleSwitchChatSession(s)}
+            onDeleteChatSession={(sid) => void handleDeleteChatSession(sid)}
+          />
+        )}
 
-        {/* VS Code–style Draggable Sidebar Sash */}
-        {!isSidebarCollapsed && !isNarrowViewport && (
+        {/* Draggable Splitter 1: Sidebar <-> Main Workspace */}
+        {isSidebarOpen && !isNarrowViewport && (
           <div
             role="separator"
             aria-orientation="vertical"
-            title="بکشید برای تغییر عرض فهرست راست (دوبار کلیک برای بازنشانی)"
+            title="Drag to resize sidebar (double-click to reset)"
             onMouseDown={(e) => {
               e.preventDefault();
               sidebarDragRef.current = {
@@ -1009,108 +1185,130 @@ export default function App() {
               };
               setIsDraggingSidebar(true);
             }}
-            onDoubleClick={() => setSidebarWidth(255)}
-            className="w-2 -mr-1 z-30 shrink-0 cursor-col-resize flex items-center justify-center group select-none"
+            onDoubleClick={() => setSidebarWidth(244)}
+            className="w-[5px] -ml-[2px] -mr-[2px] z-20 shrink-0 cursor-col-resize flex items-center justify-center group"
           >
             <div
-              className={`w-[3px] h-full transition-colors duration-150 ${
+              className={`w-[2px] h-full transition-colors ${
                 isDraggingSidebar
-                  ? "bg-blue-500 shadow-[0_0_8px_rgba(59,130,246,0.65)]"
-                  : "bg-transparent group-hover:bg-blue-500/75"
+                  ? "bg-blue-500"
+                  : "bg-transparent group-hover:bg-blue-500/70"
               }`}
             />
           </div>
         )}
 
-        <main className="flex-1 min-w-0 p-2.5 sm:p-4 min-h-0 flex flex-col gap-3 overflow-hidden">
-          <PendingQueueBanner
-            queue={dash.pending_queue}
-            connectionStatus={connectionStatus}
-            isCheckingConnection={isCheckingConnection}
-            isProcessingQueue={isProcessingQueue}
-            processingQueueId={processingQueueId}
-            autoQueueEnabled={autoQueueEnabled}
-            cooldownSecondsLeft={cooldownSecondsLeft}
-            onToggleAutoQueue={(enabled) => {
-              setAutoQueueEnabled(enabled);
-              if (enabled) setCooldownUntil(0);
-            }}
-            onRecheckConnection={() => void refreshConnection()}
-            onProcessNowAll={() => {
-              setCooldownUntil(0);
-              void runQueueDrain(true);
-            }}
-            onProcessSingleItem={(id) => void handleProcessSingleQueueItem(id)}
-            onReorderItem={(id, dir) => void handleReorderQueueItem(id, dir)}
-            onResetQueueOrder={() => void handleResetQueueOrder()}
-            onDismissItem={(id) => void handleDismissQueueItem(id)}
-            onOpenSettings={() => setActiveTab("SETTINGS")}
-          />
+        {/* Columns 2 & 3 Container: Center Chat + Right Tabbed Canvas */}
+        <div
+          ref={workspaceBodyRef}
+          className="flex-1 flex min-w-0 min-h-0 overflow-hidden"
+        >
+          {/* Column 2: Center Chat Stream (Hidden when Right Canvas is Maximized or on narrow screens when Right Canvas is open) */}
+          {(!isRightCanvasOpen || (!isRightCanvasMaximized && !isNarrowViewport)) && (
+            <AntigravityChatPane
+              dash={dash}
+              activeChannel={activeChatChannel}
+              onChangeChannel={setActiveChatChannel}
+              activeSession={activeSession}
+              chatHistory={activeChatHistory}
+              chatInput={chatInput}
+              onChangeChatInput={setChatInput}
+              isSendingChat={isSendingChat}
+              onSendChat={() => void handleSendChat()}
+              onSendFiles={(files) => void handleSendChatFiles(files)}
+              retryingMessageId={retryingMessageId}
+              onRetrySystemMessage={(id) => void handleRetrySystemMessage(id)}
+              onOpenArtifactTab={openArtifactTab}
+              onOpenSettingsTab={() => openBuiltinView("SETTINGS")}
+              onOpenReviewTab={() => openBuiltinView("WBS")}
+              connectionStatus={connectionStatus}
+              isCheckingConnection={isCheckingConnection}
+              isProcessingQueue={isProcessingQueue}
+              processingQueueId={processingQueueId}
+              autoQueueEnabled={autoQueueEnabled}
+              cooldownSecondsLeft={cooldownSecondsLeft}
+              onToggleAutoQueue={(enabled) => {
+                setAutoQueueEnabled(enabled);
+                if (enabled) setCooldownUntil(0);
+              }}
+              onRecheckConnection={() => void refreshConnection()}
+              onProcessNowAll={() => {
+                setCooldownUntil(0);
+                void runQueueDrain(true);
+              }}
+              onProcessSingleQueueItem={(id) => void handleProcessSingleQueueItem(id)}
+              onReorderQueueItem={(id, dir) => void handleReorderQueueItem(id, dir)}
+              onResetQueueOrder={() => void handleResetQueueOrder()}
+              onDismissQueueItem={(id) => void handleDismissQueueItem(id)}
+            />
+          )}
 
-          <div
-            className={`flex-1 min-h-0 min-w-0 ${
-              isSplitDesktopWorkspace
-                ? "overflow-y-auto lg:overflow-hidden"
-                : "overflow-y-auto"
-            }`}
-          >
-            {activeTab === "PATH_AND_CHAT" && (
-              <PathAndChatView
+          {/* Draggable Splitter 2: Center Chat <-> Right Tabbed Canvas */}
+          {isRightCanvasOpen && !isRightCanvasMaximized && !isNarrowViewport && (
+            <div
+              role="separator"
+              aria-orientation="vertical"
+              title="Drag to resize chat & right canvas (double-click to reset)"
+              onMouseDown={(e) => {
+                e.preventDefault();
+                setIsDraggingCanvas(true);
+              }}
+              onDoubleClick={() => setRightCanvasPct(48)}
+              className="w-[5px] -ml-[2px] -mr-[2px] z-20 shrink-0 cursor-col-resize flex items-center justify-center group border-l border-white/[0.07]"
+            >
+              <div
+                className={`w-[2px] h-full transition-colors ${
+                  isDraggingCanvas
+                    ? "bg-blue-500"
+                    : "bg-transparent group-hover:bg-blue-500/70"
+                }`}
+              />
+            </div>
+          )}
+
+          {/* Column 3: Right Tabbed Canvas */}
+          {isRightCanvasOpen && (
+            <div
+              style={
+                isRightCanvasMaximized || isNarrowViewport
+                  ? { flex: 1 }
+                  : { width: `${rightCanvasPct}%` }
+              }
+              className={`min-w-0 min-h-0 flex flex-col overflow-hidden ${
+                isRightCanvasMaximized || isNarrowViewport ? "flex-1 w-full" : "min-w-[280px] shrink-0"
+              }`}
+            >
+              <AntigravityRightCanvas
                 dash={dash}
+                settingsForm={settingsForm}
+                tabs={canvasTabs}
+                activeTabId={activeCanvasTabId}
+                isMaximized={isRightCanvasMaximized}
+                onSelectTab={activateTab}
+                onCloseTab={closeCanvasTab}
+                onOpenBuiltinView={openBuiltinView}
+                onOpenArtifactTab={openArtifactTab}
+                onOpenMethodTab={openMethodTab}
+                onToggleMaximize={() => setIsRightCanvasMaximized((v) => !v)}
+                onCloseCanvas={() => {
+                  setIsRightCanvasOpen(false);
+                  setIsRightCanvasMaximized(false);
+                }}
                 checkedGates={checkedGates}
                 onToggleGate={(id, checked) =>
                   setCheckedGates({ ...checkedGates, [id]: checked })
                 }
                 allGatesPassed={allGatesPassed}
-                onQuickComplete={handleQuickComplete}
-                onStartTask={handleStartTask}
-                chatInput={chatInput}
-                onChangeChatInput={setChatInput}
-                isSendingChat={isSendingChat}
-                onSendChat={handleSendChat}
-                onSendCopilotFiles={handleSendCopilotFiles}
-                isFullChatMode={isFullChatMode}
-                onToggleFullChatMode={setIsFullChatMode}
-                onNewChat={() =>
-                  void handleCreateChatSession(dash.active_project.id, "COPILOT")
-                }
-                onSwitchSession={(sid) => void handleSwitchCopilotSessionById(sid)}
-                onOpenSettings={() => setActiveTab("SETTINGS")}
-                retryingMessageId={retryingMessageId}
-                onRetrySystemMessage={(id) => void handleRetrySystemMessage(id)}
-              />
-            )}
-
-            {activeTab === "KNOWLEDGE_VAULT" && (
-              <KnowledgeVaultView
-                dash={dash}
-                docQueueStatus={docQueueStatus}
-                onBatchFilesSelected={handleBatchFilesSelected}
-                onBatchFilesDropped={(files) => void processBatchVaultFiles(files)}
-                onManualDocIngest={handleManualDocIngest}
-                onRequeueDoc={(docId) => void handleRequeueDoc(docId)}
-                vaultChatInput={vaultChatInput}
-                onChangeVaultChatInput={setVaultChatInput}
-                isSendingVaultChat={isSendingVaultChat}
-                onSendVaultChat={handleSendVaultChat}
-                onNewVaultChat={() =>
-                  void handleCreateChatSession(dash.active_project.id, "VAULT")
-                }
-                onSwitchVaultSession={(sid) =>
-                  void handleSwitchCopilotSessionById(sid)
-                }
-                onNavigateToPath={() => setActiveTab("PATH_AND_CHAT")}
-                onOpenSettings={() => setActiveTab("SETTINGS")}
-                retryingMessageId={retryingMessageId}
-                onRetrySystemMessage={(id) => void handleRetrySystemMessage(id)}
-              />
-            )}
-
-            {activeTab === "WBS_AND_DOCS" && (
-              <WbsAndDocsView
-                dash={dash}
-                onQuickComplete={handleQuickComplete}
-                onStartTask={handleStartTask}
+                onQuickComplete={(tid, p) => void handleQuickComplete(tid, p)}
+                onStartTask={(tid) => void handleStartTask(tid)}
+                onInsertChatPrompt={(text) => {
+                  setChatInput((prev) =>
+                    prev.trim() ? `${prev.trimEnd()}\n${text}` : text
+                  );
+                  if (isRightCanvasMaximized) setIsRightCanvasMaximized(false);
+                }}
+                onUpsertMethod={handleUpsertMethod}
+                onDeleteMethod={handleDeleteMethod}
                 onOpenNewOutcome={() => {
                   setEditingOutcome(null);
                   setShowOutcomeModal(true);
@@ -1119,6 +1317,7 @@ export default function App() {
                   setEditingOutcome(o);
                   setShowOutcomeModal(true);
                 }}
+                onDeleteOutcome={(id) => void handleDeleteOutcome(id)}
                 onOpenNewWorkLine={() => {
                   setEditingWorkLine(null);
                   setShowWorkLineModal(true);
@@ -1135,77 +1334,67 @@ export default function App() {
                   setEditingTask(t);
                   setShowTaskModal(true);
                 }}
-              />
-            )}
-
-            {activeTab === "ECOSYSTEM_CARDS" && (
-              <EcosystemAndCardsView
-                dash={dash}
-                onOpenNewOutcome={() => {
-                  setEditingOutcome(null);
-                  setShowOutcomeModal(true);
-                }}
-                onEditOutcome={(o) => {
-                  setEditingOutcome(o);
-                  setShowOutcomeModal(true);
-                }}
-                onDeleteOutcome={(id) => void handleDeleteOutcome(id)}
+                docQueueStatus={docQueueStatus}
+                onBatchFilesSelected={handleBatchFilesSelected}
+                onBatchFilesDropped={(files) => void processBatchVaultFiles(files)}
+                onManualDocIngest={handleManualDocIngest}
+                onRequeueDoc={(docId) => void handleRequeueDoc(docId)}
+                onDashboardUpdated={setDash}
+                onToast={showToast}
                 onCreateVaultCard={handleCreateVaultCard}
                 onDeleteVaultCard={(id) => void handleDeleteVaultCard(id)}
-                onResolveProposal={(id, ok) =>
-                  void handleResolveProposal(id, ok)
-                }
+                onResolveProposal={(id, ok) => void handleResolveProposal(id, ok)}
                 onUpsertCalendarDay={handleUpsertCalendarDay}
+                onChangeSettings={setSettingsForm}
+                onSaveSettings={(override) => void handleSaveSettings(override)}
               />
-            )}
-
-            {activeTab === "SETTINGS" && (
-              <SettingsView
-                settingsForm={settingsForm}
-                onChange={setSettingsForm}
-                onSave={() => void handleSaveSettings()}
-                onQuickSaveSettings={(next) => void handleSaveSettings(next)}
-              />
-            )}
-          </div>
-        </main>
+            </div>
+          )}
+        </div>
       </div>
 
-      <NewProjectModal
-        open={showNewProjModal}
-        onClose={() => setShowNewProjModal(false)}
-        onCreate={handleCreateProject}
-      />
+      {/* Modals (RTL inside modals) */}
+      <div dir="rtl">
+        <NewProjectModal
+          open={showNewProjModal}
+          onClose={() => setShowNewProjModal(false)}
+          onCreate={handleCreateProject}
+        />
 
-      <OutcomeModal
-        open={showOutcomeModal}
-        domains={dash.domains ?? []}
-        initialOutcome={editingOutcome}
-        onClose={() => setShowOutcomeModal(false)}
-        onSubmit={handleUpsertOutcome}
-      />
+        <OutcomeModal
+          open={showOutcomeModal}
+          domains={dash.domains ?? []}
+          initialOutcome={editingOutcome}
+          onClose={() => setShowOutcomeModal(false)}
+          onSubmit={handleUpsertOutcome}
+        />
 
-      <WorkLineModal
-        open={showWorkLineModal}
-        outcomes={dash.outcomes ?? []}
-        initialWorkLine={editingWorkLine}
-        onClose={() => setShowWorkLineModal(false)}
-        onCreate={handleCreateWorkLine}
-        onUpdate={handleUpdateWorkLine}
-      />
+        <WorkLineModal
+          open={showWorkLineModal}
+          outcomes={dash.outcomes ?? []}
+          initialWorkLine={editingWorkLine}
+          onClose={() => setShowWorkLineModal(false)}
+          onCreate={handleCreateWorkLine}
+          onUpdate={handleUpdateWorkLine}
+        />
 
-      <TaskModal
-        open={showTaskModal}
-        workLines={dash.work_lines ?? []}
-        outcomes={dash.outcomes ?? []}
-        editingTask={editingTask}
-        onClose={() => setShowTaskModal(false)}
-        onCreate={handleCreateManualTask}
-        onAssign={handleAssignTaskGrouping}
-      />
+        <TaskModal
+          open={showTaskModal}
+          workLines={dash.work_lines ?? []}
+          outcomes={dash.outcomes ?? []}
+          editingTask={editingTask}
+          onClose={() => setShowTaskModal(false)}
+          onCreate={handleCreateManualTask}
+          onAssign={handleAssignTaskGrouping}
+        />
+      </div>
 
+      {/* Toast Notification */}
       {toastMsg && (
-        <div className="fixed bottom-4 left-4 right-4 sm:right-auto max-w-md bg-[#18191E] border border-blue-500/40 text-white px-4 py-3 rounded-2xl text-[12.5px] font-medium z-50 shadow-mab-modal">
+        <div
+          dir="rtl"
+          className="fixed bottom-4 right-4 max-w-md bg-[#18191E] border border-blue-500/40 text-white px-4 py-3 rounded-2xl text-[12.5px] font-medium z-50 shadow-2xl"
+        >
           {toastMsg}
         </div>
       )}

@@ -1,6 +1,7 @@
 use crate::db::queries::{
-    apply_copilot_envelope_with_event, create_new_project, get_dashboard_state_for_project,
-    quick_complete_task, search_raw_events_fts, undo_last_mutation,
+    apply_copilot_envelope_with_artifacts, apply_copilot_envelope_with_event, create_new_project,
+    get_dashboard_state_for_project, quick_complete_task, search_raw_events_fts,
+    undo_last_mutation,
 };
 use crate::mab_focus_sync::synchronize_with_mab_focus;
 use crate::models::{AtomicMutation, ChainStepInput, CopilotEnvelope};
@@ -357,7 +358,7 @@ fn v3_tool_definitions() -> Value {
         },
         {
             "name": "save_personal_or_lesson_item",
-            "description": "Store a lesson learned, personal interest, note, idea, or bookmark in the personal vault (PVI-xxxx).",
+            "description": "Store a memory card, lesson learned, instruction, personal interest, note, idea, or bookmark in the personal vault (PVI-xxxx).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -365,7 +366,7 @@ fn v3_tool_definitions() -> Value {
                     "domain_code": { "type": "string", "description": "CADM domain code (e.g. MIND_LEARNING)" },
                     "item_type": {
                         "type": "string",
-                        "enum": ["LESSON_LEARNED", "INTEREST", "IDEA", "BOOKMARK", "NOTE"]
+                        "enum": ["MEMORY_CARD", "LESSON", "INSTRUCTION", "LESSON_LEARNED", "INTEREST", "IDEA", "BOOKMARK", "NOTE"]
                     },
                     "title": { "type": "string", "description": "Item title" },
                     "content_markdown": { "type": "string", "description": "Detailed Markdown content / lesson body" },
@@ -393,16 +394,126 @@ fn v3_tool_definitions() -> Value {
     ])
 }
 
+fn v4_method_tool_definition() -> Value {
+    let sub_step_schema = json!({
+        "type": "object",
+        "properties": {
+            "id": { "type": "string" },
+            "title": { "type": "string" },
+            "description": { "type": "string" },
+            "element_type": { "type": "string" },
+            "role": { "type": "string" },
+            "notes": { "type": "string" }
+        },
+        "required": ["title"]
+    });
+    let step_schema = json!({
+        "type": "object",
+        "properties": {
+            "id": { "type": "string" },
+            "order": { "type": "integer" },
+            "title": { "type": "string" },
+            "description": { "type": "string" },
+            "element_type": {
+                "type": "string",
+                "enum": ["task", "userTask", "serviceTask", "subProcess", "exclusiveGateway", "parallelGateway", "callActivity"]
+            },
+            "role": { "type": "string" },
+            "inputs": { "type": "array", "items": { "type": "string" } },
+            "outputs": { "type": "array", "items": { "type": "string" } },
+            "checklist": { "type": "array", "items": { "type": "string" } },
+            "notes": { "type": "string" },
+            "condition_label": { "type": "string" },
+            "sub_method_id": { "type": "string" },
+            "sub_steps": {
+                "type": "array",
+                "items": sub_step_schema
+            }
+        },
+        "required": ["title"]
+    });
+    json!({
+        "name": "upsert_method_playbook",
+        "description": "Create or automatically enrich/version-bump a repeatable step-by-step Method / Playbook (دستورالعمل انجام کار) with a visual BPMN 2.0 workflow (supporting nested subProcess composite steps for drill-down). Persists to SQLite and writes Markdown + BPMN 2.0 XML into 04_methods_playbooks/.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": { "type": "string", "description": "Optional project ID (defaults to active project)" },
+                "method_id": { "type": "string", "description": "Optional existing MTH-xxxx ID to enrich/update" },
+                "title": { "type": "string", "description": "Clear Persian title of the method/playbook" },
+                "category": { "type": "string", "enum": ["BACKEND", "UI_UX", "DEPLOY", "VIDEO", "ARCHITECTURE", "GENERAL"] },
+                "summary": { "type": "string", "description": "Concise 1-2 sentence Persian summary shown on chat artifact card" },
+                "objective": { "type": "string", "description": "Goal/objective of this method (هدف)" },
+                "prerequisites": { "type": "array", "items": { "type": "string" } },
+                "steps": {
+                    "type": "array",
+                    "description": "Ordered workflow steps; composite steps can use element_type='subProcess' with sub_steps[] for internal drill-down BPMN workflows",
+                    "items": step_schema
+                },
+                "checklist": { "type": "array", "items": { "type": "string" } },
+                "notes_markdown": { "type": "string" },
+                "bpmn_xml": { "type": "string", "description": "Optional complete valid BPMN 2.0 XML (<bpmn:definitions>...); auto-generated from steps if omitted" },
+                "parent_method_id": { "type": "string" },
+                "parent_element_id": { "type": "string" }
+            },
+            "required": ["title", "steps"]
+        }
+    })
+}
+
 pub fn tool_definitions() -> Value {
     let mut all = legacy_tool_definitions()
         .as_array()
         .cloned()
         .unwrap_or_default();
     all.extend(v3_tool_definitions().as_array().cloned().unwrap_or_default());
+    all.push(v4_method_tool_definition());
     Value::Array(all)
 }
 
 pub fn copilot_envelope_json_schema() -> Value {
+    let method_step_schema = json!({
+        "type": "object",
+        "properties": {
+            "id": { "type": ["string", "null"] },
+            "order": { "type": ["integer", "null"] },
+            "title": { "type": "string" },
+            "description": { "type": ["string", "null"] },
+            "element_type": { "type": ["string", "null"] },
+            "role": { "type": ["string", "null"] },
+            "checklist": { "type": "array", "items": { "type": "string" } },
+            "notes": { "type": ["string", "null"] },
+            "sub_steps": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "title": { "type": "string" },
+                        "description": { "type": ["string", "null"] },
+                        "element_type": { "type": ["string", "null"] }
+                    },
+                    "required": ["title"]
+                }
+            }
+        },
+        "required": ["title"]
+    });
+    let method_item_schema = json!({
+        "type": "object",
+        "properties": {
+            "method_id": { "type": ["string", "null"] },
+            "title": { "type": "string" },
+            "category": { "type": ["string", "null"] },
+            "summary": { "type": ["string", "null"] },
+            "objective": { "type": ["string", "null"] },
+            "prerequisites": { "type": "array", "items": { "type": "string" } },
+            "steps": { "type": "array", "items": method_step_schema },
+            "checklist": { "type": "array", "items": { "type": "string" } },
+            "notes_markdown": { "type": ["string", "null"] },
+            "bpmn_xml": { "type": ["string", "null"] }
+        },
+        "required": ["title"]
+    });
     json!({
         "type": "object",
         "properties": {
@@ -458,6 +569,10 @@ pub fn copilot_envelope_json_schema() -> Value {
                     },
                     "required": ["op"]
                 }
+            },
+            "method_playbooks": {
+                "type": "array",
+                "items": method_item_schema
             }
         },
         "required": ["conversational_reply", "mutations"]
@@ -718,7 +833,7 @@ pub fn execute_tool_with_context(
                 mutations: vec![m],
                 ..Default::default()
             };
-            let badge = apply_copilot_envelope_with_event(
+            let (badge, artifacts) = apply_copilot_envelope_with_artifacts(
                 conn,
                 &pid,
                 &format!("[MCP] create_work_entity: {}", title),
@@ -731,12 +846,18 @@ pub fn execute_tool_with_context(
             let updated = get_dashboard_state_for_project(conn, Some(&pid))
                 .map_err(|e| e.to_string())?;
             let _ = sync_all_project_projections(&updated, None, None);
-            Ok(json!({
+            let mut out = json!({
                 "badge": badge,
                 "next_step_task": updated.next_step_task,
                 "open_tasks": updated.open_tasks,
                 "active_decisions": updated.active_decisions
-            }))
+            });
+            if let Some(first_art) = artifacts.first() {
+                if let Some(obj) = out.as_object_mut() {
+                    obj.insert("artifact_ref".to_string(), json!(first_art));
+                }
+            }
+            Ok(out)
         }
         "update_work_entity" => {
             let req_pid = resolve_pid(args);
@@ -898,10 +1019,28 @@ pub fn execute_tool_with_context(
                     params![pid, note, archived_path, now],
                 )
                 .map_err(|e| e.to_string())?;
+                let note_preview: String = note.trim().chars().take(160).collect();
+                let note_title: String = note
+                    .lines()
+                    .map(str::trim)
+                    .find(|l| !l.is_empty())
+                    .unwrap_or("یادداشت آرشیوشده")
+                    .chars()
+                    .take(64)
+                    .collect();
                 return Ok(json!({
                     "project_id": pid,
                     "archived_path": archived_path,
-                    "status": "یادداشت خام در حافظه و 00_raw_inputs ثبت شد."
+                    "status": "یادداشت خام در حافظه و 00_raw_inputs ثبت شد.",
+                    "artifact_ref": {
+                        "artifact_type": "MARKDOWN_FILE",
+                        "entity_id": format!("NOTE-{}", &Uuid::new_v4().to_string()[..6].to_uppercase()),
+                        "title": note_title,
+                        "summary": note_preview,
+                        "file_path": archived_path,
+                        "action": "CREATED",
+                        "version": null
+                    }
                 }));
             }
 
@@ -935,12 +1074,50 @@ pub fn execute_tool_with_context(
             let updated = get_dashboard_state_for_project(conn, Some(&pid))
                 .map_err(|e| e.to_string())?;
             let _ = sync_all_project_projections(&updated, None, None);
-            Ok(json!({
+            let mut out = json!({
                 "badge": badge,
                 "active_sops": updated.active_sops,
                 "active_guardrails": updated.active_guardrails,
                 "recent_logs": updated.recent_logs
-            }))
+            });
+            if matches!(action.as_str(), "UPSERT_SOP" | "ADD_SOP") {
+                if let Some(rule) = opt_str(args, "sop_rule_statement") {
+                    let cat = opt_str(args, "category").unwrap_or_else(|| "GENERAL".into());
+                    if let Some(obj) = out.as_object_mut() {
+                        obj.insert(
+                            "artifact_ref".to_string(),
+                            json!({
+                                "artifact_type": "SOP_GUARDRAIL",
+                                "entity_id": format!("SOP-{}", &Uuid::new_v4().to_string()[..6].to_uppercase()),
+                                "title": format!("قانون اجرایی ({})", cat),
+                                "summary": rule.chars().take(180).collect::<String>(),
+                                "file_path": null,
+                                "action": "CREATED",
+                                "version": null
+                            }),
+                        );
+                    }
+                }
+            } else if action == "REGISTER_ANTIPATTERN" {
+                if let Some(pattern) = opt_str(args, "mistake_pattern") {
+                    let gate = opt_str(args, "preventive_gate_question").unwrap_or_default();
+                    if let Some(obj) = out.as_object_mut() {
+                        obj.insert(
+                            "artifact_ref".to_string(),
+                            json!({
+                                "artifact_type": "SOP_GUARDRAIL",
+                                "entity_id": format!("GRD-{}", &Uuid::new_v4().to_string()[..6].to_uppercase()),
+                                "title": format!("سد ضدتکرار خطا: {}", pattern.chars().take(48).collect::<String>()),
+                                "summary": if gate.is_empty() { pattern } else { gate },
+                                "file_path": null,
+                                "action": "CREATED",
+                                "version": null
+                            }),
+                        );
+                    }
+                }
+            }
+            Ok(out)
         }
         "sync_mab_focus" => {
             let report = synchronize_with_mab_focus(conn)?;
@@ -1124,11 +1301,27 @@ pub fn execute_tool_with_context(
                 return Err("Chain requires at least 1 step".to_string());
             }
 
+            let is_legacy_reprocess = source_origin.starts_with("LEGACY_REPROCESS");
             let mut steps_input = Vec::with_capacity(steps_arr.len());
+            let mut skipped_duplicates = 0usize;
             for item in steps_arr {
                 let step: ChainStepInput = serde_json::from_value(item.clone())
                     .map_err(|e| format!("Invalid step input: {}", e))?;
+                if is_legacy_reprocess
+                    && crate::method_engine::is_duplicate_task_title(conn, &pid, &step.title)
+                {
+                    skipped_duplicates += 1;
+                    continue;
+                }
                 steps_input.push(step);
+            }
+            if steps_input.is_empty() {
+                return Ok(json!({
+                    "status": "skipped_duplicates",
+                    "project_id": pid,
+                    "skipped_duplicates": skipped_duplicates,
+                    "tasks": []
+                }));
             }
 
             let (work_line, created_tasks) = crate::db::queries::create_work_line_with_chain(
@@ -1147,7 +1340,20 @@ pub fn execute_tool_with_context(
             Ok(json!({
                 "work_line_id": work_line.id,
                 "project_id": pid,
-                "tasks": task_ids
+                "tasks": task_ids,
+                "artifact_ref": {
+                    "artifact_type": "WORK_LINE",
+                    "entity_id": work_line.id,
+                    "title": work_line.title,
+                    "summary": if work_line.goal_statement.trim().is_empty() {
+                        format!("لاین کاری ({}) با {} گام اجرایی", work_line.line_mode, task_ids.len())
+                    } else {
+                        work_line.goal_statement
+                    },
+                    "file_path": null,
+                    "action": "CREATED",
+                    "version": null
+                }
             }))
         }
         "append_or_reorder_work_line" => {
@@ -1189,6 +1395,16 @@ pub fn execute_tool_with_context(
                     params![line_id],
                     |r| r.get(0),
                 ).map_err(|e| e.to_string())?;
+
+                if source_origin.starts_with("LEGACY_REPROCESS")
+                    && crate::method_engine::is_duplicate_task_title(conn, &project_id, &step.title)
+                {
+                    return Ok(json!({
+                        "status": "skipped_duplicate",
+                        "work_line_id": line_id,
+                        "title": step.title
+                    }));
+                }
 
                 let locs_json = serde_json::to_string(&step.location_tags)
                     .unwrap_or_else(|_| "[\"DESK\"]".to_string());
@@ -1351,7 +1567,10 @@ pub fn execute_tool_with_context(
         "save_personal_or_lesson_item" => {
             let item_type = opt_str(args, "item_type")
                 .ok_or_else(|| "Missing item_type".to_string())?;
-            if !matches!(item_type.as_str(), "LESSON_LEARNED" | "INTEREST" | "IDEA" | "BOOKMARK" | "NOTE") {
+            if !matches!(
+                item_type.as_str(),
+                "MEMORY_CARD" | "LESSON" | "INSTRUCTION" | "LESSON_LEARNED" | "INTEREST" | "IDEA" | "BOOKMARK" | "NOTE"
+            ) {
                 return Err(format!("Invalid item_type: {}", item_type));
             }
 
@@ -1361,7 +1580,7 @@ pub fn execute_tool_with_context(
                 .ok_or_else(|| "Missing content_markdown".to_string())?;
             let realm = opt_str(args, "realm").unwrap_or_else(|| "LIFE".to_string());
             let domain_code = opt_str(args, "domain_code").unwrap_or_else(|| "MIND_LEARNING".to_string());
-            let project_id = opt_str(args, "project_id");
+            let project_id = resolve_pid(args);
             let tags_val = args.get("tags").cloned().unwrap_or_else(|| json!([]));
             let tags_json = tags_val.to_string();
             let now = Local::now().to_rfc3339();
@@ -1370,16 +1589,59 @@ pub fn execute_tool_with_context(
 
             conn.execute(
                 "INSERT INTO personal_vault_items (
-                    id, realm, domain_code, project_id, item_type, title, content_markdown, tags_json, created_at, updated_at, content
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?7)",
+                    id, realm, domain_code, project_id, item_type, title, content_markdown, tags_json, created_at, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
                 params![item_id, realm, domain_code, project_id, item_type, title, content, tags_json, now],
             ).map_err(|e| e.to_string())?;
 
+            let summary_preview: String = content.trim().chars().take(160).collect();
             Ok(json!({
                 "item_id": item_id,
                 "item_type": item_type,
                 "domain_code": domain_code,
-                "title": title
+                "title": title,
+                "artifact_ref": {
+                    "artifact_type": "VAULT_CARD",
+                    "entity_id": item_id,
+                    "title": title,
+                    "summary": summary_preview,
+                    "file_path": null,
+                    "action": "CREATED",
+                    "version": null
+                }
+            }))
+        }
+        "upsert_method_playbook" => {
+            let req_pid = resolve_pid(args);
+            let dash = get_dashboard_state_for_project(conn, req_pid.as_deref())
+                .map_err(|e| e.to_string())?;
+            let pid = dash.active_project.id.clone();
+            let workspace_path = dash.active_project.workspace_path.clone();
+
+            let input: crate::models::MethodPlaybookInput = serde_json::from_value(args.clone())
+                .map_err(|e| format!("ورودی نامعتبر برای upsert_method_playbook: {}", e))?;
+            let src_ref = existing_event_id
+                .map(|id| format!("event:{}", id))
+                .unwrap_or_else(|| format!("mcp:{}", source_origin));
+
+            let (method, is_created, artifact_ref) = crate::method_engine::upsert_method_playbook(
+                conn,
+                &pid,
+                &workspace_path,
+                input,
+                Some(&src_ref),
+            )?;
+
+            Ok(json!({
+                "status": "ok",
+                "action": if is_created { "CREATED" } else { "UPDATED" },
+                "method_id": method.id,
+                "title": method.title,
+                "version": method.version,
+                "archived_path": method.archived_path,
+                "bpmn_file_path": method.bpmn_file_path,
+                "steps_count": method.steps.len(),
+                "artifact_ref": artifact_ref
             }))
         }
         "open_in_right_panel" => {

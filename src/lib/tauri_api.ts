@@ -118,6 +118,25 @@ export interface SessionWorkLog {
   logged_at: string;
 }
 
+export interface WrittenArtifactRef {
+  artifact_type:
+    | "METHOD_PLAYBOOK"
+    | "KNOWLEDGE_DOC"
+    | "MEETING_MINUTES"
+    | "DECISION_ADR"
+    | "SOP_RULE"
+    | "VAULT_CARD"
+    | "WORK_LINE"
+    | "MARKDOWN_FILE"
+    | string;
+  entity_id: string;
+  title: string;
+  summary: string;
+  file_path?: string | null;
+  action: "CREATED" | "UPDATED" | string;
+  version?: number | null;
+}
+
 export interface ChatMessage {
   id: number;
   project_id: string;
@@ -128,6 +147,7 @@ export interface ChatMessage {
   archived_file_path?: string | null;
   applied_mutations_badge?: string | null;
   clarifying_questions: string[];
+  written_artifacts?: WrittenArtifactRef[];
   created_at: string;
 }
 
@@ -287,6 +307,101 @@ export interface SyncReport {
   last_synced_at: string;
 }
 
+export interface MethodStep {
+  id: string;
+  order: number;
+  title: string;
+  description: string;
+  element_type:
+    | "task"
+    | "userTask"
+    | "serviceTask"
+    | "subProcess"
+    | "exclusiveGateway"
+    | "parallelGateway"
+    | "callActivity"
+    | string;
+  role: string;
+  inputs: string[];
+  outputs: string[];
+  checklist: string[];
+  notes: string;
+  condition_label?: string | null;
+  sub_method_id?: string | null;
+  sub_steps: MethodStep[];
+}
+
+export interface MethodPlaybook {
+  id: string;
+  project_id: string;
+  slug: string;
+  title: string;
+  category: string;
+  summary: string;
+  objective: string;
+  prerequisites: string[];
+  steps: MethodStep[];
+  checklist: string[];
+  notes_markdown: string;
+  markdown_content: string;
+  bpmn_xml: string;
+  parent_method_id?: string | null;
+  parent_element_id?: string | null;
+  version: number;
+  archived_path: string;
+  bpmn_file_path: string;
+  source_refs: string[];
+  created_at: string;
+  updated_at: string;
+}
+
+export interface MethodPlaybookInput {
+  method_id?: string | null;
+  title: string;
+  category?: string | null;
+  summary?: string | null;
+  objective?: string | null;
+  prerequisites?: string[];
+  steps: Partial<MethodStep>[];
+  checklist?: string[];
+  notes_markdown?: string | null;
+  bpmn_xml?: string | null;
+  parent_method_id?: string | null;
+  parent_element_id?: string | null;
+}
+
+export interface LegacyReprocessCandidate {
+  source_kind: "KNOWLEDGE_DOC" | "RAW_EVENT" | string;
+  source_id: number;
+  project_id: string;
+  title: string;
+  doc_type: string;
+  snippet: string;
+  created_at: string;
+  processing_status: string;
+  already_upgraded: boolean;
+  upgraded_at?: string | null;
+  archived_path?: string | null;
+}
+
+export interface LegacyReprocessSelection {
+  source_kind: string;
+  source_id: number;
+}
+
+export interface DatabaseBackupResult {
+  backup_path: string;
+  backup_size_bytes: number;
+  created_at: string;
+}
+
+export interface LegacyReprocessEnqueueResult {
+  backup_path: string;
+  backup_size_bytes: number;
+  enqueued_count: number;
+  dashboard: DashboardState;
+}
+
 export interface DashboardState {
   projects: Project[];
   active_project: Project;
@@ -318,6 +433,7 @@ export interface DashboardState {
   calendar_days?: CalendarDay[];
   pending_proposals?: PendingProposal[];
   personal_vault_items?: PersonalVaultItem[];
+  methods_playbooks?: MethodPlaybook[];
 }
 
 export interface CommittedChatTurn {
@@ -627,4 +743,22 @@ export const CompassApi = {
     dayNote: string;
     isOffDay: boolean;
   }) => invoke<DashboardState>("cmd_upsert_calendar_day", params),
+  upsertMethodPlaybook: (input: MethodPlaybookInput) =>
+    invoke<DashboardState>("cmd_upsert_method_playbook", { input }),
+  deleteMethodPlaybook: (methodId: string) =>
+    invoke<DashboardState>("cmd_delete_method_playbook", { methodId }),
+  readWorkspaceFile: (filePath: string) =>
+    invoke<string>("cmd_read_workspace_file", { filePath }),
+  listLegacyReprocessCandidates: () =>
+    invoke<LegacyReprocessCandidate[]>("cmd_list_legacy_reprocess_candidates"),
+  backupDatabaseNow: () =>
+    invoke<DatabaseBackupResult>("cmd_backup_database_now"),
+  enqueueLegacyReprocess: (
+    mode: "ALL_CHRONOLOGICAL" | "SELECTED",
+    selectedItems: LegacyReprocessSelection[]
+  ) =>
+    invoke<LegacyReprocessEnqueueResult>("cmd_enqueue_legacy_reprocess", {
+      mode,
+      selectedItems,
+    }),
 };

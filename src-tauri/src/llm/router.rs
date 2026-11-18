@@ -4,6 +4,7 @@ use crate::mcp_tools::{
 };
 use crate::models::{
     CopilotEnvelope, LiveModelOption, LiveModelsResponse, LlmConfig, LlmConnectionStatus,
+    WrittenArtifactRef,
 };
 use rusqlite::Connection;
 use serde_json::{json, Value};
@@ -23,7 +24,18 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 pub struct CopilotTurnResult {
     pub envelope: CopilotEnvelope,
     pub mcp_ops_executed: Vec<String>,
+    pub mcp_written_artifacts: Vec<WrittenArtifactRef>,
     pub transport_label: String,
+}
+
+fn collect_artifact_from_mcp_output(val: &Value, acc: &mut Vec<WrittenArtifactRef>) {
+    if let Some(art_val) = val.get("artifact_ref") {
+        if let Ok(art) = serde_json::from_value::<WrittenArtifactRef>(art_val.clone()) {
+            if !art.title.trim().is_empty() {
+                acc.push(art);
+            }
+        }
+    }
 }
 
 pub async fn run_llm_text(
@@ -191,6 +203,7 @@ pub async fn run_copilot_turn(
                     Ok(CopilotTurnResult {
                         envelope: env,
                         mcp_ops_executed: Vec::new(),
+                        mcp_written_artifacts: Vec::new(),
                         transport_label: label,
                     })
                 }
@@ -222,6 +235,7 @@ pub async fn run_copilot_turn(
                     Ok(CopilotTurnResult {
                         envelope: env,
                         mcp_ops_executed: Vec::new(),
+                        mcp_written_artifacts: Vec::new(),
                         transport_label: label,
                     })
                 }
@@ -234,6 +248,7 @@ pub async fn run_copilot_turn(
                     Ok(CopilotTurnResult {
                         envelope: env,
                         mcp_ops_executed: Vec::new(),
+                        mcp_written_artifacts: Vec::new(),
                         transport_label: label,
                     })
                 }
@@ -1262,6 +1277,7 @@ async fn run_gemini_mcp_turn(
         "parts": [{ "text": user_prompt }]
     })];
     let mut mcp_ops_executed: Vec<String> = Vec::new();
+    let mut mcp_written_artifacts: Vec<WrittenArtifactRef> = Vec::new();
 
     for _round in 0..6 {
         let body = json!({
@@ -1317,6 +1333,7 @@ async fn run_gemini_mcp_turn(
                 let response_obj = match exec_res {
                     Ok(ok_val) => {
                         mcp_ops_executed.push(fn_name.clone());
+                        collect_artifact_from_mcp_output(&ok_val, &mut mcp_written_artifacts);
                         ok_val
                     }
                     Err(err_msg) => json!({ "error": err_msg }),
@@ -1344,6 +1361,7 @@ async fn run_gemini_mcp_turn(
         return Ok(CopilotTurnResult {
             envelope: env,
             mcp_ops_executed,
+            mcp_written_artifacts,
             transport_label: label,
         });
     }
@@ -1357,6 +1375,7 @@ async fn run_gemini_mcp_turn(
             ..Default::default()
         },
         mcp_ops_executed,
+        mcp_written_artifacts,
         transport_label: "MCP_TOOLS".to_string(),
     })
 }
@@ -1455,6 +1474,7 @@ async fn run_local_openai_mcp_turn(
         json!({ "role": "user", "content": user_prompt }),
     ];
     let mut mcp_ops_executed: Vec<String> = Vec::new();
+    let mut mcp_written_artifacts: Vec<WrittenArtifactRef> = Vec::new();
 
     for _round in 0..6 {
         let mut body = json!({
@@ -1506,6 +1526,7 @@ async fn run_local_openai_mcp_turn(
                 let tool_text = match exec_res {
                     Ok(ok_val) => {
                         mcp_ops_executed.push(fn_name.clone());
+                        collect_artifact_from_mcp_output(&ok_val, &mut mcp_written_artifacts);
                         serde_json::to_string(&ok_val).unwrap_or_else(|_| ok_val.to_string())
                     }
                     Err(err_msg) => json!({ "error": err_msg }).to_string(),
@@ -1535,6 +1556,7 @@ async fn run_local_openai_mcp_turn(
         return Ok(CopilotTurnResult {
             envelope: env,
             mcp_ops_executed,
+            mcp_written_artifacts,
             transport_label: label,
         });
     }
@@ -1548,6 +1570,7 @@ async fn run_local_openai_mcp_turn(
             ..Default::default()
         },
         mcp_ops_executed,
+        mcp_written_artifacts,
         transport_label: "MCP_TOOLS".to_string(),
     })
 }
@@ -1850,8 +1873,44 @@ mod tests {
         let server = tokio::spawn(async move {
             for round in 0..2 {
                 if let Ok((mut socket, _)) = listener.accept().await {
-                    let mut buf = [0u8; 8192];
-                    let _ = socket.read(&mut buf).await;
+                    // Drain full HTTP request (headers + Content-Length body) so Windows doesn't TCP RST on large tool payloads
+                    let mut req_buf = Vec::with_capacity(16384);
+                    let mut tmp = [0u8; 4096];
+                    let mut expected_total: Option<usize> = None;
+                    loop {
+                        match socket.read(&mut tmp).await {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                req_buf.extend_from_slice(&tmp[..n]);
+                                if expected_total.is_none() {
+                                    if let Some(pos) = req_buf
+                                        .windows(4)
+                                        .position(|w| w == b"\r\n\r\n")
+                                    {
+                                        let headers_end = pos + 4;
+                                        let headers_str =
+                                            String::from_utf8_lossy(&req_buf[..headers_end]);
+                                        let content_len = headers_str
+                                            .lines()
+                                            .find_map(|l| {
+                                                let lower = l.to_ascii_lowercase();
+                                                lower
+                                                    .strip_prefix("content-length:")
+                                                    .and_then(|v| v.trim().parse::<usize>().ok())
+                                            })
+                                            .unwrap_or(0);
+                                        expected_total = Some(headers_end + content_len);
+                                    }
+                                }
+                                if let Some(total) = expected_total {
+                                    if req_buf.len() >= total {
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
                     let body = if round == 0 {
                         serde_json::json!({
                             "choices": [{

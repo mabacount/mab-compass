@@ -267,6 +267,44 @@ pub fn init_database(db_path: &Path, default_vault_root: &Path) -> Result<Connec
         );
         CREATE INDEX IF NOT EXISTS idx_personal_vault_items_domain ON personal_vault_items(domain_code);
         CREATE INDEX IF NOT EXISTS idx_personal_vault_items_realm ON personal_vault_items(realm);
+
+        -- 7. Methods, Playbooks & BPMN 2.0 Workflows (MTH-XXXX)
+        CREATE TABLE IF NOT EXISTS methods_playbooks (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            slug TEXT NOT NULL,
+            title TEXT NOT NULL,
+            category TEXT NOT NULL DEFAULT 'GENERAL',
+            summary TEXT NOT NULL DEFAULT '',
+            objective TEXT NOT NULL DEFAULT '',
+            prerequisites_json TEXT NOT NULL DEFAULT '[]',
+            steps_json TEXT NOT NULL DEFAULT '[]',
+            checklist_json TEXT NOT NULL DEFAULT '[]',
+            notes_markdown TEXT NOT NULL DEFAULT '',
+            markdown_content TEXT NOT NULL DEFAULT '',
+            bpmn_xml TEXT NOT NULL DEFAULT '',
+            parent_method_id TEXT,
+            parent_element_id TEXT,
+            version INTEGER NOT NULL DEFAULT 1,
+            archived_path TEXT NOT NULL DEFAULT '',
+            bpmn_file_path TEXT NOT NULL DEFAULT '',
+            source_refs_json TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_methods_playbooks_project ON methods_playbooks(project_id);
+        CREATE INDEX IF NOT EXISTS idx_methods_playbooks_slug ON methods_playbooks(project_id, slug);
+
+        -- 8. Legacy Memory Reprocessing Audit History
+        CREATE TABLE IF NOT EXISTS legacy_reprocess_history (
+            source_kind TEXT NOT NULL,
+            source_id INTEGER NOT NULL,
+            project_id TEXT NOT NULL,
+            reprocessed_at TEXT NOT NULL,
+            extracted_summary TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (source_kind, source_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_legacy_reprocess_project ON legacy_reprocess_history(project_id);
         ",
     )?;
 
@@ -299,6 +337,12 @@ pub fn init_database(db_path: &Path, default_vault_root: &Path) -> Result<Connec
         "chat_messages",
         "session_id",
         "ALTER TABLE chat_messages ADD COLUMN session_id TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column_exists(
+        &conn,
+        "chat_messages",
+        "written_artifacts_json",
+        "ALTER TABLE chat_messages ADD COLUMN written_artifacts_json TEXT NOT NULL DEFAULT '[]'",
     )?;
 
     // Projects alterations

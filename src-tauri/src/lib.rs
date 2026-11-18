@@ -3,9 +3,29 @@ pub mod file_extractor;
 pub mod llm;
 pub mod mab_focus_sync;
 pub mod mcp_tools;
+pub mod method_engine;
 pub mod models;
 pub mod projector;
 pub mod vault_manager;
+
+fn merge_written_artifacts(
+    mcp_arts: &[models::WrittenArtifactRef],
+    env_arts: &[models::WrittenArtifactRef],
+    extra: Vec<models::WrittenArtifactRef>,
+) -> Vec<models::WrittenArtifactRef> {
+    let mut out: Vec<models::WrittenArtifactRef> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for art in mcp_arts.iter().chain(env_arts.iter()).chain(extra.iter()) {
+        if art.title.trim().is_empty() {
+            continue;
+        }
+        let key = format!("{}::{}", art.artifact_type, art.entity_id);
+        if seen.insert(key) {
+            out.push(art.clone());
+        }
+    }
+    out
+}
 
 fn format_turn_badge(mcp_ops: &[String], envelope_badge: &str, transport_label: &str) -> String {
     if !mcp_ops.is_empty() {
@@ -255,6 +275,7 @@ async fn cmd_run_assistant_turn(
         active_decisions,
         active_sops,
         knowledge_docs,
+        methods_playbooks,
         copilot_history,
         vault_history,
         fts_hits,
@@ -282,6 +303,7 @@ async fn cmd_run_assistant_turn(
             d.active_decisions.clone(),
             d.active_sops.clone(),
             d.knowledge_docs.clone(),
+            d.methods_playbooks.clone(),
             filtered_copilot,
             filtered_vault,
             hits,
@@ -313,7 +335,7 @@ async fn cmd_run_assistant_turn(
         )
     };
 
-    let (mcp_sys_prompt, mcp_user_prompt) = build_mcp_tool_turn_prompts(
+    let (mcp_sys_prompt, mcp_user_prompt) = build_mcp_tool_turn_prompts_with_methods(
         &pid,
         &norm_ch,
         &message_text,
@@ -322,8 +344,10 @@ async fn cmd_run_assistant_turn(
         &active_decisions,
         &active_sops,
         &knowledge_docs,
+        &methods_playbooks,
         &fts_hits,
         None,
+        false,
     );
 
     let llm_cfg = LlmConfig::from(&settings);
@@ -348,23 +372,45 @@ async fn cmd_run_assistant_turn(
         Ok(turn) => {
             let envelope = turn.envelope;
             let mut conn = state.db.lock().map_err(|e| e.to_string())?;
-            let env_badge = if !envelope.mutations.is_empty() || turn.mcp_ops_executed.is_empty() {
-                apply_copilot_envelope_with_event(
-                    &mut conn,
-                    &pid,
-                    &message_text,
-                    Some(&archived_path),
-                    source_origin,
-                    &envelope,
-                    raw_event_id,
-                )
-                .map_err(|e| e.to_string())?
-            } else {
-                "بدون تغییر گراف".to_string()
-            };
+            let (env_badge, env_artifacts) =
+                if !envelope.mutations.is_empty()
+                    || !envelope.method_playbooks.is_empty()
+                    || turn.mcp_ops_executed.is_empty()
+                {
+                    apply_copilot_envelope_with_artifacts(
+                        &mut conn,
+                        &pid,
+                        &message_text,
+                        Some(&archived_path),
+                        source_origin,
+                        &envelope,
+                        raw_event_id,
+                    )
+                    .map_err(|e| e.to_string())?
+                } else {
+                    ("بدون تغییر گراف".to_string(), Vec::new())
+                };
             let badge = format_turn_badge(&turn.mcp_ops_executed, &env_badge, &turn.transport_label);
 
-            append_assistant_chat_message(
+            let mut extra_artifacts: Vec<WrittenArtifactRef> = Vec::new();
+            if let (Some(mtitle), Some(mbody)) = (
+                envelope.meeting_title.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+                envelope.meeting_summary_markdown.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+            ) {
+                extra_artifacts.push(WrittenArtifactRef {
+                    artifact_type: "MEETING_MINUTES".to_string(),
+                    entity_id: format!("MTG-{}", mtitle.chars().take(24).collect::<String>()),
+                    title: mtitle.to_string(),
+                    summary: mbody.chars().take(160).collect(),
+                    file_path: None,
+                    action: "CREATED".to_string(),
+                    version: None,
+                });
+            }
+            let written_artifacts =
+                merge_written_artifacts(&turn.mcp_written_artifacts, &env_artifacts, extra_artifacts);
+
+            append_assistant_chat_message_with_artifacts(
                 &conn,
                 &pid,
                 &session_id,
@@ -374,6 +420,7 @@ async fn cmd_run_assistant_turn(
                 Some(&archived_path),
                 &badge,
                 &envelope.clarifying_questions,
+                &written_artifacts,
             )
             .map_err(|e| e.to_string())?;
 
@@ -471,6 +518,7 @@ async fn cmd_retry_system_message(
         active_decisions,
         active_sops,
         knowledge_docs,
+        methods_playbooks,
         copilot_history,
         vault_history,
         fts_hits,
@@ -517,6 +565,7 @@ async fn cmd_retry_system_message(
             d.active_decisions.clone(),
             d.active_sops.clone(),
             d.knowledge_docs.clone(),
+            d.methods_playbooks.clone(),
             filtered_copilot,
             filtered_vault,
             hits,
@@ -577,7 +626,7 @@ async fn cmd_retry_system_message(
         .as_ref()
         .map(|(t, dt, f)| (t.as_str(), dt.as_str(), f.as_str()));
 
-    let (mcp_sys_prompt, mcp_user_prompt) = build_mcp_tool_turn_prompts(
+    let (mcp_sys_prompt, mcp_user_prompt) = build_mcp_tool_turn_prompts_with_methods(
         &ctx.project_id,
         &ctx.channel,
         &recovered_text,
@@ -586,8 +635,10 @@ async fn cmd_retry_system_message(
         &active_decisions,
         &active_sops,
         &knowledge_docs,
+        &methods_playbooks,
         &fts_hits,
         doc_meta_ref,
+        false,
     );
 
     let llm_cfg = LlmConfig::from(&settings);
@@ -614,20 +665,24 @@ async fn cmd_retry_system_message(
         Ok(turn) => {
             let envelope = turn.envelope;
             let mut conn = state.db.lock().map_err(|e| e.to_string())?;
-            let env_badge = if !envelope.mutations.is_empty() || turn.mcp_ops_executed.is_empty() {
-                apply_copilot_envelope_with_event(
-                    &mut conn,
-                    &ctx.project_id,
-                    &recovered_text,
-                    ctx.user_archived_path.as_deref(),
-                    source_origin,
-                    &envelope,
-                    ctx.raw_event_id,
-                )
-                .map_err(|e| e.to_string())?
-            } else {
-                "بدون تغییر گراف".to_string()
-            };
+            let (env_badge, env_artifacts) =
+                if !envelope.mutations.is_empty()
+                    || !envelope.method_playbooks.is_empty()
+                    || turn.mcp_ops_executed.is_empty()
+                {
+                    apply_copilot_envelope_with_artifacts(
+                        &mut conn,
+                        &ctx.project_id,
+                        &recovered_text,
+                        ctx.user_archived_path.as_deref(),
+                        source_origin,
+                        &envelope,
+                        ctx.raw_event_id,
+                    )
+                    .map_err(|e| e.to_string())?
+                } else {
+                    ("بدون تغییر گراف".to_string(), Vec::new())
+                };
             let badge = format_turn_badge(&turn.mcp_ops_executed, &env_badge, &turn.transport_label);
 
             let items_count = (envelope.mutations.len() + turn.mcp_ops_executed.len()) as i32;
@@ -637,12 +692,14 @@ async fn cmd_retry_system_message(
                 ctx.system_archived_path.as_deref(),
                 &ctx.user_message_text,
             );
+            let mut extra_artifacts: Vec<WrittenArtifactRef> = Vec::new();
             if let Some(doc_id) = matched_doc_id {
                 let new_summary = envelope
                     .executive_doc_summary
                     .clone()
                     .filter(|s| !s.trim().is_empty())
                     .unwrap_or_else(|| envelope.conversational_reply.clone());
+                let doc_title_opt = get_knowledge_document_by_id(&conn, doc_id).map(|d| d.title);
                 let new_kp = get_knowledge_document_by_id(&conn, doc_id).and_then(|doc| {
                     let dash_proj = get_dashboard_state_for_project(&conn, Some(&ctx.project_id)).ok()?;
                     archive_onboarding_document(
@@ -660,11 +717,22 @@ async fn cmd_retry_system_message(
                     items_count,
                     new_kp.as_deref(),
                 );
+                extra_artifacts.push(WrittenArtifactRef {
+                    artifact_type: "KNOWLEDGE_DOC".to_string(),
+                    entity_id: doc_id.to_string(),
+                    title: doc_title_opt.unwrap_or_else(|| "سند آرشیو دانش".to_string()),
+                    summary: new_summary.chars().take(180).collect(),
+                    file_path: new_kp,
+                    action: "UPDATED".to_string(),
+                    version: None,
+                });
             }
 
             let _ = delete_system_chat_message(&conn, system_message_id);
+            let written_artifacts =
+                merge_written_artifacts(&turn.mcp_written_artifacts, &env_artifacts, extra_artifacts);
 
-            append_assistant_chat_message(
+            append_assistant_chat_message_with_artifacts(
                 &conn,
                 &ctx.project_id,
                 &ctx.session_id,
@@ -674,6 +742,7 @@ async fn cmd_retry_system_message(
                 ctx.user_archived_path.as_deref(),
                 &badge,
                 &envelope.clarifying_questions,
+                &written_artifacts,
             )
             .map_err(|e| e.to_string())?;
 
@@ -978,6 +1047,7 @@ async fn cmd_run_file_assistant_turn(
         active_decisions,
         active_sops,
         knowledge_docs,
+        methods_playbooks,
         copilot_history,
         vault_history,
         resolved_kdoc_id,
@@ -1016,6 +1086,7 @@ async fn cmd_run_file_assistant_turn(
             d.active_decisions.clone(),
             d.active_sops.clone(),
             d.knowledge_docs.clone(),
+            d.methods_playbooks.clone(),
             filtered_copilot,
             filtered_vault,
             resolved_doc,
@@ -1047,7 +1118,7 @@ async fn cmd_run_file_assistant_turn(
         )
     };
 
-    let (mcp_sys_prompt, mcp_user_prompt) = build_mcp_tool_turn_prompts(
+    let (mcp_sys_prompt, mcp_user_prompt) = build_mcp_tool_turn_prompts_with_methods(
         &pid,
         &norm_ch,
         if norm_ch == "VAULT" { &extracted_text } else { &combined_prompt_text },
@@ -1056,8 +1127,10 @@ async fn cmd_run_file_assistant_turn(
         &active_decisions,
         &active_sops,
         &knowledge_docs,
+        &methods_playbooks,
         &[],
         Some((&effective_title, &doc_type, &effective_filename)),
+        false,
     );
 
     let llm_cfg = LlmConfig::from(&settings);
@@ -1091,21 +1164,25 @@ async fn cmd_run_file_assistant_turn(
             )?;
 
             let mut conn = state.db.lock().map_err(|e| e.to_string())?;
-            let items_count = (envelope.mutations.len() + turn.mcp_ops_executed.len()) as i32;
-            let env_badge = if !envelope.mutations.is_empty() || turn.mcp_ops_executed.is_empty() {
-                apply_copilot_envelope_with_event(
-                    &mut conn,
-                    &pid,
-                    &combined_prompt_text,
-                    Some(&knowledge_path),
-                    source_origin,
-                    &envelope,
-                    Some(raw_event_id),
-                )
-                .map_err(|e| e.to_string())?
-            } else {
-                "بدون تغییر گراف".to_string()
-            };
+            let items_count = (envelope.mutations.len() + envelope.method_playbooks.len() + turn.mcp_ops_executed.len()) as i32;
+            let (env_badge, env_artifacts) =
+                if !envelope.mutations.is_empty()
+                    || !envelope.method_playbooks.is_empty()
+                    || turn.mcp_ops_executed.is_empty()
+                {
+                    apply_copilot_envelope_with_artifacts(
+                        &mut conn,
+                        &pid,
+                        &combined_prompt_text,
+                        Some(&knowledge_path),
+                        source_origin,
+                        &envelope,
+                        Some(raw_event_id),
+                    )
+                    .map_err(|e| e.to_string())?
+                } else {
+                    ("بدون تغییر گراف".to_string(), Vec::new())
+                };
             let badge = format_turn_badge(&turn.mcp_ops_executed, &env_badge, &turn.transport_label);
 
             let inserted_doc_id = if let Some(did) = resolved_kdoc_id {
@@ -1132,7 +1209,35 @@ async fn cmd_run_file_assistant_turn(
                 .ok()
             };
 
-            append_assistant_chat_message(
+            let mut extra_artifacts = vec![WrittenArtifactRef {
+                artifact_type: "KNOWLEDGE_DOC".to_string(),
+                entity_id: inserted_doc_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| effective_title.clone()),
+                title: effective_title.clone(),
+                summary: summary.chars().take(180).collect(),
+                file_path: Some(knowledge_path.clone()),
+                action: "CREATED".to_string(),
+                version: None,
+            }];
+            if let (Some(mtitle), Some(mbody)) = (
+                envelope.meeting_title.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+                envelope.meeting_summary_markdown.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+            ) {
+                extra_artifacts.push(WrittenArtifactRef {
+                    artifact_type: "MEETING_MINUTES".to_string(),
+                    entity_id: format!("MTG-{}", mtitle.chars().take(24).collect::<String>()),
+                    title: mtitle.to_string(),
+                    summary: mbody.chars().take(160).collect(),
+                    file_path: None,
+                    action: "CREATED".to_string(),
+                    version: None,
+                });
+            }
+            let written_artifacts =
+                merge_written_artifacts(&turn.mcp_written_artifacts, &env_artifacts, extra_artifacts);
+
+            append_assistant_chat_message_with_artifacts(
                 &conn,
                 &pid,
                 &session_id,
@@ -1142,6 +1247,7 @@ async fn cmd_run_file_assistant_turn(
                 Some(&knowledge_path),
                 &badge,
                 &envelope.clarifying_questions,
+                &written_artifacts,
             )
             .map_err(|e| e.to_string())?;
 
@@ -1537,6 +1643,14 @@ async fn cmd_process_pending_queue_item(
             });
         }
 
+        let doc_row_before = item
+            .knowledge_doc_id
+            .and_then(|did| get_knowledge_document_by_id(&conn, did));
+        let was_doc_already_processed = doc_row_before
+            .as_ref()
+            .map(|d| d.processing_status.eq_ignore_ascii_case("PROCESSED"))
+            .unwrap_or(false);
+
         let _ = set_pending_item_processing(&conn, queue_id);
         if let Some(doc_id) = item.knowledge_doc_id {
             let _ = set_knowledge_doc_processing_status(&conn, doc_id, "PROCESSING", None, None, None);
@@ -1550,9 +1664,7 @@ async fn cmd_process_pending_queue_item(
         let user_row = item
             .user_message_id
             .and_then(|uid| get_user_chat_message_by_id(&conn, uid));
-        let doc_row = item
-            .knowledge_doc_id
-            .and_then(|did| get_knowledge_document_by_id(&conn, did));
+        let doc_row = doc_row_before;
 
         let read_archived = |path_str: &str| -> Option<String> {
             let raw = fs::read_to_string(path_str).ok()?;
@@ -1626,6 +1738,7 @@ async fn cmd_process_pending_queue_item(
             target_dash,
             raw_row,
             doc_row,
+            was_doc_already_processed,
             recovered_text,
             copilot_history,
             vault_history,
@@ -1639,6 +1752,7 @@ async fn cmd_process_pending_queue_item(
         target_dash,
         raw_row,
         doc_row,
+        was_doc_already_processed,
         recovered_text,
         copilot_history,
         vault_history,
@@ -1646,10 +1760,15 @@ async fn cmd_process_pending_queue_item(
     ) = prep;
 
     let norm_ch = normalize_chat_channel(&item.channel).to_string();
-    let source_origin = raw_row
-        .as_ref()
-        .map(|(st, _)| st.clone())
-        .unwrap_or_else(|| item.source_type.clone());
+    let is_legacy_reprocess = item.source_type.starts_with("LEGACY_REPROCESS");
+    let source_origin = if is_legacy_reprocess {
+        item.source_type.clone()
+    } else {
+        raw_row
+            .as_ref()
+            .map(|(st, _)| st.clone())
+            .unwrap_or_else(|| item.source_type.clone())
+    };
     let is_doc_turn = doc_row.is_some()
         || source_origin == "DOC_ONBOARDING"
         || source_origin == "COPILOT_FILE";
@@ -1675,7 +1794,17 @@ async fn cmd_process_pending_queue_item(
         .as_ref()
         .map(|(t, dt, f)| (t.as_str(), dt.as_str(), f.as_str()));
 
-    let prompt = if let Some((ref t, ref dt, ref f)) = doc_meta_owned {
+    let prompt = if is_legacy_reprocess {
+        build_legacy_reprocess_prompt(
+            &item.project_id,
+            &item.title_preview,
+            &recovered_text,
+            &target_dash.open_tasks,
+            &target_dash.active_decisions,
+            &target_dash.active_sops,
+            &target_dash.methods_playbooks,
+        )
+    } else if let Some((ref t, ref dt, ref f)) = doc_meta_owned {
         if norm_ch == "VAULT" {
             build_document_onboarding_prompt(
                 &item.project_id,
@@ -1725,7 +1854,7 @@ async fn cmd_process_pending_queue_item(
         )
     };
 
-    let (mcp_sys_prompt, mcp_user_prompt) = build_mcp_tool_turn_prompts(
+    let (mcp_sys_prompt, mcp_user_prompt) = build_mcp_tool_turn_prompts_with_methods(
         &item.project_id,
         &norm_ch,
         &recovered_text,
@@ -1738,8 +1867,10 @@ async fn cmd_process_pending_queue_item(
         &target_dash.active_decisions,
         &target_dash.active_sops,
         &target_dash.knowledge_docs,
+        &target_dash.methods_playbooks,
         &fts_hits,
         doc_meta_ref,
+        is_legacy_reprocess,
     );
 
     let llm_cfg = LlmConfig::from(&target_dash.settings);
@@ -1759,24 +1890,29 @@ async fn cmd_process_pending_queue_item(
         Ok(turn) => {
             let envelope = turn.envelope;
             let mut conn = state.db.lock().map_err(|e| e.to_string())?;
-            let env_badge = if !envelope.mutations.is_empty() || turn.mcp_ops_executed.is_empty() {
-                apply_copilot_envelope_with_event(
-                    &mut conn,
-                    &item.project_id,
-                    &recovered_text,
-                    item.archived_path.as_deref(),
-                    &source_origin,
-                    &envelope,
-                    item.raw_event_id,
-                )
-                .map_err(|e| e.to_string())?
-            } else {
-                "بدون تغییر گراف".to_string()
-            };
+            let (env_badge, env_artifacts) =
+                if !envelope.mutations.is_empty()
+                    || !envelope.method_playbooks.is_empty()
+                    || turn.mcp_ops_executed.is_empty()
+                {
+                    apply_copilot_envelope_with_artifacts(
+                        &mut conn,
+                        &item.project_id,
+                        &recovered_text,
+                        item.archived_path.as_deref(),
+                        &source_origin,
+                        &envelope,
+                        item.raw_event_id,
+                    )
+                    .map_err(|e| e.to_string())?
+                } else {
+                    ("بدون تغییر گراف".to_string(), Vec::new())
+                };
             let badge =
                 format_turn_badge(&turn.mcp_ops_executed, &env_badge, &turn.transport_label);
 
-            let items_count = (envelope.mutations.len() + turn.mcp_ops_executed.len()) as i32;
+            let items_count = (envelope.mutations.len() + envelope.method_playbooks.len() + turn.mcp_ops_executed.len()) as i32;
+            let mut extra_artifacts: Vec<WrittenArtifactRef> = Vec::new();
             if let Some(doc_id) = item.knowledge_doc_id {
                 let summary = envelope
                     .executive_doc_summary
@@ -1787,27 +1923,71 @@ async fn cmd_process_pending_queue_item(
                     .as_ref()
                     .map(|d| d.title.as_str())
                     .unwrap_or("سند پردازش‌شده");
-                let new_kp = archive_onboarding_document(
-                    &target_dash.active_project.workspace_path,
-                    title_for_doc,
-                    &recovered_text,
-                    &summary,
-                )
-                .ok();
-                let _ = update_knowledge_doc_analysis(
-                    &conn,
-                    doc_id,
-                    &summary,
-                    items_count,
-                    new_kp.as_deref(),
-                );
+                let new_kp = if is_legacy_reprocess {
+                    doc_row.as_ref().map(|d| d.archived_path.clone())
+                } else {
+                    archive_onboarding_document(
+                        &target_dash.active_project.workspace_path,
+                        title_for_doc,
+                        &recovered_text,
+                        &summary,
+                    )
+                    .ok()
+                };
+                if !is_legacy_reprocess {
+                    let _ = update_knowledge_doc_analysis(
+                        &conn,
+                        doc_id,
+                        &summary,
+                        items_count,
+                        new_kp.as_deref(),
+                    );
+                    extra_artifacts.push(WrittenArtifactRef {
+                        artifact_type: "KNOWLEDGE_DOC".to_string(),
+                        entity_id: doc_id.to_string(),
+                        title: title_for_doc.to_string(),
+                        summary: summary.chars().take(180).collect(),
+                        file_path: new_kp,
+                        action: "UPDATED".to_string(),
+                        version: None,
+                    });
+                } else {
+                    let _ = set_knowledge_doc_processing_status(
+                        &conn,
+                        doc_id,
+                        "PROCESSED",
+                        None,
+                        None,
+                        None,
+                    );
+                    let _ = method_engine::mark_legacy_reprocessed(
+                        &conn,
+                        "KNOWLEDGE_DOC",
+                        doc_id,
+                        &item.project_id,
+                        &badge,
+                    );
+                }
+            } else if is_legacy_reprocess {
+                if let Some(eid) = item.raw_event_id {
+                    let _ = method_engine::mark_legacy_reprocessed(
+                        &conn,
+                        "RAW_EVENT",
+                        eid,
+                        &item.project_id,
+                        &badge,
+                    );
+                }
             }
 
             if let Some(sys_id) = item.system_message_id {
                 let _ = delete_system_chat_message(&conn, sys_id);
             }
 
-            append_assistant_chat_message(
+            let written_artifacts =
+                merge_written_artifacts(&turn.mcp_written_artifacts, &env_artifacts, extra_artifacts);
+
+            append_assistant_chat_message_with_artifacts(
                 &conn,
                 &item.project_id,
                 &effective_session_id,
@@ -1817,6 +1997,7 @@ async fn cmd_process_pending_queue_item(
                 item.archived_path.as_deref(),
                 &badge,
                 &envelope.clarifying_questions,
+                &written_artifacts,
             )
             .map_err(|e| e.to_string())?;
 
@@ -1844,7 +2025,19 @@ async fn cmd_process_pending_queue_item(
             let conn = state.db.lock().map_err(|e| e.to_string())?;
             let _ = record_pending_item_failure(&conn, queue_id, &err);
             if let Some(doc_id) = item.knowledge_doc_id {
-                let _ = set_knowledge_doc_processing_status(&conn, doc_id, "FAILED", None, None, None);
+                let restore_status = if is_legacy_reprocess && was_doc_already_processed {
+                    "PROCESSED"
+                } else {
+                    "FAILED"
+                };
+                let _ = set_knowledge_doc_processing_status(
+                    &conn,
+                    doc_id,
+                    restore_status,
+                    None,
+                    None,
+                    None,
+                );
             }
             if let Some(sys_id) = item.system_message_id {
                 let notice = format!(
@@ -2245,6 +2438,120 @@ fn cmd_query_tasks_by_context(
     .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+fn cmd_upsert_method_playbook(
+    state: State<'_, AppState>,
+    input: MethodPlaybookInput,
+) -> Result<DashboardState, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let dash = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
+    method_engine::upsert_method_playbook(
+        &conn,
+        &dash.active_project.id,
+        &dash.active_project.workspace_path,
+        input,
+        Some("manual_ui"),
+    )?;
+    get_dashboard_state(&conn).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn cmd_delete_method_playbook(
+    state: State<'_, AppState>,
+    method_id: String,
+) -> Result<DashboardState, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    method_engine::delete_method_playbook(&conn, &method_id).map_err(|e| e.to_string())?;
+    get_dashboard_state(&conn).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn cmd_read_workspace_file(
+    state: State<'_, AppState>,
+    file_path: String,
+) -> Result<String, String> {
+    let trimmed = file_path.trim();
+    if trimmed.is_empty() {
+        return Err("مسیر فایل خالی است.".into());
+    }
+    let requested = PathBuf::from(trimmed);
+    let canonical_req = fs::canonicalize(&requested)
+        .map_err(|e| format!("فایل در مسیر مشخص‌شده یافت نشد: {}", e))?;
+
+    let allowed_roots: Vec<PathBuf> = {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        let dash = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
+        let mut roots = Vec::new();
+        if !dash.settings.vault_root_path.trim().is_empty() {
+            if let Ok(c) = fs::canonicalize(&dash.settings.vault_root_path) {
+                roots.push(c);
+            }
+        }
+        for p in &dash.projects {
+            if !p.workspace_path.trim().is_empty() {
+                if let Ok(c) = fs::canonicalize(&p.workspace_path) {
+                    roots.push(c);
+                }
+            }
+        }
+        roots
+    };
+
+    if !allowed_roots.iter().any(|r| canonical_req.starts_with(r)) {
+        return Err("دسترسی به فایل خارج از پوشه‌های Vault پروژه مجاز نیست.".into());
+    }
+
+    fs::read_to_string(&canonical_req).map_err(|e| format!("خطا در خواندن فایل: {}", e))
+}
+
+#[tauri::command]
+fn cmd_list_legacy_reprocess_candidates(
+    state: State<'_, AppState>,
+) -> Result<Vec<LegacyReprocessCandidate>, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let dash = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
+    method_engine::list_legacy_reprocess_candidates(&conn, &dash.active_project.id)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn cmd_backup_database_now(
+    state: State<'_, AppState>,
+) -> Result<DatabaseBackupResult, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let backup_dir = state.app_data_dir.join("backups");
+    method_engine::backup_sqlite_database(&conn, &backup_dir)
+}
+
+#[tauri::command]
+fn cmd_enqueue_legacy_reprocess(
+    state: State<'_, AppState>,
+    mode: String,
+    selected_items: Vec<LegacyReprocessSelection>,
+) -> Result<LegacyReprocessEnqueueResult, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let dash = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
+
+    // Mandatory automatic SQLite backup BEFORE enqueueing legacy reprocessing!
+    let backup_dir = state.app_data_dir.join("backups");
+    let backup = method_engine::backup_sqlite_database(&conn, &backup_dir)?;
+
+    let enqueued_count = method_engine::enqueue_legacy_reprocess(
+        &conn,
+        &dash.active_project.id,
+        &mode,
+        &selected_items,
+    )?;
+
+    let updated = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
+    Ok(LegacyReprocessEnqueueResult {
+        backup_path: backup.backup_path,
+        backup_size_bytes: backup.backup_size_bytes,
+        enqueued_count,
+        dashboard: updated,
+    })
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -2323,7 +2630,13 @@ pub fn run() {
             cmd_create_personal_vault_item,
             cmd_delete_personal_vault_item,
             cmd_resolve_pending_proposal,
-            cmd_upsert_calendar_day
+            cmd_upsert_calendar_day,
+            cmd_upsert_method_playbook,
+            cmd_delete_method_playbook,
+            cmd_read_workspace_file,
+            cmd_list_legacy_reprocess_candidates,
+            cmd_backup_database_now,
+            cmd_enqueue_legacy_reprocess
         ])
         .run(tauri::generate_context!())
         .expect("Error running Mab-Compass Tauri v2 application");
