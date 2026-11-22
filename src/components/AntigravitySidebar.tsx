@@ -12,6 +12,7 @@ import {
   MessageSquarePlus,
   Plus,
   Settings,
+  Terminal,
   Trash2,
   Workflow,
 } from "lucide-react";
@@ -23,7 +24,8 @@ export type BuiltinCanvasViewId =
   | "WBS"
   | "KNOWLEDGE_ARCHIVE"
   | "ECOSYSTEM_CARDS"
-  | "SETTINGS";
+  | "SETTINGS"
+  | "LOGS";
 
 interface AntigravitySidebarProps {
   dash: DashboardState;
@@ -370,8 +372,26 @@ export function AntigravitySidebar({
           </div>
         </div>
 
-        {/* Bottom Footer (Exact Antigravity bottom-left Settings + subtle memory count) */}
+        {/* Bottom Footer (Settings & System Logs + subtle memory count) */}
         <div className="p-2 border-t border-white/[0.06] space-y-1 shrink-0">
+          <button
+            type="button"
+            onClick={() => handleSelectQuickLink("LOGS")}
+            className={`w-full px-2.5 py-1.5 rounded-lg text-[12.5px] flex items-center justify-between transition ${
+              activeCanvasTabId === "LOGS"
+                ? "bg-white/[0.09] text-white font-medium"
+                : "text-[#9CA3AF] hover:bg-white/[0.04] hover:text-white"
+            }`}
+          >
+            <span className="flex items-center gap-2.5">
+              <Terminal className="w-3.5 h-3.5 text-blue-400" />
+              <span dir="rtl">لاگ‌های سیستم</span>
+            </span>
+            <span className="font-mono text-[10px] text-blue-400/80 bg-blue-500/10 px-1.5 py-0.5 rounded">
+              Logs
+            </span>
+          </button>
+
           <button
             type="button"
             onClick={() => handleSelectQuickLink("SETTINGS")}

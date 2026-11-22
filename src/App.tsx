@@ -35,6 +35,7 @@ import {
   ManualTaskPayload,
   TaskAssignPayload,
 } from "./components/TaskModal";
+import { addAppLog } from "./lib/logStore";
 
 const BUILTIN_TAB_TITLES: Record<BuiltinCanvasViewId, string> = {
   PATH_AHEAD: "مسیر پیش‌رو",
@@ -43,6 +44,7 @@ const BUILTIN_TAB_TITLES: Record<BuiltinCanvasViewId, string> = {
   KNOWLEDGE_ARCHIVE: "اسناد و بازپردازش",
   ECOSYSTEM_CARDS: "اهداف و کارت‌ها",
   SETTINGS: "تنظیمات",
+  LOGS: "لاگ‌های سیستم",
 };
 
 export default function App() {
@@ -259,8 +261,14 @@ export default function App() {
     try {
       const st = await CompassApi.checkLlmConnection();
       setConnectionStatus(st);
+      if (st.connected) {
+        addAppLog("SUCCESS", "LLM", `ارتباط با مدل برقرار است: ${st.provider} (${st.model})`, st.message);
+      } else {
+        addAppLog("WARN", "LLM", `عدم دسترسی به مدل: ${st.provider}`, st.message);
+      }
       return st;
-    } catch {
+    } catch (err: unknown) {
+      addAppLog("ERROR", "LLM", "خطا در تست اتصال هوش مصنوعی", String(err));
       return null;
     } finally {
       setIsCheckingConnection(false);
@@ -420,12 +428,23 @@ export default function App() {
           const nextItem = latestDash.pending_queue[0];
           if (!nextItem) break;
 
+          addAppLog(
+            "INFO",
+            "QUEUE",
+            `آغاز پردازش نوبتی مورد ${nextItem.id} از صف: «${nextItem.title_preview}»`
+          );
           setProcessingQueueId(nextItem.id);
           const outcome = await CompassApi.processPendingQueueItem(nextItem.id);
           setDash(outcome.dashboard);
           setProcessingQueueId(null);
 
           if (outcome.error) {
+            addAppLog(
+              "ERROR",
+              "QUEUE",
+              `توقف پردازش مورد «${nextItem.title_preview}»`,
+              outcome.error
+            );
             setCooldownUntil(Date.now() + 45_000);
             void refreshConnection();
             showToast(
@@ -435,6 +454,11 @@ export default function App() {
           }
 
           if (outcome.processed) {
+            addAppLog(
+              "SUCCESS",
+              "QUEUE",
+              `مورد «${nextItem.title_preview}» با موفقیت توسط مدل پردازش و ثبت شد.`
+            );
             processedCount += 1;
           } else {
             break;
@@ -445,6 +469,7 @@ export default function App() {
           showToast(`${processedCount} مورد از صف با موفقیت توسط مدل تحلیل و ثبت شد.`);
         }
       } catch (e: unknown) {
+        addAppLog("ERROR", "QUEUE", "خطای پیش‌بینی‌نشده در پردازش صف", String(e));
         setCooldownUntil(Date.now() + 45_000);
         showToast(`خطا در پردازش صف انتظار: ${String(e)}`);
       } finally {
@@ -473,17 +498,6 @@ export default function App() {
     runQueueDrain,
     dash,
   ]);
-
-  // Periodic connectivity poll when queue has pending items
-  useEffect(() => {
-    if (!dash || dash.pending_queue.length === 0) return;
-    const id = window.setInterval(() => {
-      if (document.visibilityState !== "visible") return;
-      if (queueRunningRef.current || isUserBusyRef.current) return;
-      void refreshConnection();
-    }, 20_000);
-    return () => window.clearInterval(id);
-  }, [dash?.pending_queue.length, refreshConnection, dash]);
 
   // Auto refresh when external MCP process mutates SQLite
   useEffect(() => {
@@ -964,10 +978,26 @@ export default function App() {
       setSettingsForm(d.settings);
       setCooldownUntil(0);
       showToast("تنظیمات با موفقیت ذخیره شد.");
+      addAppLog("INFO", "SYSTEM", `تنظیمات با موفقیت ذخیره شد (ارائه‌دهنده: ${target.active_llm_provider})`);
       void refreshConnection();
     } catch (e: unknown) {
+      addAppLog("ERROR", "SYSTEM", "خطا در ذخیره تنظیمات", String(e));
       showToast(`خطا در ذخیره تنظیمات: ${String(e)}`);
     }
+  };
+
+  const handleQuickChangeModel = async (provider: string, modelId: string, label: string) => {
+    if (!settingsForm) return;
+    const next: AppSettings = {
+      ...settingsForm,
+      active_llm_provider: provider,
+      ...(provider === "AGY_CLI" ? { agy_model: modelId } : {}),
+      ...(provider === "LOCAL_OPENAI" ? { local_model: modelId } : {}),
+      ...(provider === "GEMINI_REST" ? { gemini_model: modelId } : {}),
+    };
+    addAppLog("INFO", "LLM", `تغییر سریع مدل به «${label}» (${provider} / ${modelId})`);
+    showToast(`مدل فعال به «${label}» تغییر کرد.`);
+    await handleSaveSettings(next);
   };
 
   const handleRequeueDoc = async (docId: number) => {
@@ -1147,6 +1177,7 @@ export default function App() {
         onUndo={() => void handleUndo()}
         onSyncMabFocus={() => void handleSyncMabFocus()}
         onExportExcel={() => void handleExportExcel()}
+        onOpenLogs={() => openBuiltinView("LOGS")}
       />
 
       {/* Antigravity 3-Column LTR Workbench Body: Left Sidebar | Center Chat | Right Tabbed Canvas */}
@@ -1220,6 +1251,7 @@ export default function App() {
               onRetrySystemMessage={(id) => void handleRetrySystemMessage(id)}
               onOpenArtifactTab={openArtifactTab}
               onOpenSettingsTab={() => openBuiltinView("SETTINGS")}
+              onQuickChangeModel={(prov, mid, lbl) => void handleQuickChangeModel(prov, mid, lbl)}
               onOpenReviewTab={() => openBuiltinView("WBS")}
               connectionStatus={connectionStatus}
               isCheckingConnection={isCheckingConnection}

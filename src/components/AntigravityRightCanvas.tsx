@@ -9,6 +9,7 @@ import {
   Minimize2,
   Plus,
   Settings,
+  Terminal,
   Workflow,
   X,
 } from "lucide-react";
@@ -30,6 +31,7 @@ import { KnowledgeArchivePanel } from "./KnowledgeArchivePanel";
 import { EcosystemAndCardsView } from "./EcosystemAndCardsView";
 import { SettingsView } from "./SettingsView";
 import { ArtifactViewerTab } from "./ArtifactViewerTab";
+import { SystemLogsPanel } from "./SystemLogsPanel";
 
 export interface CanvasTab {
   id: string;
@@ -110,6 +112,8 @@ function getTabIcon(tab: CanvasTab) {
       return <Brain className="w-3.5 h-3.5 text-cyan-400 shrink-0" />;
     case "SETTINGS":
       return <Settings className="w-3.5 h-3.5 text-white/70 shrink-0" />;
+    case "LOGS":
+      return <Terminal className="w-3.5 h-3.5 text-blue-400 shrink-0" />;
     default:
       return tab.artifact?.artifact_type === "METHOD_PLAYBOOK" ||
         tab.artifact?.artifact_type === "WORK_LINE" ? (
@@ -257,6 +261,7 @@ export function AntigravityRightCanvas({
                         icon: Brain,
                       },
                       { id: "SETTINGS", label: "تنظیمات سیستم", icon: Settings },
+                      { id: "LOGS", label: "لاگ‌ها و رویدادهای سیستم", icon: Terminal },
                     ] as const
                   ).map((item) => {
                     const Icon = item.icon;
@@ -403,6 +408,8 @@ export function AntigravityRightCanvas({
               onQuickSaveSettings={(next) => onSaveSettings(next)}
             />
           </div>
+        ) : activeTab.kind === "LOGS" ? (
+          <SystemLogsPanel />
         ) : activeTab.kind === "ARTIFACT" && activeTab.artifact ? (
           <ArtifactViewerTab
             key={activeTab.id}

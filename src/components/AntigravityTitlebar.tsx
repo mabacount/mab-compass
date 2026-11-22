@@ -10,6 +10,7 @@ import {
   RefreshCw,
   RotateCcw,
   Square,
+  Terminal,
   X,
 } from "lucide-react";
 import { DashboardState, LlmConnectionStatus } from "../lib/tauri_api";
@@ -32,6 +33,7 @@ interface AntigravityTitlebarProps {
   onUndo: () => void;
   onSyncMabFocus: () => void;
   onExportExcel: () => void;
+  onOpenLogs?: () => void;
 }
 
 export function AntigravityTitlebar({
@@ -52,6 +54,7 @@ export function AntigravityTitlebar({
   onUndo,
   onSyncMabFocus,
   onExportExcel,
+  onOpenLogs,
 }: AntigravityTitlebarProps) {
   const isConnected = connectionStatus?.connected ?? false;
   const runWindowAction = (action: "minimize" | "toggleMaximize" | "close") => {
@@ -193,6 +196,17 @@ export function AntigravityTitlebar({
         >
           <FileSpreadsheet className="w-3.5 h-3.5" />
         </button>
+
+        {onOpenLogs && (
+          <button
+            type="button"
+            onClick={onOpenLogs}
+            title="مشاهده لاگ‌ها و رویدادهای سیستم"
+            className="w-7 h-7 rounded-md text-white/65 hover:text-white hover:bg-white/[0.07] flex items-center justify-center transition"
+          >
+            <Terminal className="w-3.5 h-3.5 text-blue-400" />
+          </button>
+        )}
 
         <button
           type="button"

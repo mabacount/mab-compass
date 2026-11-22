@@ -903,6 +903,106 @@ fn is_missing_agy_output(detail: &str) -> bool {
         || lower.contains("no such file or directory")
 }
 
+pub fn detect_system_proxy() -> Option<String> {
+    for var in [
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "ALL_PROXY",
+        "https_proxy",
+        "http_proxy",
+        "all_proxy",
+    ] {
+        if let Ok(val) = std::env::var(var) {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::process::Command as StdCommand;
+        // Verify ProxyEnable is set to 1 before reading ProxyServer
+        let mut enable_cmd = StdCommand::new("reg");
+        enable_cmd.args([
+            "query",
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+            "/v",
+            "ProxyEnable",
+        ]);
+        let is_enabled = if let Ok(out) = enable_cmd.output() {
+            let text = String::from_utf8_lossy(&out.stdout);
+            text.lines().any(|l| {
+                let parts: Vec<&str> = l.split_whitespace().collect();
+                parts.iter().any(|&p| p == "0x1" || p == "1")
+            })
+        } else {
+            false
+        };
+
+        if is_enabled {
+            let mut reg_cmd = StdCommand::new("reg");
+            reg_cmd.args([
+                "query",
+                r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+                "/v",
+                "ProxyServer",
+            ]);
+            if let Ok(out) = reg_cmd.output() {
+                let text = String::from_utf8_lossy(&out.stdout);
+                for line in text.lines() {
+                    if line.contains("ProxyServer") {
+                        let parts: Vec<&str> = line.split_whitespace().collect();
+                        if let Some(val) = parts.last() {
+                            let s = val.trim();
+                            if !s.is_empty() && s != "ProxyServer" && s != "REG_SZ" {
+                                let resolved = if s.contains('=') {
+                                    s.split(';')
+                                        .find(|seg| seg.starts_with("https=") || seg.starts_with("http="))
+                                        .and_then(|seg| seg.split('=').nth(1))
+                                        .unwrap_or(s)
+                                } else {
+                                    s
+                                };
+                                let proxy = if resolved.starts_with("http://")
+                                    || resolved.starts_with("https://")
+                                    || resolved.starts_with("socks5://")
+                                {
+                                    resolved.to_string()
+                                } else {
+                                    format!("http://{}", resolved)
+                                };
+                                return Some(proxy);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn apply_proxy_to_command(cmd: &mut Command) {
+    if let Some(proxy) = detect_system_proxy() {
+        cmd.env("HTTP_PROXY", &proxy)
+            .env("HTTPS_PROXY", &proxy)
+            .env("ALL_PROXY", &proxy)
+            .env("http_proxy", &proxy)
+            .env("https_proxy", &proxy)
+            .env("all_proxy", &proxy)
+            .env("NO_PROXY", "localhost,127.0.0.1,::1,127.*,*.local")
+            .env("no_proxy", "localhost,127.0.0.1,::1,127.*,*.local");
+    } else {
+        cmd.env_remove("HTTP_PROXY")
+            .env_remove("HTTPS_PROXY")
+            .env_remove("ALL_PROXY")
+            .env_remove("http_proxy")
+            .env_remove("https_proxy")
+            .env_remove("all_proxy");
+    }
+}
+
 async fn run_agy_command(args: &[&str]) -> Result<std::process::Output, String> {
     let agy_bin = resolve_agy_executable();
     let is_cmd_script = agy_bin
@@ -921,6 +1021,8 @@ async fn run_agy_command(args: &[&str]) -> Result<std::process::Output, String> 
         c
     };
 
+    apply_proxy_to_command(&mut cmd);
+
     #[cfg(target_os = "windows")]
     cmd.creation_flags(CREATE_NO_WINDOW);
 
@@ -934,6 +1036,7 @@ async fn run_agy_command(args: &[&str]) -> Result<std::process::Output, String> 
                 cmd_args.extend_from_slice(args);
                 let mut fallback = Command::new("cmd");
                 fallback.args(&cmd_args).creation_flags(CREATE_NO_WINDOW);
+                apply_proxy_to_command(&mut fallback);
                 match tokio::time::timeout(Duration::from_secs(8), fallback.output()).await {
                     Ok(Ok(out)) => Ok(out),
                     Ok(Err(err)) => Err(format_agy_not_installed_message(&err.to_string())),
@@ -1134,7 +1237,7 @@ async fn call_agy_cli(app_data_dir: PathBuf, model: &str, prompt: &str) -> Resul
         "--model".to_string(),
         model_name.to_string(),
         "--print-timeout".to_string(),
-        "120s".to_string(),
+        "600s".to_string(),
     ];
 
     let mut cmd = if is_cmd_script {
@@ -1146,6 +1249,7 @@ async fn call_agy_cli(app_data_dir: PathBuf, model: &str, prompt: &str) -> Resul
         c.args(&stream_args);
         c
     };
+    apply_proxy_to_command(&mut cmd);
     cmd.current_dir(&clean_room)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1170,6 +1274,7 @@ async fn call_agy_cli(app_data_dir: PathBuf, model: &str, prompt: &str) -> Resul
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
                     .creation_flags(CREATE_NO_WINDOW);
+                apply_proxy_to_command(&mut cmd_fallback);
                 cmd_fallback
                     .spawn()
                     .map_err(|err| format_agy_not_installed_message(&err.to_string()))?

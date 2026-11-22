@@ -26,6 +26,7 @@ import {
 import { formatShortTime } from "../lib/formatters";
 import { MarkdownRenderer } from "./ui/MarkdownRenderer";
 import { PendingQueueBanner } from "./PendingQueueBanner";
+import { QuickModelSwitcher } from "./QuickModelSwitcher";
 
 interface AntigravityChatPaneProps {
   dash: DashboardState;
@@ -42,6 +43,7 @@ interface AntigravityChatPaneProps {
   onRetrySystemMessage: (systemMessageId: number) => void;
   onOpenArtifactTab: (artifact: WrittenArtifactRef) => void;
   onOpenSettingsTab: () => void;
+  onQuickChangeModel?: (provider: string, modelId: string, modelLabel: string) => void;
   onOpenReviewTab: () => void;
   // Queue banner props
   connectionStatus: LlmConnectionStatus | null;
@@ -102,6 +104,7 @@ export function AntigravityChatPane({
   onRetrySystemMessage,
   onOpenArtifactTab,
   onOpenSettingsTab,
+  onQuickChangeModel,
   onOpenReviewTab,
   connectionStatus,
   isCheckingConnection,
@@ -125,6 +128,7 @@ export function AntigravityChatPane({
   const [isDraggingFile, setIsDraggingFile] = useState(false);
   const [showMemoryDrawer, setShowMemoryDrawer] = useState(false);
   const [showFullComposer, setShowFullComposer] = useState(false);
+  const [isModelSwitcherOpen, setIsModelSwitcherOpen] = useState(false);
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -586,15 +590,29 @@ export function AntigravityChatPane({
                 <Expand className="w-3.5 h-3.5" />
               </button>
 
-              <button
-                type="button"
-                onClick={onOpenSettingsTab}
-                title="تغییر مدل یا سرویس‌دهنده هوش مصنوعی"
-                className="px-2 py-1 rounded-lg hover:bg-white/[0.07] text-[11.5px] text-white/65 hover:text-white inline-flex items-center gap-1 transition truncate max-w-[200px]"
-              >
-                <span className="truncate font-mono text-[11px]">{activeModelLabel}</span>
-                <ChevronDown className="w-3 h-3 opacity-60 shrink-0" />
-              </button>
+              <div className="relative">
+                <button
+                  type="button"
+                  onClick={() => setIsModelSwitcherOpen((prev) => !prev)}
+                  title="تغییر سریع مدل یا سرویس‌دهنده هوش مصنوعی"
+                  className="px-2 py-1 rounded-lg hover:bg-white/[0.07] text-[11.5px] text-white/65 hover:text-white inline-flex items-center gap-1 transition truncate max-w-[200px]"
+                >
+                  <span className="truncate font-mono text-[11px]">{activeModelLabel}</span>
+                  <ChevronDown className="w-3 h-3 opacity-60 shrink-0" />
+                </button>
+
+                <QuickModelSwitcher
+                  isOpen={isModelSwitcherOpen}
+                  onClose={() => setIsModelSwitcherOpen(false)}
+                  settings={dash.settings}
+                  onSelectModel={(provider, modelId, label) => {
+                    if (onQuickChangeModel) {
+                      onQuickChangeModel(provider, modelId, label);
+                    }
+                  }}
+                  onOpenSettingsTab={onOpenSettingsTab}
+                />
+              </div>
             </div>
 
             {/* Right side: Circular Antigravity Blue Send Button */}
