@@ -12,13 +12,19 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+use tokio::sync::Mutex as TokioMutex;
 
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+/// Global sequential concurrency gate for local models (e.g. LM Studio).
+/// Guarantees that only ONE request hits the local inference engine at any time,
+/// preventing parallel requests from splitting GPU/CPU resources and triggering timeouts.
+static LOCAL_OPENAI_GATE: LazyLock<TokioMutex<()>> = LazyLock::new(|| TokioMutex::new(()));
 
 #[derive(Debug, Clone)]
 pub struct CopilotTurnResult {
@@ -191,7 +197,16 @@ pub async fn run_copilot_turn(
             .await
             {
                 Ok(res) => Ok(res),
-                Err(_tool_err) => {
+                Err(tool_err) => {
+                    let err_lower = tool_err.to_ascii_lowercase();
+                    if err_lower.contains("timed out")
+                        || err_lower.contains("timeout")
+                        || err_lower.contains("connection refused")
+                        || err_lower.contains("10061")
+                        || err_lower.contains("error sending request")
+                    {
+                        return Err(format!("خطای اتصال یا تایم‌اوت مدل لوکال: {}", tool_err));
+                    }
                     let raw = call_local_openai_structured(
                         &config.local_endpoint,
                         &config.local_model,
@@ -638,6 +653,7 @@ pub fn parse_agy_models_output(raw: &str) -> Vec<LiveModelOption> {
 
         let lower = s.to_ascii_lowercase();
         if lower.starts_with("available models")
+            || lower.starts_with("fetching")
             || lower.starts_with("usage:")
             || lower.starts_with("id ")
             || lower.starts_with("model ")
@@ -690,7 +706,8 @@ async fn fetch_lm_studio_models(local_endpoint: &str) -> LiveModelsResponse {
     };
 
     let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(6))
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
         .build()
     {
         Ok(c) => c,
@@ -1092,8 +1109,8 @@ async fn call_agy_cli(app_data_dir: PathBuf, model: &str, prompt: &str) -> Resul
     let schema_path = ensure_copilot_schema_file(&clean_room)?;
     let schema_arg = schema_path.to_string_lossy().to_string();
 
-    let model_name = if model.trim().is_empty() {
-        "Gemini 3.1 Pro (High)"
+    let model_name = if model.trim().is_empty() || model.trim() == "Gemini 3.1 Pro (High)" {
+        "gemini-3.8-flash-high"
     } else {
         model.trim()
     };
@@ -1386,9 +1403,11 @@ async fn call_local_openai_structured(
     prompt: &str,
     structured: bool,
 ) -> Result<String, String> {
+    let _gate = LOCAL_OPENAI_GATE.lock().await;
     let ep = derive_lm_studio_chat_url(endpoint)?;
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(120))
+        .no_proxy()
+        .timeout(Duration::from_secs(360))
         .build()
         .map_err(|e| e.to_string())?;
     let clean_model = model.trim();
@@ -1414,7 +1433,8 @@ async fn call_local_openai_structured(
     for rf in modes {
         let mut body = json!({
             "messages": [{ "role": "user", "content": prompt }],
-            "temperature": 0.1
+            "temperature": 0.1,
+            "max_tokens": 4096
         });
         if !clean_model.is_empty() {
             body["model"] = json!(clean_model);
@@ -1461,9 +1481,11 @@ async fn run_local_openai_mcp_turn(
     system_prompt: &str,
     user_prompt: &str,
 ) -> Result<CopilotTurnResult, String> {
+    let _gate = LOCAL_OPENAI_GATE.lock().await;
     let ep = derive_lm_studio_chat_url(endpoint)?;
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(120))
+        .no_proxy()
+        .timeout(Duration::from_secs(360))
         .build()
         .map_err(|e| e.to_string())?;
     let clean_model = model.trim();
@@ -1481,7 +1503,8 @@ async fn run_local_openai_mcp_turn(
             "messages": messages,
             "tools": tools,
             "tool_choice": "auto",
-            "temperature": 0.1
+            "temperature": 0.1,
+            "max_tokens": 4096
         });
         if !clean_model.is_empty() {
             body["model"] = json!(clean_model);

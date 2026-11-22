@@ -537,7 +537,7 @@ impl Default for AppSettings {
             mab_focus_data_path: String::new(),
             auto_sync_mab_focus: true,
             active_llm_provider: "AGY_CLI".to_string(),
-            agy_model: "Gemini 3.1 Pro (High)".to_string(),
+            agy_model: "gemini-3.8-flash-high".to_string(),
             gemini_model: "gemini-2.5-flash".to_string(),
             local_model: String::new(),
             gemini_api_key: String::new(),

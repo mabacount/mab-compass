@@ -17,7 +17,7 @@ pub fn init_database(db_path: &Path, default_vault_root: &Path) -> Result<Connec
             mab_focus_data_path TEXT NOT NULL,
             auto_sync_mab_focus INTEGER NOT NULL DEFAULT 1,
             active_llm_provider TEXT NOT NULL DEFAULT 'AGY_CLI',
-            agy_model TEXT NOT NULL DEFAULT 'Gemini 3.1 Pro (High)',
+            agy_model TEXT NOT NULL DEFAULT 'gemini-3.8-flash-high',
             gemini_model TEXT NOT NULL DEFAULT 'gemini-2.5-flash',
             local_model TEXT NOT NULL DEFAULT '',
             gemini_api_key TEXT NOT NULL DEFAULT '',
@@ -514,6 +514,14 @@ pub fn init_database(db_path: &Path, default_vault_root: &Path) -> Result<Connec
          WHERE processing_status = 'PROCESSED'
            AND (executive_summary LIKE 'متن فایل استخراج و در حافظه پروژه آرشیو شد%'
                 OR executive_summary LIKE 'در انتظار پردازش%')",
+        [],
+    );
+
+    // Migrate legacy/invalid AGY CLI model names to the current active Gemini 3.8 Flash
+    let _ = conn.execute(
+        "UPDATE app_settings
+         SET agy_model = 'gemini-3.8-flash-high'
+         WHERE agy_model = 'Gemini 3.1 Pro (High)' OR agy_model = ''",
         [],
     );
 

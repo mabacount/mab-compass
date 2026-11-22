@@ -200,12 +200,15 @@ export function SettingsView({
           </label>
           <MabSelect
             value={settingsForm.active_llm_provider}
-            onChange={(val) =>
-              onChange({
+            onChange={(val) => {
+              const next = {
                 ...settingsForm,
                 active_llm_provider: val,
-              })
-            }
+              };
+              onChange(next);
+              handleFetchModels(val);
+              onQuickSaveSettings?.(next);
+            }}
             options={LLM_PROVIDER_OPTIONS}
           />
         </div>
@@ -239,7 +242,17 @@ export function SettingsView({
 
           <MabSelect
             value={selectedModel}
-            onChange={(val) => setModelForProvider(activeProvider, val)}
+            onChange={(val) => {
+              setModelForProvider(activeProvider, val);
+              const cur = formRef.current;
+              const next =
+                activeProvider === "GEMINI_REST"
+                  ? { ...cur, gemini_model: val }
+                  : activeProvider === "LOCAL_OPENAI"
+                  ? { ...cur, local_model: val }
+                  : { ...cur, agy_model: val };
+              onQuickSaveSettings?.(next);
+            }}
             options={modelOptions}
             placeholder={
               liveModels.length === 0 && !hasSavedFallback
