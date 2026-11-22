@@ -529,8 +529,8 @@ export function AntigravityChatPane({
       </div>
 
       {/* Antigravity Elevated Bottom Composer Box */}
-      <div className="px-3.5 pb-3 pt-1.5 shrink-0 bg-[#0D0E11]">
-        <div className="rounded-2xl bg-[#16171C] border border-white/[0.10] focus-within:border-white/[0.22] transition shadow-lg overflow-hidden">
+      <div className="px-3.5 pb-3 pt-1.5 shrink-0 bg-[#0D0E11] relative z-20">
+        <div className="rounded-2xl bg-[#16171C] border border-white/[0.10] focus-within:border-white/[0.22] transition shadow-lg relative">
           <textarea
             ref={textareaRef}
             dir="rtl"
@@ -548,13 +548,13 @@ export function AntigravityChatPane({
                 : "پیام، گزارش کار یا دستور خود را بنویسید... (Enter ارسال • Shift+Enter خط جدید)"
             }
             rows={3}
-            className="w-full bg-transparent px-4 pt-3 pb-2 text-[13.5px] leading-[1.8] text-white placeholder-white/35 resize-none outline-none min-h-[76px] max-h-[190px] select-text"
+            className="w-full bg-transparent px-4 pt-3 pb-2 text-[13.5px] leading-[1.8] text-white placeholder-white/35 resize-none outline-none min-h-[76px] max-h-[190px] select-text rounded-t-2xl"
           />
 
           {/* Bottom Composer Toolbar (matching Antigravity screenshot!) */}
           <div
             dir="ltr"
-            className="px-3 pb-2.5 pt-1 flex items-center justify-between gap-2"
+            className="px-3 pb-2.5 pt-1 flex items-center justify-between gap-2 rounded-b-2xl"
           >
             {/* Left side: + attach, expand, model selector pill */}
             <div className="flex items-center gap-1.5 min-w-0">

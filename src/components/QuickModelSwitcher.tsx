@@ -178,11 +178,21 @@ export function QuickModelSwitcher({
   );
 
   return (
-    <div
-      ref={containerRef}
-      dir="rtl"
-      className="absolute bottom-full mb-2 right-0 w-[340px] max-w-[92vw] max-h-[460px] bg-[#14151B] border border-white/[0.12] rounded-xl shadow-2xl flex flex-col z-50 overflow-hidden text-right select-none animate-in fade-in slide-in-from-bottom-2 duration-150 backdrop-blur-md"
-    >
+    <>
+      {/* Click-outside backdrop to catch any click outside and prevent accidental trigger */}
+      <div
+        className="fixed inset-0 z-40 bg-transparent"
+        onClick={(e) => {
+          e.stopPropagation();
+          onClose();
+        }}
+      />
+
+      <div
+        ref={containerRef}
+        dir="rtl"
+        className="absolute bottom-full mb-2.5 left-0 w-[350px] max-w-[calc(100vw-32px)] max-h-[min(480px,calc(100vh-160px))] bg-[#14151B] border border-white/[0.14] rounded-xl shadow-2xl flex flex-col z-50 overflow-hidden text-right select-none animate-in fade-in slide-in-from-bottom-2 duration-150 backdrop-blur-md"
+      >
       {/* Header with Search */}
       <div className="p-2.5 border-b border-white/[0.08] bg-[#181A22] space-y-2 shrink-0">
         <div className="flex items-center justify-between">
@@ -381,6 +391,7 @@ export function QuickModelSwitcher({
         </button>
       </div>
     </div>
+    </>
   );
 }
 
