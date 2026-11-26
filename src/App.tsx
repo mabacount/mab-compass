@@ -8,6 +8,7 @@ import {
   MethodPlaybook,
   MethodPlaybookInput,
   Outcome,
+  Project,
   WorkEntity,
   WorkLine,
   WrittenArtifactRef,
@@ -24,6 +25,7 @@ import {
   CanvasTab,
 } from "./components/AntigravityRightCanvas";
 import { NewProjectModal } from "./components/NewProjectModal";
+import { ProjectManageModal } from "./components/ProjectManageModal";
 import { OutcomeModal, OutcomeFormValues } from "./components/OutcomeModal";
 import {
   WorkLineModal,
@@ -43,6 +45,7 @@ const BUILTIN_TAB_TITLES: Record<BuiltinCanvasViewId, string> = {
   WBS: "ساختار WBS و لاین‌ها",
   KNOWLEDGE_ARCHIVE: "اسناد و بازپردازش",
   ECOSYSTEM_CARDS: "اهداف و کارت‌ها",
+  PROJECTS_STUDIO: "استودیو و ساماندهی پروژه‌ها",
   SETTINGS: "تنظیمات",
   LOGS: "لاگ‌های سیستم",
 };
@@ -94,6 +97,8 @@ export default function App() {
 
   // Manual 5-Layer Modals
   const [showNewProjModal, setShowNewProjModal] = useState(false);
+  const [newProjParentId, setNewProjParentId] = useState<string | null>(null);
+  const [managingProject, setManagingProject] = useState<Project | null>(null);
   const [showOutcomeModal, setShowOutcomeModal] = useState(false);
   const [editingOutcome, setEditingOutcome] = useState<Outcome | null>(null);
   const [showWorkLineModal, setShowWorkLineModal] = useState(false);
@@ -761,16 +766,69 @@ export default function App() {
     }
   };
 
-  const handleCreateProject = async (idCode: string, name: string) => {
+  const handleCreateProject = async (
+    idCode: string,
+    name: string,
+    options?: {
+      parentId?: string | null;
+      realm?: string;
+      color?: string;
+    }
+  ) => {
     try {
-      const d = await CompassApi.createProject(idCode, name);
+      const d = await CompassApi.createProject(idCode, name, options);
       setDash(d);
       setSettingsForm(d.settings);
       setCheckedGates({});
       setShowNewProjModal(false);
-      showToast("پروژه جدید با پوشه‌های استاندارد ساخته و با Mab-Focus سینک شد.");
+      setNewProjParentId(null);
+      showToast("پروژه جدید در هسته مرکزی، کامپس و مب‌فوکس ثبت و همگام شد.");
     } catch (e: unknown) {
       showToast(`خطا در ساخت پروژه: ${String(e)}`);
+    }
+  };
+
+  const handleUpdateProject = async (params: {
+    projectId: string;
+    name: string;
+    parentId: string | null;
+    clearParent: boolean;
+    realm: string;
+    lifecycleStatus: string;
+    color: string;
+    dailyQuotaMinutes: number;
+    weeklyQuotaMinutes: number;
+    monthlyQuotaMinutes: number;
+    hourlyRate: number;
+  }) => {
+    try {
+      const d = await CompassApi.updateProject(params);
+      setDash(d);
+      showToast("پروژه ویرایش و با دیتابیس مرکزی و مب‌فوکس همگام‌سازی شد.");
+    } catch (e: unknown) {
+      showToast(`خطا در ویرایش پروژه: ${String(e)}`);
+    }
+  };
+
+  const handleMergeProjects = async (sourceId: string, targetId: string) => {
+    try {
+      const d = await CompassApi.mergeProjects(sourceId, targetId);
+      setDash(d);
+      setCheckedGates({});
+      showToast("ادغام پروژه‌ها در هسته مرکزی، کامپس و مب‌فوکس با موفقیت انجام شد.");
+    } catch (e: unknown) {
+      showToast(`خطا در ادغام پروژه‌ها: ${String(e)}`);
+    }
+  };
+
+  const handleDeleteProject = async (projectId: string) => {
+    try {
+      const d = await CompassApi.deleteProject(projectId);
+      setDash(d);
+      setCheckedGates({});
+      showToast("پروژه حذف و تغییر در دیتابیس مرکزی ثبت شد.");
+    } catch (e: unknown) {
+      showToast(`خطا در حذف پروژه: ${String(e)}`);
     }
   };
 
@@ -1195,7 +1253,11 @@ export default function App() {
             }
             onOpenBuiltinView={openBuiltinView}
             onSwitchProject={(pid) => void handleSwitchProject(pid)}
-            onOpenNewProject={() => setShowNewProjModal(true)}
+            onOpenNewProject={(parentId) => {
+              setNewProjParentId(parentId ?? null);
+              setShowNewProjModal(true);
+            }}
+            onManageProject={(proj) => setManagingProject(proj)}
             onCreateChatSession={(pid, ch) => void handleCreateChatSession(pid, ch)}
             onSwitchChatSession={(s) => void handleSwitchChatSession(s)}
             onDeleteChatSession={(sid) => void handleDeleteChatSession(sid)}
@@ -1377,6 +1439,29 @@ export default function App() {
                 onDeleteVaultCard={(id) => void handleDeleteVaultCard(id)}
                 onResolveProposal={(id, ok) => void handleResolveProposal(id, ok)}
                 onUpsertCalendarDay={handleUpsertCalendarDay}
+                onSwitchProject={(pid) => void handleSwitchProject(pid)}
+                onCreateProject={(parentId) => {
+                  setNewProjParentId(parentId ?? null);
+                  setShowNewProjModal(true);
+                }}
+                onUpdateProject={async (payload) => {
+                  const current = dash?.projects.find((p) => p.id === payload.projectId);
+                  await handleUpdateProject({
+                    projectId: payload.projectId,
+                    name: payload.name ?? current?.name ?? "",
+                    parentId: payload.parentId !== undefined ? payload.parentId : (current?.parent_id ?? null),
+                    clearParent: payload.clearParent ?? (payload.parentId === null),
+                    realm: payload.realm ?? current?.realm ?? "WORK",
+                    lifecycleStatus: payload.lifecycleStatus ?? current?.lifecycle_status ?? "ACTIVE",
+                    color: payload.color ?? current?.color ?? "#6366f1",
+                    dailyQuotaMinutes: payload.dailyQuotaMinutes ?? current?.daily_quota_minutes ?? 0,
+                    weeklyQuotaMinutes: payload.weeklyQuotaMinutes ?? current?.weekly_quota_minutes ?? 0,
+                    monthlyQuotaMinutes: payload.monthlyQuotaMinutes ?? current?.monthly_quota_minutes ?? 0,
+                    hourlyRate: payload.hourlyRate ?? current?.hourly_rate ?? 0,
+                  });
+                }}
+                onMergeProjects={handleMergeProjects}
+                onDeleteProject={handleDeleteProject}
                 onChangeSettings={setSettingsForm}
                 onSaveSettings={(override) => void handleSaveSettings(override)}
               />
@@ -1389,8 +1474,22 @@ export default function App() {
       <div dir="rtl">
         <NewProjectModal
           open={showNewProjModal}
-          onClose={() => setShowNewProjModal(false)}
+          projects={dash.projects}
+          defaultParentId={newProjParentId}
+          onClose={() => {
+            setShowNewProjModal(false);
+            setNewProjParentId(null);
+          }}
           onCreate={handleCreateProject}
+        />
+
+        <ProjectManageModal
+          project={managingProject}
+          projects={dash.projects}
+          onClose={() => setManagingProject(null)}
+          onSave={handleUpdateProject}
+          onMerge={handleMergeProjects}
+          onDelete={handleDeleteProject}
         />
 
         <OutcomeModal

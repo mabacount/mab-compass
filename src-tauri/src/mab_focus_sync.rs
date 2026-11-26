@@ -40,6 +40,16 @@ struct FocusDbProject {
     id: String,
     name: String,
     parent_id: Option<String>,
+    realm: String,
+    status: String,
+    color: String,
+    daily_quota_minutes: i32,
+    weekly_quota_minutes: i32,
+    monthly_quota_minutes: i32,
+    hourly_rate: f64,
+    google_calendar_id: Option<String>,
+    created_at: String,
+    updated_at: String,
 }
 
 #[derive(Debug, Clone)]
@@ -446,24 +456,61 @@ fn sync_with_focus_sqlite(
     let has_archived = proj_cols.contains("archived");
     let has_status = proj_cols.contains("status");
     let has_realm = proj_cols.contains("realm");
+    let has_color = proj_cols.contains("color");
+    let has_daily = proj_cols.contains("daily_quota_minutes");
+    let has_weekly = proj_cols.contains("weekly_quota_minutes");
+    let has_monthly = proj_cols.contains("monthly_quota_minutes");
+    let has_rate = proj_cols.contains("hourly_rate");
+    let has_gcal = proj_cols.contains("google_calendar_id");
     let has_created_at = proj_cols.contains("created_at");
+    let has_updated_at = proj_cols.contains("updated_at");
 
-    let proj_sql = if has_archived {
-        "SELECT id, name, parent_id FROM projects WHERE COALESCE(archived, 0) = 0"
-    } else if has_status {
-        "SELECT id, name, parent_id FROM projects WHERE COALESCE(status, 'active') != 'archived'"
+    let sel_realm = if has_realm { "COALESCE(realm, 'work')" } else { "'work'" };
+    let sel_status = if has_status {
+        "COALESCE(status, 'active')"
+    } else if has_archived {
+        "CASE WHEN COALESCE(archived, 0) = 1 THEN 'archived' ELSE 'active' END"
     } else {
-        "SELECT id, name, parent_id FROM projects"
+        "'active'"
     };
+    let sel_color = if has_color { "COALESCE(color, '#3B82F6')" } else { "'#3B82F6'" };
+    let sel_daily = if has_daily { "COALESCE(daily_quota_minutes, 0)" } else { "0" };
+    let sel_weekly = if has_weekly { "COALESCE(weekly_quota_minutes, 0)" } else { "0" };
+    let sel_monthly = if has_monthly { "COALESCE(monthly_quota_minutes, 0)" } else { "0" };
+    let sel_rate = if has_rate { "COALESCE(hourly_rate, 0.0)" } else { "0.0" };
+    let sel_gcal = if has_gcal { "google_calendar_id" } else { "NULL" };
+    let sel_created = if has_created_at { "COALESCE(created_at, '')" } else { "''" };
+    let sel_updated = if has_updated_at { "COALESCE(updated_at, '')" } else { "''" };
+
+    let where_clause = if has_archived && !has_status {
+        "WHERE COALESCE(archived, 0) = 0"
+    } else {
+        ""
+    };
+    let proj_sql = format!(
+        "SELECT id, name, parent_id, {sel_realm}, {sel_status}, {sel_color}, \
+         {sel_daily}, {sel_weekly}, {sel_monthly}, {sel_rate}, {sel_gcal}, \
+         {sel_created}, {sel_updated} FROM projects {where_clause}"
+    );
 
     let focus_projects: Vec<FocusDbProject> = {
-        let mut stmt = focus_conn.prepare(proj_sql).map_err(|e| e.to_string())?;
+        let mut stmt = focus_conn.prepare(&proj_sql).map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map([], |r| {
                 Ok(FocusDbProject {
                     id: r.get(0)?,
                     name: r.get(1)?,
                     parent_id: r.get(2)?,
+                    realm: r.get(3)?,
+                    status: r.get(4)?,
+                    color: r.get(5)?,
+                    daily_quota_minutes: r.get(6)?,
+                    weekly_quota_minutes: r.get(7)?,
+                    monthly_quota_minutes: r.get(8)?,
+                    hourly_rate: r.get(9)?,
+                    google_calendar_id: r.get(10)?,
+                    created_at: r.get(11)?,
+                    updated_at: r.get(12)?,
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -475,29 +522,130 @@ fn sync_with_focus_sqlite(
         .map(|p| (p.id.clone(), p.clone()))
         .collect();
 
-    // ۱. وارد کردن پروژه‌های کلان جدید از SQLite Mab-Focus به Mab-Compass
+    // ۱. وارد کردن پروژه‌های کلان و زیرپروژه‌های درختی از SQLite Mab-Focus به Mab-Compass
     let existing_local = load_local_projects(conn)?;
     let mut existing_ids: HashSet<String> =
         existing_local.iter().map(|p| p.id.clone()).collect();
+    let mut focus_to_local: HashMap<String, String> = HashMap::new();
+    for lp in &existing_local {
+        if let Some(ref fid) = lp.external_focus_id {
+            focus_to_local.insert(fid.clone(), lp.id.clone());
+        }
+    }
 
-    for fp in focus_projects
-        .iter()
-        .filter(|p| p.parent_id.as_deref().map(str::trim).unwrap_or("").is_empty())
+    let core_tombstones: HashSet<String> = if let Some(core_path) = (!cfg!(test))
+        .then(crate::ecosystem_core::resolve_default_core_db_path)
+        .flatten()
+        .filter(|p| p.exists())
     {
-        if fp.name.trim().is_empty() {
+        if let Ok(c) = crate::ecosystem_core::open_core_db(&core_path) {
+            c.prepare("SELECT id FROM core_projects WHERE status IN ('deleted', 'merged') OR deleted_at IS NOT NULL")
+                .ok()
+                .and_then(|mut s| {
+                    s.query_map([], |r| r.get::<_, String>(0))
+                        .ok()
+                        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                })
+                .unwrap_or_default()
+        } else {
+            HashSet::new()
+        }
+    } else {
+        HashSet::new()
+    };
+
+    // ترتیب‌دهی: ابتدا ریشه‌ها (parent_id تهی)، سپس فرزندان سطح به سطح
+    let mut ordered_focus: Vec<&FocusDbProject> = Vec::new();
+    let mut seen_fp: HashSet<String> = HashSet::new();
+    for pass in 0..8 {
+        for fp in &focus_projects {
+            if seen_fp.contains(&fp.id) {
+                continue;
+            }
+            let pid_empty = fp.parent_id.as_deref().map(str::trim).unwrap_or("").is_empty();
+            let parent_ready = pid_empty
+                || fp
+                    .parent_id
+                    .as_deref()
+                    .map(|p| seen_fp.contains(p))
+                    .unwrap_or(false)
+                || pass == 7;
+            if parent_ready {
+                ordered_focus.push(fp);
+                seen_fp.insert(fp.id.clone());
+            }
+        }
+    }
+
+    for fp in ordered_focus {
+        if fp.name.trim().is_empty() || core_tombstones.contains(&fp.id) {
             continue;
         }
+        let local_parent_id = fp
+            .parent_id
+            .as_deref()
+            .and_then(|pid| focus_to_local.get(pid).cloned());
         let matched_local = existing_local.iter().find(|lp| {
             lp.external_focus_id.as_deref() == Some(fp.id.as_str())
                 || lp.name.trim() == fp.name.trim()
                 || lp.id.eq_ignore_ascii_case(fp.name.trim())
         });
 
+        let compass_realm = if fp.realm.trim().eq_ignore_ascii_case("life") {
+            "LIFE"
+        } else {
+            "WORK"
+        };
+        let compass_status = match fp.status.trim().to_ascii_lowercase().as_str() {
+            "suspended" | "paused" => "PAUSED",
+            "archived" => "ARCHIVED",
+            _ => "ACTIVE",
+        };
+        let eff_updated = if !fp.updated_at.trim().is_empty() {
+            fp.updated_at.trim()
+        } else if !fp.created_at.trim().is_empty() {
+            fp.created_at.trim()
+        } else {
+            now
+        };
+
         if let Some(lp) = matched_local {
-            if lp.external_focus_id.as_deref() != Some(fp.id.as_str()) {
+            focus_to_local.insert(fp.id.clone(), lp.id.clone());
+            if lp.external_focus_id.as_deref() != Some(fp.id.as_str())
+                || lp.parent_id != local_parent_id
+                || lp.name != fp.name.trim()
+                || lp.realm != compass_realm
+                || lp.lifecycle_status != compass_status
+                || lp.color != fp.color
+                || lp.daily_quota_minutes != fp.daily_quota_minutes
+                || lp.weekly_quota_minutes != fp.weekly_quota_minutes
+                || lp.monthly_quota_minutes != fp.monthly_quota_minutes
+                || (lp.hourly_rate - fp.hourly_rate).abs() > 0.01
+                || lp.google_calendar_id != fp.google_calendar_id
+            {
                 let _ = conn.execute(
-                    "UPDATE projects SET external_focus_id = ?1 WHERE id = ?2",
-                    params![fp.id, lp.id],
+                    "UPDATE projects SET
+                        name = ?1, external_focus_id = ?2, parent_id = ?3,
+                        realm = ?4, lifecycle_status = ?5, color = ?6,
+                        daily_quota_minutes = ?7, weekly_quota_minutes = ?8,
+                        monthly_quota_minutes = ?9, hourly_rate = ?10,
+                        google_calendar_id = ?11, updated_at = ?12
+                     WHERE id = ?13",
+                    params![
+                        fp.name.trim(),
+                        fp.id,
+                        local_parent_id,
+                        compass_realm,
+                        compass_status,
+                        fp.color,
+                        fp.daily_quota_minutes,
+                        fp.weekly_quota_minutes,
+                        fp.monthly_quota_minutes,
+                        fp.hourly_rate,
+                        fp.google_calendar_id,
+                        eff_updated,
+                        lp.id
+                    ],
                 );
             }
         } else {
@@ -509,12 +657,33 @@ fn sync_with_focus_sqlite(
             let _ = ensure_project_directories(&proj_folder);
             if conn
                 .execute(
-                    "INSERT INTO projects (id, name, workspace_path, external_focus_id, is_active, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, 0, ?5)",
-                    params![new_cid, fp.name.trim(), proj_folder, fp.id, now],
+                    "INSERT INTO projects (
+                        id, name, workspace_path, external_focus_id, is_active, updated_at,
+                        parent_id, realm, lifecycle_status, color,
+                        daily_quota_minutes, weekly_quota_minutes, monthly_quota_minutes,
+                        hourly_rate, google_calendar_id, created_at
+                     ) VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                    params![
+                        new_cid,
+                        fp.name.trim(),
+                        proj_folder,
+                        fp.id,
+                        eff_updated,
+                        local_parent_id,
+                        compass_realm,
+                        compass_status,
+                        fp.color,
+                        fp.daily_quota_minutes,
+                        fp.weekly_quota_minutes,
+                        fp.monthly_quota_minutes,
+                        fp.hourly_rate,
+                        fp.google_calendar_id,
+                        if fp.created_at.trim().is_empty() { now } else { fp.created_at.trim() },
+                    ],
                 )
                 .is_ok()
             {
+                focus_to_local.insert(fp.id.clone(), new_cid.clone());
                 existing_ids.insert(new_cid);
                 imported_projects += 1;
             }
@@ -874,26 +1043,26 @@ fn sync_with_focus_sqlite(
 }
 
 fn load_local_projects(conn: &Connection) -> Result<Vec<Project>, String> {
-    let mut stmt = conn
-        .prepare("SELECT id, name, workspace_path, external_focus_id, is_active, updated_at FROM projects")
-        .map_err(|e| e.to_string())?;
-    let rows = stmt
-        .query_map([], |r| {
-            Ok(Project {
-                id: r.get(0)?,
-                name: r.get(1)?,
-                workspace_path: r.get(2)?,
-                external_focus_id: r.get(3)?,
-                is_active: r.get::<_, i32>(4)? == 1,
-                updated_at: r.get(5)?,
-                ..Default::default()
-            })
-        })
-        .map_err(|e| e.to_string())?;
-    Ok(rows.filter_map(|r| r.ok()).collect())
+    crate::ecosystem_core::load_compass_projects(conn)
 }
 
 pub fn synchronize_with_mab_focus(conn: &mut Connection) -> Result<SyncReport, String> {
+    let core_path_opt = if cfg!(test) {
+        std::env::var("MAB_ECOSYSTEM_DB_PATH")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+    } else {
+        crate::ecosystem_core::resolve_default_core_db_path()
+    };
+    synchronize_with_mab_focus_and_core(conn, core_path_opt.as_deref())
+}
+
+pub fn synchronize_with_mab_focus_and_core(
+    conn: &mut Connection,
+    core_db_path: Option<&Path>,
+) -> Result<SyncReport, String> {
     let (vault_root, configured_focus_path): (String, String) = conn
         .query_row(
             "SELECT vault_root_path, mab_focus_data_path FROM app_settings WHERE id = 1",
@@ -909,7 +1078,17 @@ pub fn synchronize_with_mab_focus(conn: &mut Connection) -> Result<SyncReport, S
     let mut exported_projects = 0;
     let mut ingested_notes = 0;
 
-    // اولویت ۱: اتصال مستقیم به دیتابیس واقعی SQLite اپلیکیشن Mab-Focus (mab_focus_v3.db / mab_focus.db)
+    // اولویت ۱: همگام‌سازی اولیه با هسته مرکزی (اعمال ادغام‌ها و حذف‌های ثبت‌شده)
+    if let Some(core_path) = core_db_path {
+        if let Ok(core_stats) =
+            crate::ecosystem_core::reconcile_compass_with_core_at_path(conn, core_path, &vault_root)
+        {
+            imported_projects += core_stats.imported_projects;
+            exported_projects += core_stats.exported_projects;
+        }
+    }
+
+    // اولویت ۲: اتصال مستقیم به دیتابیس واقعی SQLite اپلیکیشن Mab-Focus (mab_focus_v3.db / mab_focus.db)
     if let Some(ref db_path) = focus_db_opt {
         if let Some(p_str) = focus_dir.to_str() {
             if configured_focus_path.trim() != p_str {
@@ -923,6 +1102,15 @@ pub fn synchronize_with_mab_focus(conn: &mut Connection) -> Result<SyncReport, S
         imported_projects += imp;
         exported_projects += exp;
         ingested_notes += ing;
+
+        // بازتاب فوری ساختار درختی و پروژه‌های واردشده/به‌روزشده از Mab-Focus به هسته مرکزی mab_core.db
+        if let Some(core_path) = core_db_path {
+            let _ = crate::ecosystem_core::reconcile_compass_with_core_at_path(
+                conn,
+                core_path,
+                &vault_root,
+            );
+        }
     }
 
     // اولویت ۲ (پشتیبانی تکمیلی / پل اختیاری JSON و TXT در صورت وجود در پوشه)
@@ -1194,7 +1382,7 @@ mod tests {
         update_settings(&c1, &s1).unwrap();
 
         let rep_v1 = synchronize_with_mab_focus(&mut c1).unwrap();
-        assert_eq!(rep_v1.projects_imported_from_focus, 1); // macro project only
+        assert_eq!(rep_v1.projects_imported_from_focus, 2); // macro + child project unified tree!
         assert_eq!(rep_v1.projects_exported_to_focus, 2); // GERDALO + IRANOIL exported as UUIDs
         assert_eq!(rep_v1.notes_ingested_from_focus, 2); // 1 completed task_log + 1 edit_note
 

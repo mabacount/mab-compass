@@ -7,6 +7,21 @@ export interface Project {
   external_focus_id?: string | null;
   is_active: boolean;
   updated_at: string;
+  domain_code?: string;
+  primary_outcome_id?: string | null;
+  lifecycle_status?: "ACTIVE" | "PAUSED" | "ARCHIVED" | string;
+  scope_mode?: string;
+  realm?: "WORK" | "LIFE" | string;
+  priority_weight?: number;
+  pause_resume_note?: string;
+  parent_id?: string | null;
+  color?: string;
+  daily_quota_minutes?: number;
+  weekly_quota_minutes?: number;
+  monthly_quota_minutes?: number;
+  hourly_rate?: number;
+  google_calendar_id?: string | null;
+  created_at?: string;
 }
 
 export interface LifeDomain {
@@ -404,6 +419,16 @@ export interface LegacyReprocessEnqueueResult {
   dashboard: DashboardState;
 }
 
+export interface ProjectPathSummary {
+  project: Project;
+  next_step_task?: WorkEntity | null;
+  horizon_tasks: WorkEntity[];
+  blockers: WorkEntity[];
+  open_tasks_count: number;
+  in_progress_count: number;
+  active_work_lines_count: number;
+}
+
 export interface DashboardState {
   projects: Project[];
   active_project: Project;
@@ -436,6 +461,9 @@ export interface DashboardState {
   pending_proposals?: PendingProposal[];
   personal_vault_items?: PersonalVaultItem[];
   methods_playbooks?: MethodPlaybook[];
+  active_chat_scope?: string;
+  portfolio_projects?: ProjectPathSummary[];
+  cross_project_priorities?: WorkEntity[];
 }
 
 export interface CommittedChatTurn {
@@ -485,8 +513,54 @@ export const CompassApi = {
   getDashboard: () => invoke<DashboardState>("cmd_get_dashboard"),
   switchProject: (projectId: string) =>
     invoke<DashboardState>("cmd_switch_project", { projectId }),
-  createProject: (idCode: string, name: string) =>
-    invoke<DashboardState>("cmd_create_project", { idCode, name }),
+  createProject: (
+    idCode: string,
+    name: string,
+    options?: {
+      parentId?: string | null;
+      realm?: string;
+      color?: string;
+      lifecycleStatus?: string;
+    }
+  ) =>
+    invoke<DashboardState>("cmd_create_project", {
+      idCode,
+      name,
+      parentId: options?.parentId ?? null,
+      realm: options?.realm ?? null,
+      color: options?.color ?? null,
+      lifecycleStatus: options?.lifecycleStatus ?? null,
+    }),
+  updateProject: (params: {
+    projectId: string;
+    name?: string;
+    parentId?: string | null;
+    clearParent?: boolean;
+    realm?: string;
+    lifecycleStatus?: string;
+    color?: string;
+    dailyQuotaMinutes?: number;
+    weeklyQuotaMinutes?: number;
+    monthlyQuotaMinutes?: number;
+    hourlyRate?: number;
+  }) =>
+    invoke<DashboardState>("cmd_update_project", {
+      projectId: params.projectId,
+      name: params.name ?? null,
+      parentId: params.parentId ?? null,
+      clearParent: params.clearParent ?? false,
+      realm: params.realm ?? null,
+      lifecycleStatus: params.lifecycleStatus ?? null,
+      color: params.color ?? null,
+      dailyQuotaMinutes: params.dailyQuotaMinutes ?? null,
+      weeklyQuotaMinutes: params.weeklyQuotaMinutes ?? null,
+      monthlyQuotaMinutes: params.monthlyQuotaMinutes ?? null,
+      hourlyRate: params.hourlyRate ?? null,
+    }),
+  mergeProjects: (sourceId: string, targetId: string) =>
+    invoke<DashboardState>("cmd_merge_projects", { sourceId, targetId }),
+  deleteProject: (projectId: string) =>
+    invoke<DashboardState>("cmd_delete_project", { projectId }),
   quickCompleteStep: (taskId: string, pomosSpent: number) =>
     invoke<DashboardState>("cmd_quick_complete_step", { taskId, pomosSpent }),
   startTaskStep: (taskId: string) =>

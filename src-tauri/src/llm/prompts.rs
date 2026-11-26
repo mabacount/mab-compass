@@ -146,6 +146,146 @@ pub fn format_projects_catalog(projects: &[Project]) -> String {
         .join("\n")
 }
 
+pub fn build_cross_project_portfolio_snapshot(conn: &Connection) -> String {
+    let projects = match crate::ecosystem_core::load_compass_projects(conn) {
+        Ok(p) => p,
+        Err(_) => return String::new(),
+    };
+    let (summaries, prioritized) =
+        crate::db::queries::query_portfolio_path_summary(conn, &projects).unwrap_or_default();
+    let today_key = Local::now().format("%Y-%m-%d").to_string();
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "## CROSS-PROJECT PORTFOLIO & PATH AHEAD (TODAY: {})\n",
+        today_key
+    ));
+
+    // Today's global calendar load
+    let (total_cap, deep_cap): (i32, i32) = conn
+        .query_row(
+            "SELECT total_capacity_minutes, deep_capacity_minutes FROM calendar_days WHERE date_key = ?1",
+            params![today_key],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap_or((300, 150));
+    let booked_today: i32 = conn
+        .query_row(
+            "SELECT COALESCE(SUM(duration_minutes), 0) FROM work_entities WHERE scheduled_date = ?1 AND entity_type = 'TASK' AND status NOT IN ('CLOSED', 'SUPERSEDED')",
+            params![today_key],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    out.push_str(&format!(
+        "- Today Global Calendar: total={}m | deep={}m | booked={}m | available={}m\n",
+        total_cap,
+        deep_cap,
+        booked_today,
+        total_cap.saturating_sub(booked_today)
+    ));
+
+    // Active outcomes
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT id, domain_code, title, time_window, progress_percent FROM outcomes WHERE status = 'ACTIVE' ORDER BY updated_at DESC LIMIT 8",
+    ) {
+        if let Ok(rows) = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3).unwrap_or_default(),
+                r.get::<_, i32>(4).unwrap_or(0),
+            ))
+        }) {
+            let outs: Vec<String> = rows
+                .filter_map(|r| r.ok())
+                .map(|(id, dom, title, tw, pct)| {
+                    format!("[{} | {} | {} | {}%] {}", id, dom, tw, pct, title)
+                })
+                .collect();
+            if !outs.is_empty() {
+                out.push_str("- Active Strategic Outcomes: ");
+                out.push_str(&outs.join(" ; "));
+                out.push('\n');
+            }
+        }
+    }
+
+    out.push_str("\n### PER-PROJECT PATH AHEAD:\n");
+    for s in &summaries {
+        let active_tag = if s.project.is_active { " *VIEWED*" } else { "" };
+        out.push_str(&format!(
+            "- project_id=\"{}\" | name=\"{}\" [{}, {}{}] (open={}, in_progress={}, lines={})\n",
+            s.project.id,
+            s.project.name,
+            s.project.realm,
+            s.project.lifecycle_status,
+            active_tag,
+            s.open_tasks_count,
+            s.in_progress_count,
+            s.active_work_lines_count
+        ));
+        if let Some(ref ns) = s.next_step_task {
+            let sched = ns
+                .scheduled_date
+                .as_deref()
+                .map(|d| format!(" sched={}", d))
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "  #1 NEXT STEP: [{}] \"{}\" (status={}, P={}, critical={}{}) | DoD: {}\n",
+                ns.id,
+                ns.title,
+                ns.status,
+                ns.priority_score,
+                ns.is_on_critical_path,
+                sched,
+                ns.definition_of_done.chars().take(120).collect::<String>()
+            ));
+        } else {
+            out.push_str("  #1 NEXT STEP: (none open)\n");
+        }
+        if !s.horizon_tasks.is_empty() {
+            let h_list: Vec<String> = s
+                .horizon_tasks
+                .iter()
+                .map(|t| format!("[{}] \"{}\" (P={}, {})", t.id, t.title, t.priority_score, t.status))
+                .collect();
+            out.push_str(&format!("  HORIZON: {}\n", h_list.join(" | ")));
+        }
+        if !s.blockers.is_empty() {
+            let b_list: Vec<String> = s
+                .blockers
+                .iter()
+                .map(|b| format!("[{}] {}", b.id, b.title))
+                .collect();
+            out.push_str(&format!("  BLOCKERS: {}\n", b_list.join(" | ")));
+        }
+    }
+
+    if !prioritized.is_empty() {
+        out.push_str("\n### TOP CROSS-PROJECT PRIORITIZED QUEUE:\n");
+        for (idx, t) in prioritized.iter().take(15).enumerate() {
+            let sched = t.scheduled_date.as_deref().unwrap_or("-");
+            let due = t.due_date.as_deref().unwrap_or("-");
+            out.push_str(&format!(
+                "{}. [{}] \"{}\" | project=\"{}\" ({}) | P={} | critical={} | status={} | sched={} | due={}\n",
+                idx + 1,
+                t.id,
+                t.title,
+                t.project_name,
+                t.project_id,
+                t.priority_score,
+                t.is_on_critical_path,
+                t.status,
+                sched,
+                due
+            ));
+        }
+    }
+
+    out
+}
+
 pub fn append_cross_project_routing_instructions(
     prompt: String,
     chat_project_id: &str,
@@ -153,12 +293,12 @@ pub fn append_cross_project_routing_instructions(
 ) -> String {
     let catalog = format_projects_catalog(projects);
     let scope_note = if chat_project_id.eq_ignore_ascii_case("GLOBAL") {
-        "This is a CROSS-PROJECT (GLOBAL) conversation. The user is NOT restricted to a single project and may discuss multiple projects in one message."
+        "This is a CROSS-PROJECT (STRATEGIC LAYER ABOVE PROJECTS) conversation. The user is NOT restricted to a single project and may review, compare, prioritize, or update multiple projects in one message."
     } else {
-        "Even though this chat is inside a project, the user may mention notes, tasks, or decisions belonging to OTHER projects."
+        "Even though this chat has a project focus, the user may mention notes, tasks, priorities, or decisions belonging to OTHER projects."
     };
     format!(
-        "{prompt}\n\nAVAILABLE PROJECTS IN WORKSPACE:\n{catalog}\n\nCROSS-PROJECT ROUTING RULE:\n{scope_note}\nWhenever the user mentions a note, insight, decision, task, or rule for a SPECIFIC project (by name or ID), set `project_id` on each mutation (or MCP tool call) to that target project's exact `project_id` so it is recorded in THAT project."
+        "{prompt}\n\nAVAILABLE PROJECTS IN WORKSPACE:\n{catalog}\n\nCROSS-PROJECT ROUTING & STRATEGIC PRIORITIZATION RULE:\n{scope_note}\nWhenever the user mentions a note, insight, decision, task, or rule for a SPECIFIC project (by name or ID), set `project_id` on each mutation (or MCP tool call) to that target project's exact `project_id` so it is recorded in THAT project.\nIf the user asks to review the Path Ahead across all projects or prioritize/schedule across projects, analyze ALL projects' Path Ahead and update priority_score / is_on_critical_path / scheduled_date / next_step across the relevant projects!"
     )
 }
 
@@ -210,6 +350,41 @@ pub fn build_mcp_tool_turn_prompts_with_projects(
     is_legacy_reprocess: bool,
     all_projects: &[Project],
 ) -> (String, String) {
+    build_mcp_tool_turn_prompts_with_portfolio(
+        project_id,
+        channel,
+        user_message_or_doc,
+        recent_history,
+        open_tasks,
+        active_decisions,
+        active_sops,
+        recent_docs,
+        existing_methods,
+        fts_snippets,
+        doc_meta,
+        is_legacy_reprocess,
+        all_projects,
+        "",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_mcp_tool_turn_prompts_with_portfolio(
+    project_id: &str,
+    channel: &str,
+    user_message_or_doc: &str,
+    recent_history: &[ChatMessage],
+    open_tasks: &[WorkEntity],
+    active_decisions: &[WorkEntity],
+    active_sops: &[SopRule],
+    recent_docs: &[KnowledgeDocument],
+    existing_methods: &[MethodPlaybook],
+    fts_snippets: &[(String, String)],
+    doc_meta: Option<(&str, &str, &str)>, // (title, doc_type, filename)
+    is_legacy_reprocess: bool,
+    all_projects: &[Project],
+    portfolio_snapshot: &str,
+) -> (String, String) {
     let current_hero = format_active_next_step_summary(open_tasks);
     let tasks_compact = compact_tasks_summary(open_tasks);
     let methods_summary = format_existing_methods_summary(existing_methods);
@@ -244,6 +419,9 @@ pub fn build_mcp_tool_turn_prompts_with_projects(
                 channel, title, doc_type, fname
             ),
             ("VAULT", None) => "Knowledge Vault Multi-Turn Refinement".to_string(),
+            _ if project_id.eq_ignore_ascii_case("GLOBAL") => {
+                "Cross-Project Strategic Copilot & Portfolio Path Ahead Architect (Above Projects)".to_string()
+            }
             _ => "Project Copilot & Path Ahead Architect".to_string(),
         }
     };
@@ -266,46 +444,57 @@ CRITICAL ANTI-DUPLICATE LEGACY REPROCESSING RULES:
     let projects_catalog = format_projects_catalog(all_projects);
     let cross_project_rules = if is_global_chat {
         r#"
-CROSS-PROJECT (GLOBAL) CHAT & MULTI-PROJECT NOTE ROUTING:
-- This conversation is a FREE / CROSS-PROJECT chat (NOT restricted to a single project).
-- The user may talk about multiple projects in the same chat or even in the same message!
-- WHENEVER the user mentions a note, point, insight, lesson, instruction, task, decision (ADR), SOP rule, antipattern, or method/playbook about a SPECIFIC project (by name or ID from `AVAILABLE PROJECTS IN WORKSPACE` below), you MUST pass that target project's `project_id` in your MCP tool call (`save_personal_or_lesson_item`, `log_work_and_knowledge`, `create_work_entity`, `update_work_entity`, `upsert_method_playbook`, `create_work_line_chain`, etc.) so it is recorded directly in THAT project!
-- If the user mentions points about 2 or more different projects in one message, invoke the recording tools separately for each respective `project_id`.
-- For general personal notes not tied to any specific project, you may omit `project_id` on `save_personal_or_lesson_item` (or pass `project_id: null`).
-- You can also call `get_path_ahead` or `search_memory` with any `project_id` to inspect another project's live state before recording."#
+CROSS-PROJECT (STRATEGIC LAYER ABOVE PROJECTS) & MULTI-PROJECT ROUTING:
+- This conversation sits ABOVE individual projects! The user is NOT restricted to a single project and may discuss, compare, prioritize, or update ANY combination of projects in one message.
+- You have full cross-project visibility and execution tools:
+  * Call `get_all_projects_path_ahead` whenever you want a fresh, detailed breakdown of Path Ahead, horizon tasks, blockers, outcomes, and global priority queue across ALL projects.
+  * Call `prioritize_across_projects` to rank `priority_score` (0..100), promote `#1 next_step`, toggle `is_on_critical_path`, and schedule (`scheduled_date`, `scheduled_slot`) tasks across MULTIPLE projects in a single call!
+- WHENEVER the user mentions a note, point, insight, lesson, instruction, task, decision (ADR), SOP rule, antipattern, or method/playbook about a SPECIFIC project (by name or ID from `AVAILABLE PROJECTS IN WORKSPACE` below), set `project_id` on your MCP tool call (`save_personal_or_lesson_item`, `log_work_and_knowledge`, `create_work_entity`, `update_work_entity`, `upsert_method_playbook`, `create_work_line_chain`, etc.) so it is recorded directly in THAT project!
+- If the user mentions points about 2 or more different projects in one message, update each respective `project_id` cleanly in the same turn.
+- For general personal notes not tied to any specific project, omit `project_id` on `save_personal_or_lesson_item` (or pass `project_id: null`)."#
     } else {
         r#"
-CROSS-PROJECT NOTE ROUTING:
-- Even though this chat is inside a specific project, if the user mentions a note, insight, task, decision, or method belonging to ANOTHER project from `AVAILABLE PROJECTS IN WORKSPACE`, pass that other project's `project_id` in your MCP tool call so it is recorded in THAT project instead!"#
+CROSS-PROJECT NOTE ROUTING & STRATEGIC TOOLS:
+- Even though this chat has a project focus, if the user mentions a note, insight, task, decision, priority, or method belonging to ANOTHER project from `AVAILABLE PROJECTS IN WORKSPACE`, pass that other project's `project_id` in your MCP tool call so it is recorded in THAT project!
+- You can also use `get_all_projects_path_ahead` and `prioritize_across_projects` to inspect and coordinate priorities across projects."#
+    };
+
+    let portfolio_section = if portfolio_snapshot.trim().is_empty() {
+        String::new()
+    } else {
+        format!("\n{portfolio_snapshot}\n")
     };
 
     let system_prompt = format!(
-        r#"You are Mab-Compass v4.0's interactive AI Copilot, Knowledge & Method Architect for project "{project_id}" ({mode_desc}).
+        r#"You are Mab-Compass v4.5's interactive AI Copilot, Knowledge & Strategic Portfolio Architect for scope "{project_id}" ({mode_desc}).
 {legacy_rules}
 {cross_project_rules}
 YOU HAVE NATIVE MCP TOOLS TO READ & UPDATE THE FULL ECOSYSTEM DIRECTLY:
-1. Methods, Playbooks & BPMN 2.0 Workflows (دستورالعمل و متد انجام کار):
+1. Cross-Project Portfolio & Path Ahead Prioritization (لایه فراپروژه‌ای):
+   - `get_all_projects_path_ahead`: Inspect Path Ahead (`#1 next_step`, `horizon_tasks`, `blockers`, `work_lines`) across ALL active/paused projects + Outcomes + Today's Calendar capacity + global prioritized queue!
+   - `prioritize_across_projects`: Batch-prioritize (`priority_score` 0..100, `is_on_critical_path`, `make_next_step`, `status`, `scheduled_date`, `scheduled_slot`) tasks across MULTIPLE projects atomically in one call!
+2. Methods, Playbooks & BPMN 2.0 Workflows (دستورالعمل و متد انجام کار):
    - `upsert_method_playbook`: WHENEVER you detect a repeatable work pattern, procedure, workflow, or method in a work report, incremental messages, or document — OR whenever the user explicitly asks for a method/playbook/workflow — call `upsert_method_playbook`!
    - If a similar method ALREADY exists in `EXISTING METHODS & PLAYBOOKS`, pass its `method_id` (or matching title) so it automatically enriches & bumps version (`v1 -> v2`) instead of duplicating!
    - Include Persian `title`, `summary`, `objective` (هدف), `prerequisites` (پیش‌نیازها), ordered `steps` (with `element_type`: `task`/`userTask`/`serviceTask`/`subProcess`/`exclusiveGateway`/`parallelGateway`, `role`, `inputs`, `outputs`, `checklist`, `notes`), overall `checklist`, and `notes_markdown`.
    - For composite stages/groups of tasks, set `element_type: "subProcess"` and populate `sub_steps` so the user can visually click and drill down into the internal BPMN 2.0 sub-workflow!
    - Files are automatically written to `04_methods_playbooks/` (.md + .bpmn) and displayed as clickable Artifact Cards beneath your chat reply.
-2. Strategic Domains & Outcomes:
+3. Strategic Domains & Outcomes:
    - `upsert_domain_or_outcome`: Create or update Outcomes (`OUT-xxxx`) linked to CADM life domains (`MIND_LEARNING`, `HEALTH_ENERGY`, `WEALTH_FINANCE`, `RELATIONS`, `RESILIENCE`, `PURPOSE`, `SPIRITUALITY`, `SANCTUARY`).
-3. WorkLines (Sequential Chains & Goal Clusters):
+4. WorkLines (Sequential Chains & Goal Clusters):
    - `create_work_line_chain` & `append_or_reorder_work_line`: Group multi-step work into `SEQUENTIAL_CHAIN` or `GOAL_CLUSTER` WorkLines (`WLN-xxxx`).
-4. Tasks, Decisions & Blockers:
+5. Tasks, Decisions & Blockers:
    - `create_work_entity`, `update_work_entity`, `set_next_step`, `complete_task`, `delete_work_entity`, `schedule_task_on_calendar`.
-5. Atomic Knowledge Cards, Lessons Learned, Instructions & Guardrails:
+6. Atomic Knowledge Cards, Lessons Learned, Instructions & Guardrails:
    - `save_personal_or_lesson_item`: Use `item_type`: `"MEMORY_CARD"`, `"LESSON"`, `"INSTRUCTION"`, `"NOTE"`.
    - `log_work_and_knowledge`: Record `LOG_WORK`, `UPSERT_SOP`, `REGISTER_ANTIPATTERN`, or `INGEST_NOTE`.
-6. Project Lifecycle & Memory Search:
+7. Project Lifecycle & Memory Search:
    - `propose_project_lifecycle`, `get_path_ahead`, `search_memory`, `sync_mab_focus`, `undo_last_change`.
 
 DOCUMENT & INPUT PROCESSING RULES:
-1. Analyze the user's message, work report, or document carefully against existing tasks, Methods/Playbooks, WorkLines, Outcomes, SOPs, and conversation history.
-2. Extract EVERY valuable atomic piece using MCP tools BEFORE replying (especially repeatable Methods/Playbooks + BPMN workflows, WorkLines, Tasks, Memory Cards, Lessons, Guardrails).
-3. After tool execution, write a warm, sharp, engineering-focused **Persian Markdown** reply explicitly noting every document/method/playbook/workflow you wrote or updated (their clickable cards will appear right below your message).
+1. Analyze the user's message, work report, or document carefully against existing tasks across projects, Methods/Playbooks, WorkLines, Outcomes, SOPs, and conversation history.
+2. Extract or update EVERY valuable atomic piece using MCP tools BEFORE replying (including multi-project updates & cross-project prioritization when requested!).
+3. After tool execution, write a warm, sharp, engineering-focused **Persian Markdown** reply explicitly noting which projects/tasks/documents/methods you updated or prioritized (clickable cards appear right below your message).
 4. If key ambiguities remain, end your Persian reply with 1 to 3 concise numbered questions."#
     );
 
@@ -314,14 +503,14 @@ DOCUMENT & INPUT PROCESSING RULES:
     let user_prompt = format!(
         r#"AVAILABLE PROJECTS IN WORKSPACE:
 {projects_catalog}
-
-CURRENT #1 ACTIVE STEP ON PATH AHEAD:
+{portfolio_section}
+CURRENT #1 ACTIVE STEP IN VIEWED PROJECT:
 {current_hero}
 
 EXISTING METHODS & PLAYBOOKS (UPDATE/ENRICH BY method_id IF SIMILAR):
 {methods_summary}
 
-CURRENT OPEN TASKS:
+CURRENT OPEN TASKS IN VIEWED PROJECT:
 {tasks_compact}
 
 ACTIVE DECISIONS (ADRs):

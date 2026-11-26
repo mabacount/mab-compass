@@ -225,6 +225,10 @@ fn default_step_category() -> String {
     "GENERAL".to_string()
 }
 
+fn default_project_color() -> String {
+    "#3B82F6".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     pub id: String,
@@ -249,6 +253,24 @@ pub struct Project {
     pub priority_weight: i32,
     #[serde(default)]
     pub pause_resume_note: String,
+
+    // Unified Ecosystem / Mab-Focus Hierarchy & Planning Fields
+    #[serde(default)]
+    pub parent_id: Option<String>,
+    #[serde(default = "default_project_color")]
+    pub color: String,
+    #[serde(default)]
+    pub daily_quota_minutes: i32,
+    #[serde(default)]
+    pub weekly_quota_minutes: i32,
+    #[serde(default)]
+    pub monthly_quota_minutes: i32,
+    #[serde(default)]
+    pub hourly_rate: f64,
+    #[serde(default)]
+    pub google_calendar_id: Option<String>,
+    #[serde(default)]
+    pub created_at: String,
 }
 
 impl Default for Project {
@@ -267,6 +289,14 @@ impl Default for Project {
             realm: "WORK".to_string(),
             priority_weight: 5,
             pause_resume_note: String::new(),
+            parent_id: None,
+            color: "#3B82F6".to_string(),
+            daily_quota_minutes: 0,
+            weekly_quota_minutes: 0,
+            monthly_quota_minutes: 0,
+            hourly_rate: 0.0,
+            google_calendar_id: None,
+            created_at: String::new(),
         }
     }
 }
@@ -559,6 +589,17 @@ pub struct SyncReport {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ProjectPathSummary {
+    pub project: Project,
+    pub next_step_task: Option<WorkEntity>,
+    pub horizon_tasks: Vec<WorkEntity>,
+    pub blockers: Vec<WorkEntity>,
+    pub open_tasks_count: i32,
+    pub in_progress_count: i32,
+    pub active_work_lines_count: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DashboardState {
     pub projects: Vec<Project>,
     pub active_project: Project,
@@ -609,6 +650,14 @@ pub struct DashboardState {
     pub personal_vault_items: Vec<PersonalVaultItem>,
     #[serde(default)]
     pub methods_playbooks: Vec<MethodPlaybook>,
+
+    // v4.5 Cross-Project Strategic Layer Additions
+    #[serde(default)]
+    pub active_chat_scope: String,
+    #[serde(default)]
+    pub portfolio_projects: Vec<ProjectPathSummary>,
+    #[serde(default)]
+    pub cross_project_priorities: Vec<WorkEntity>,
 }
 
 fn default_bpmn_element_type() -> String {

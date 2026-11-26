@@ -28,11 +28,22 @@ src-tauri/gen/
 *.swp
 *.swo
 *~
+# OS & Local Logs / Shortcuts / Databases
 .DS_Store
 Thumbs.db
 *.lnk
 *.local
 *.log
+err.txt
+out.txt
+src-tauri/vault/
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.db
+*.db-wal
+*.db-shm
 
 # Env
 .env

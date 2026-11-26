@@ -6,20 +6,24 @@ import {
   Compass,
   Database,
   Folder,
+  FolderGit2,
   FolderOpen,
   FolderArchive,
+  FolderPlus,
   Layers,
   MessageSquarePlus,
   Plus,
   Settings,
+  Settings2,
   Terminal,
   Trash2,
   Workflow,
 } from "lucide-react";
-import { ChatSession, DashboardState } from "../lib/tauri_api";
+import { ChatSession, DashboardState, Project } from "../lib/tauri_api";
 
 export type BuiltinCanvasViewId =
   | "PATH_AHEAD"
+  | "PROJECTS_STUDIO"
   | "METHODS_BPMN"
   | "WBS"
   | "KNOWLEDGE_ARCHIVE"
@@ -36,7 +40,8 @@ interface AntigravitySidebarProps {
   onNewConversation: () => void;
   onOpenBuiltinView: (viewId: BuiltinCanvasViewId) => void;
   onSwitchProject: (projectId: string) => void;
-  onOpenNewProject: () => void;
+  onOpenNewProject: (parentId?: string | null) => void;
+  onManageProject: (project: Project) => void;
   onCreateChatSession: (projectId: string, channel: "COPILOT" | "VAULT") => void;
   onSwitchChatSession: (session: ChatSession) => void;
   onDeleteChatSession: (sessionId: string) => void;
@@ -67,6 +72,7 @@ export function AntigravitySidebar({
   onOpenBuiltinView,
   onSwitchProject,
   onOpenNewProject,
+  onManageProject,
   onCreateChatSession,
   onSwitchChatSession,
   onDeleteChatSession,
@@ -74,11 +80,19 @@ export function AntigravitySidebar({
   const [expandedProjects, setExpandedProjects] = useState<Record<string, boolean>>({});
 
   useEffect(() => {
-    setExpandedProjects((prev) => ({
-      ...prev,
-      [dash.active_project.id]: true,
-    }));
-  }, [dash.active_project.id]);
+    setExpandedProjects((prev) => {
+      const next = { ...prev, [dash.active_project.id]: true };
+      let curParent = dash.active_project.parent_id;
+      let guard = 0;
+      while (curParent && guard < 10) {
+        next[curParent] = true;
+        const parentObj = dash.projects.find((p) => p.id === curParent);
+        curParent = parentObj?.parent_id ?? null;
+        guard += 1;
+      }
+      return next;
+    });
+  }, [dash.active_project.id, dash.active_project.parent_id, dash.projects]);
 
   const toggleExpand = (pid: string) => {
     setExpandedProjects((prev) => ({
@@ -100,6 +114,13 @@ export function AntigravitySidebar({
       icon: Compass,
       badge: dash.top_priority_steps?.length || (dash.next_step_task ? 1 : null),
       accentClass: "text-blue-400",
+    },
+    {
+      id: "PROJECTS_STUDIO",
+      label: "استودیو و ادغام پروژه‌ها",
+      icon: FolderGit2,
+      badge: dash.projects.length,
+      accentClass: "text-indigo-400",
     },
     {
       id: "METHODS_BPMN",
@@ -223,21 +244,21 @@ export function AntigravitySidebar({
                 (s) => s.project_id === "GLOBAL"
               );
               return (
-                <div className="mb-2 shrink-0">
-                  <div className="px-2 pb-1 flex items-center justify-between text-[11px] font-medium text-cyan-300/80">
+                <div className="mb-2.5 shrink-0">
+                  <div className="px-2 pb-1 flex items-center justify-between text-[11px] font-medium text-cyan-300/85">
                     <span dir="rtl" className="truncate">
-                      گفتگوهای آزاد (همه پروژه‌ها)
+                      گفتگوها (خارج از پروژه)
                     </span>
                     <button
                       type="button"
                       onClick={() => onCreateChatSession("GLOBAL", "COPILOT")}
-                      title="گفتگوی آزاد جدید (بدون محدودیت پروژه)"
+                      title="گفتگوی فراپروژه‌ای جدید"
                       className="p-1 rounded hover:bg-white/[0.07] text-cyan-300/70 hover:text-cyan-200 transition"
                     >
                       <MessageSquarePlus className="w-3.5 h-3.5" />
                     </button>
                   </div>
-                  <div className="space-y-0.5 max-h-36 overflow-y-auto pr-0.5">
+                  <div className="space-y-0.5 max-h-48 overflow-y-auto pr-0.5">
                     {globalSessions.map((sess) => {
                       const isCurrent =
                         (sess.channel === "COPILOT" &&
@@ -297,155 +318,214 @@ export function AntigravitySidebar({
 
             <div className="px-2 pb-1.5 flex items-center justify-between text-[11px] font-medium text-white/45 shrink-0">
               <span>Projects</span>
-              <button
-                type="button"
-                onClick={onOpenNewProject}
-                title="ساخت پروژه جدید"
-                className="p-1 rounded hover:bg-white/[0.07] text-white/50 hover:text-white transition"
-              >
-                <Plus className="w-3.5 h-3.5" />
-              </button>
+              <div className="flex items-center gap-0.5">
+                <button
+                  type="button"
+                  onClick={() => handleSelectQuickLink("PROJECTS_STUDIO")}
+                  title="استودیو و ادغام پروژه‌ها"
+                  className="p-1 rounded hover:bg-white/[0.07] text-indigo-300/75 hover:text-indigo-200 transition"
+                >
+                  <FolderGit2 className="w-3.5 h-3.5" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onOpenNewProject(null)}
+                  title="ساخت پروژه جدید"
+                  className="p-1 rounded hover:bg-white/[0.07] text-white/50 hover:text-white transition"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                </button>
+              </div>
             </div>
 
             <div className="flex-1 min-h-0 overflow-y-auto space-y-1 pr-0.5 pb-2">
-              {dash.projects.map((p) => {
-                const isExpanded = expandedProjects[p.id] ?? p.is_active;
-                const projSessions = dash.all_project_chat_sessions.filter(
-                  (s) => s.project_id === p.id
+              {(() => {
+                const visibleSidebarProjects = dash.projects.filter(
+                  (p) => p.is_active || (p.lifecycle_status || "ACTIVE").toUpperCase() !== "ARCHIVED"
+                );
+                const projectIds = new Set(visibleSidebarProjects.map((p) => p.id));
+                const rootProjects = visibleSidebarProjects.filter(
+                  (p) => !p.parent_id || !projectIds.has(p.parent_id)
                 );
 
-                return (
-                  <div key={p.id} className="space-y-0.5">
-                    {/* Project Folder Row */}
-                    <div
-                      className={`group flex items-center justify-between gap-1 px-2 py-1.5 rounded-lg text-[12.5px] transition ${
-                        p.is_active
-                          ? "text-white font-medium"
-                          : "text-[#9CA3AF] hover:bg-white/[0.04] hover:text-white"
-                      }`}
-                    >
-                      <button
-                        type="button"
-                        onClick={() => {
-                          if (!p.is_active) onSwitchProject(p.id);
-                          else toggleExpand(p.id);
-                        }}
-                        className="flex-1 flex items-center gap-2 min-w-0 text-left"
-                      >
-                        {isExpanded ? (
-                          <FolderOpen
-                            className={`w-3.5 h-3.5 shrink-0 ${
-                              p.is_active ? "text-blue-400" : "text-white/45"
-                            }`}
-                          />
-                        ) : (
-                          <Folder className="w-3.5 h-3.5 shrink-0 text-white/45" />
-                        )}
-                        <span dir="auto" className="truncate">
-                          {p.name}
-                        </span>
-                      </button>
+                const renderProjectNode = (p: Project, depth: number) => {
+                  const isExpanded = expandedProjects[p.id] ?? p.is_active;
+                  const projSessions = dash.all_project_chat_sessions.filter(
+                    (s) => s.project_id === p.id
+                  );
+                  const children = visibleSidebarProjects.filter((c) => c.parent_id === p.id);
+                  const dotColor = p.color || "#3B82F6";
 
-                      <div className="flex items-center gap-0.5 shrink-0">
+                  return (
+                    <div
+                      key={p.id}
+                      style={depth > 0 ? { paddingLeft: `${Math.min(depth, 4) * 10}px` } : undefined}
+                      className="space-y-0.5"
+                    >
+                      {/* Project Folder Row */}
+                      <div
+                        className={`group flex items-center justify-between gap-1 px-2 py-1.5 rounded-lg text-[12.5px] transition ${
+                          p.is_active
+                            ? "text-white font-medium bg-white/[0.04]"
+                            : "text-[#9CA3AF] hover:bg-white/[0.04] hover:text-white"
+                        }`}
+                      >
                         <button
                           type="button"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            onCreateChatSession(p.id, "COPILOT");
+                          onClick={() => {
+                            if (!p.is_active) onSwitchProject(p.id);
+                            else toggleExpand(p.id);
                           }}
-                          title="گفتگوی جدید در این پروژه"
-                          className="opacity-0 group-hover:opacity-100 p-1 rounded hover:bg-white/[0.09] text-white/55 hover:text-blue-300 transition"
+                          className="flex-1 flex items-center gap-1.5 min-w-0 text-left"
                         >
-                          <MessageSquarePlus className="w-3 h-3" />
-                        </button>
-                        <button
-                          type="button"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            toggleExpand(p.id);
-                          }}
-                          className="p-0.5 text-white/40 hover:text-white"
-                        >
+                          <span
+                            className="w-2 h-2 rounded-full shrink-0"
+                            style={{ backgroundColor: dotColor }}
+                          />
                           {isExpanded ? (
-                            <ChevronDown className="w-3 h-3" />
+                            <FolderOpen
+                              className={`w-3.5 h-3.5 shrink-0 ${
+                                p.is_active ? "text-blue-400" : "text-white/45"
+                              }`}
+                            />
                           ) : (
-                            <ChevronRight className="w-3 h-3" />
+                            <Folder className="w-3.5 h-3.5 shrink-0 text-white/45" />
+                          )}
+                          <span dir="auto" className="truncate">
+                            {p.name}
+                          </span>
+                          {p.lifecycle_status === "PAUSED" && (
+                            <span className="px-1 rounded bg-amber-500/15 text-amber-300 text-[9px] shrink-0">
+                              معلق
+                            </span>
+                          )}
+                          {p.lifecycle_status === "ARCHIVED" && (
+                            <span className="px-1 rounded bg-white/10 text-white/50 text-[9px] shrink-0">
+                              آرشیو
+                            </span>
                           )}
                         </button>
+
+                        <div className="flex items-center gap-0.5 shrink-0">
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              onOpenNewProject(p.id);
+                            }}
+                            title="ساخت زیرپروژه"
+                            className="opacity-0 group-hover:opacity-100 p-1 rounded hover:bg-white/[0.09] text-white/55 hover:text-emerald-300 transition"
+                          >
+                            <FolderPlus className="w-3 h-3" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              onManageProject(p);
+                            }}
+                            title="تنظیمات و ادغام پروژه"
+                            className="opacity-0 group-hover:opacity-100 p-1 rounded hover:bg-white/[0.09] text-white/55 hover:text-purple-300 transition"
+                          >
+                            <Settings2 className="w-3 h-3" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              onCreateChatSession(p.id, "COPILOT");
+                            }}
+                            title="گفتگوی جدید در این پروژه"
+                            className="opacity-0 group-hover:opacity-100 p-1 rounded hover:bg-white/[0.09] text-white/55 hover:text-blue-300 transition"
+                          >
+                            <MessageSquarePlus className="w-3 h-3" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              toggleExpand(p.id);
+                            }}
+                            className="p-0.5 text-white/40 hover:text-white"
+                          >
+                            {isExpanded ? (
+                              <ChevronDown className="w-3 h-3" />
+                            ) : (
+                              <ChevronRight className="w-3 h-3" />
+                            )}
+                          </button>
+                        </div>
                       </div>
-                    </div>
 
-                    {/* Conversations under project */}
-                    {isExpanded && (
-                      <div className="pl-4 space-y-0.5">
-                        {projSessions.map((sess) => {
-                          const isCurrent =
-                            p.is_active &&
-                            ((sess.channel === "COPILOT" &&
-                              sess.id === dash.active_copilot_session_id) ||
-                              (sess.channel === "VAULT" &&
-                                sess.id === dash.active_vault_session_id));
+                      {/* Conversations & Child Sub-Projects */}
+                      {isExpanded && (
+                        <div className="pl-3 space-y-0.5 border-l border-white/[0.06] ml-2.5">
+                          {children.map((child) => renderProjectNode(child, depth + 1))}
+                          {projSessions.map((sess) => {
+                            const isCurrent =
+                              p.is_active &&
+                              ((sess.channel === "COPILOT" &&
+                                sess.id === dash.active_copilot_session_id) ||
+                                (sess.channel === "VAULT" &&
+                                  sess.id === dash.active_vault_session_id));
 
-                          return (
-                            <div
-                              key={sess.id}
-                              className={`group flex items-center justify-between gap-1.5 px-2.5 py-1.5 rounded-lg text-[12px] transition ${
-                                isCurrent
-                                  ? "bg-white/[0.08] text-white font-medium"
-                                  : "text-[#9CA3AF] hover:bg-white/[0.04] hover:text-white"
-                              }`}
-                            >
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  onSwitchChatSession(sess);
-                                  if (isNarrowViewport && onCloseMobile) onCloseMobile();
-                                }}
-                                className="flex-1 min-w-0 text-left truncate"
-                                title={sess.title}
+                            return (
+                              <div
+                                key={sess.id}
+                                className={`group flex items-center justify-between gap-1.5 px-2.5 py-1.5 rounded-lg text-[12px] transition ${
+                                  isCurrent
+                                    ? "bg-white/[0.08] text-white font-medium"
+                                    : "text-[#9CA3AF] hover:bg-white/[0.04] hover:text-white"
+                                }`}
                               >
-                                <span dir="auto" className="truncate block">
-                                  {sess.title}
-                                </span>
-                              </button>
-
-                              <div className="flex items-center gap-1 shrink-0">
-                                {sess.channel === "VAULT" && (
-                                  <span className="px-1 rounded bg-purple-500/20 text-purple-300 text-[9px]">
-                                    دانش
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    onSwitchChatSession(sess);
+                                    if (isNarrowViewport && onCloseMobile) onCloseMobile();
+                                  }}
+                                  className="flex-1 min-w-0 text-left truncate"
+                                  title={sess.title}
+                                >
+                                  <span dir="auto" className="truncate block">
+                                    {sess.title}
                                   </span>
-                                )}
-                                <span className="font-mono text-[10.5px] text-white/35 group-hover:hidden">
-                                  {formatCompactAge(sess.updated_at)}
-                                </span>
-                                {projSessions.length > 1 && (
-                                  <button
-                                    type="button"
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      onDeleteChatSession(sess.id);
-                                    }}
-                                    title="حذف گفتگو"
-                                    className="hidden group-hover:inline-flex p-0.5 text-white/45 hover:text-rose-400 transition"
-                                  >
-                                    <Trash2 className="w-3 h-3" />
-                                  </button>
-                                )}
-                              </div>
-                            </div>
-                          );
-                        })}
+                                </button>
 
-                        {projSessions.length === 0 && (
-                          <div className="px-2.5 py-1 text-[11px] text-white/35" dir="rtl">
-                            بدون گفتگو
-                          </div>
-                        )}
-                      </div>
-                    )}
-                  </div>
-                );
-              })}
+                                <div className="flex items-center gap-1 shrink-0">
+                                  {sess.channel === "VAULT" && (
+                                    <span className="px-1 rounded bg-purple-500/20 text-purple-300 text-[9px]">
+                                      دانش
+                                    </span>
+                                  )}
+                                  <span className="font-mono text-[10.5px] text-white/35 group-hover:hidden">
+                                    {formatCompactAge(sess.updated_at)}
+                                  </span>
+                                  {projSessions.length > 1 && (
+                                    <button
+                                      type="button"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        onDeleteChatSession(sess.id);
+                                      }}
+                                      title="حذف گفتگو"
+                                      className="hidden group-hover:inline-flex p-0.5 text-white/45 hover:text-rose-400 transition"
+                                    >
+                                      <Trash2 className="w-3 h-3" />
+                                    </button>
+                                  )}
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  );
+                };
+
+                return rootProjects.map((rootProj) => renderProjectNode(rootProj, 0));
+              })()}
             </div>
           </div>
         </div>

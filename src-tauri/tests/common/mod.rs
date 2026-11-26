@@ -1463,6 +1463,7 @@ pub fn get_dashboard_state_fixture(
                 realm: r.get(10).unwrap_or_else(|_| "WORK".to_string()),
                 priority_weight: r.get(11).unwrap_or(5),
                 pause_resume_note: r.get(12).unwrap_or_default(),
+                ..Default::default()
             })
         })?
         .filter_map(|r| r.ok())

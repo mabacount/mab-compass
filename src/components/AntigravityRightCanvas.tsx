@@ -4,6 +4,7 @@ import {
   Compass,
   FileText,
   FolderArchive,
+  FolderGit2,
   Layers,
   Maximize2,
   Minimize2,
@@ -29,6 +30,7 @@ import { MethodsAndBpmnView } from "./MethodsAndBpmnView";
 import { WbsAndDocsView } from "./WbsAndDocsView";
 import { KnowledgeArchivePanel } from "./KnowledgeArchivePanel";
 import { EcosystemAndCardsView } from "./EcosystemAndCardsView";
+import { ProjectStudioView } from "./ProjectStudioView";
 import { SettingsView } from "./SettingsView";
 import { ArtifactViewerTab } from "./ArtifactViewerTab";
 import { SystemLogsPanel } from "./SystemLogsPanel";
@@ -94,12 +96,31 @@ interface AntigravityRightCanvasProps {
     dayNote: string;
     isOffDay: boolean;
   }) => Promise<void>;
+  onSwitchProject: (projectId: string) => void;
+  onCreateProject: (parentId?: string | null) => void;
+  onUpdateProject: (payload: {
+    projectId: string;
+    name?: string;
+    parentId?: string | null;
+    clearParent?: boolean;
+    realm?: string;
+    lifecycleStatus?: string;
+    color?: string;
+    dailyQuotaMinutes?: number | null;
+    weeklyQuotaMinutes?: number | null;
+    monthlyQuotaMinutes?: number | null;
+    hourlyRate?: number | null;
+  }) => Promise<void>;
+  onMergeProjects: (sourceId: string, targetId: string) => Promise<void>;
+  onDeleteProject: (projectId: string) => Promise<void>;
   onChangeSettings: (next: AppSettings) => void;
   onSaveSettings: (override?: AppSettings) => void;
 }
 
 function getTabIcon(tab: CanvasTab) {
   switch (tab.kind) {
+    case "PROJECTS_STUDIO":
+      return <FolderGit2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />;
     case "PATH_AHEAD":
       return <Compass className="w-3.5 h-3.5 text-blue-400 shrink-0" />;
     case "METHODS_BPMN":
@@ -163,6 +184,11 @@ export function AntigravityRightCanvas({
   onDeleteVaultCard,
   onResolveProposal,
   onUpsertCalendarDay,
+  onSwitchProject,
+  onCreateProject,
+  onUpdateProject,
+  onMergeProjects,
+  onDeleteProject,
   onChangeSettings,
   onSaveSettings,
 }: AntigravityRightCanvasProps) {
@@ -248,6 +274,7 @@ export function AntigravityRightCanvas({
                   {(
                     [
                       { id: "PATH_AHEAD", label: "مسیر پیش‌رو", icon: Compass },
+                      { id: "PROJECTS_STUDIO", label: "استودیو و ادغام پروژه‌ها", icon: FolderGit2 },
                       { id: "METHODS_BPMN", label: "متدها و نقشه BPMN 2.0", icon: Workflow },
                       { id: "WBS", label: "ساختار WBS و لاین‌ها", icon: Layers },
                       {
@@ -327,6 +354,13 @@ export function AntigravityRightCanvas({
               </button>
               <button
                 type="button"
+                onClick={() => onOpenBuiltinView("PROJECTS_STUDIO")}
+                className="px-3 py-1.5 rounded-lg bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/30 text-emerald-200 text-[12px]"
+              >
+                استودیو و ادغام پروژه‌ها
+              </button>
+              <button
+                type="button"
                 onClick={() => onOpenBuiltinView("METHODS_BPMN")}
                 className="px-3 py-1.5 rounded-lg bg-purple-500/20 hover:bg-purple-500/30 text-purple-200 text-[12px]"
               >
@@ -343,8 +377,18 @@ export function AntigravityRightCanvas({
             onQuickComplete={onQuickComplete}
             onStartTask={onStartTask}
             onInsertChatPrompt={onInsertChatPrompt}
+            onSwitchProject={onSwitchProject}
             onOpenWorkLineBpmn={openWorkLineBpmn}
             onOpenProjectBpmn={() => onOpenBuiltinView("METHODS_BPMN")}
+          />
+        ) : activeTab.kind === "PROJECTS_STUDIO" ? (
+          <ProjectStudioView
+            dash={dash}
+            onSwitchProject={onSwitchProject}
+            onCreateProject={onCreateProject}
+            onUpdateProject={onUpdateProject}
+            onMergeProjects={onMergeProjects}
+            onDeleteProject={onDeleteProject}
           />
         ) : activeTab.kind === "METHODS_BPMN" ? (
           <MethodsAndBpmnView

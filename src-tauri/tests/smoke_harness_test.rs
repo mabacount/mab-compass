@@ -256,3 +256,98 @@ fn test_call_mcp_tool_helper() {
     let iranoil = projects.iter().find(|p| p.get("id").and_then(|v| v.as_str()) == Some("IRANOIL"));
     assert!(iranoil.is_some(), "IRANOIL project should be returned by list_projects");
 }
+
+#[test]
+fn test_cross_project_strategic_path_ahead_and_prioritization() {
+    let mut conn = create_test_db();
+
+    // 1. Create tasks in two different projects via MCP tools
+    call_mcp_tool(
+        &mut conn,
+        "create_work_entity",
+        json!({
+            "project_id": "GERDALO",
+            "title": "طراحی درگاه پرداخت گردالو",
+            "status": "OPEN",
+            "is_on_critical_path": false
+        }),
+    )
+    .expect("create task in GERDALO");
+
+    call_mcp_tool(
+        &mut conn,
+        "create_work_entity",
+        json!({
+            "project_id": "IRANOIL",
+            "title": "خروجی گزارش مصرف ایران‌اویل",
+            "status": "OPEN",
+            "is_on_critical_path": false
+        }),
+    )
+    .expect("create task in IRANOIL");
+
+    // 2. Inspect Path Ahead across ALL projects in one higher-layer call
+    let portfolio = call_mcp_tool(&mut conn, "get_all_projects_path_ahead", json!({}))
+        .expect("get_all_projects_path_ahead");
+    assert!(
+        portfolio["projects_count"].as_i64().unwrap_or(0) >= 2,
+        "Portfolio should cover at least 2 projects"
+    );
+
+    let queue = portfolio["global_prioritized_queue"]
+        .as_array()
+        .expect("global_prioritized_queue array");
+    let g_tid = queue
+        .iter()
+        .find(|t| t["project_id"] == "GERDALO")
+        .and_then(|t| t["id"].as_str())
+        .expect("GERDALO task ID")
+        .to_string();
+    let i_tid = queue
+        .iter()
+        .find(|t| t["project_id"] == "IRANOIL")
+        .and_then(|t| t["id"].as_str())
+        .expect("IRANOIL task ID")
+        .to_string();
+
+    // 3. Batch-prioritize across BOTH projects without specifying project_id (auto-resolved!)
+    let prio_res = call_mcp_tool(
+        &mut conn,
+        "prioritize_across_projects",
+        json!({
+            "items": [
+                {
+                    "task_id": i_tid,
+                    "priority_score": 98,
+                    "make_next_step": true,
+                    "is_on_critical_path": true,
+                    "scheduled_date": "2026-11-27",
+                    "scheduled_slot": "MORNING_DEEP"
+                },
+                {
+                    "task_id": g_tid,
+                    "priority_score": 82,
+                    "make_next_step": true,
+                    "is_on_critical_path": true
+                }
+            ]
+        }),
+    )
+    .expect("prioritize_across_projects");
+
+    assert_eq!(prio_res["status"], "ok");
+    let refreshed = prio_res["global_prioritized_queue"]
+        .as_array()
+        .expect("refreshed queue");
+    assert_eq!(
+        refreshed[0]["project_id"], "IRANOIL",
+        "IRANOIL task prioritized at P98 must rank #1 globally"
+    );
+    assert_eq!(refreshed[0]["priority_score"], 98);
+    assert_eq!(refreshed[0]["status"], "IN_PROGRESS");
+
+    let snap = mab_compass_lib::llm::prompts::build_cross_project_portfolio_snapshot(&conn);
+    assert!(snap.contains("IRANOIL"));
+    assert!(snap.contains("GERDALO"));
+    assert!(snap.contains("P=98"));
+}

@@ -202,12 +202,21 @@ export function AntigravityChatPane({
             {activeSession?.title || "گفتگوی همیار"}
           </span>
           {activeSession?.project_id === "GLOBAL" ? (
-            <span
-              dir="rtl"
-              className="px-2 py-0.5 rounded-md bg-cyan-500/15 border border-cyan-500/25 text-[10px] font-medium text-cyan-300 shrink-0"
-            >
-              آزاد • همه پروژه‌ها
-            </span>
+            <div className="flex items-center gap-1.5 shrink-0">
+              <span
+                dir="rtl"
+                className="px-2 py-0.5 rounded-md bg-cyan-500/15 border border-cyan-500/25 text-[10px] font-medium text-cyan-300 shrink-0"
+              >
+                لایه راهبردی • همه پروژه‌ها
+              </span>
+              <span
+                dir="auto"
+                title="پروژه نمایش‌داده‌شده در بوم راست"
+                className="hidden sm:inline-block px-2 py-0.5 rounded-md bg-white/[0.04] border border-white/[0.07] text-[10px] text-white/50 truncate max-w-[115px]"
+              >
+                بوم: {dash.active_project.name}
+              </span>
+            </div>
           ) : (
             <span
               dir="auto"
@@ -345,16 +354,20 @@ export function AntigravityChatPane({
             <div className="flex flex-wrap gap-1.5 pt-1">
               {[
                 {
+                  label: "بررسی و اولویت‌بندی همه پروژه‌ها",
+                  text: "مسیر پیش‌رو در همه پروژه‌های فعالم را بررسی کن، گلوگاه‌ها را بگو و اولویت‌های امروز را بین پروژه‌ها تنظیم کن.",
+                },
+                {
+                  label: "آپدیت چند پروژه در یک پیام",
+                  text: "این گزارش/نکات را درباره پروژه‌های مختلف بررسی کن و هر مورد را در پروژه مربوط به خودش ثبت و آپدیت کن:\n",
+                },
+                {
                   label: "استخراج متد و BPMN",
                   text: "از این گزارش کار، دستورالعمل گام‌به‌گام (متد انجام کار) و نمودار BPMN 2.0 را استخراج و ذخیره کن:\n",
                 },
                 {
                   label: "ساخت لاین کاری",
                   text: "برای این هدف یک لاین کاری پشت‌به‌پشت (WorkLine) با گام‌های دقیق بساز:\n",
-                },
-                {
-                  label: "ثبت گزارش کار",
-                  text: "گزارش کار امروز من:\n",
                 },
               ].map((chip, idx) => (
                 <button

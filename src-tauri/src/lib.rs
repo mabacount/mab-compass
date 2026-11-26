@@ -1,4 +1,5 @@
 pub mod db;
+pub mod ecosystem_core;
 pub mod file_extractor;
 pub mod llm;
 pub mod mab_focus_sync;
@@ -122,7 +123,26 @@ fn apply_envelope_cross_project(
         std::collections::BTreeMap::new();
 
     for m in &envelope.mutations {
+        let entity_owner = if m.project_id.is_none() {
+            m.target_id.as_deref().and_then(|tid| {
+                conn.query_row(
+                    "SELECT project_id FROM work_entities WHERE id = ?1 LIMIT 1",
+                    [tid.trim()],
+                    |r| r.get::<_, String>(0),
+                )
+                .ok()
+                .and_then(|pid| {
+                    projects
+                        .iter()
+                        .find(|p| p.id == pid)
+                        .map(|p| (p.id.clone(), p.name.clone()))
+                })
+            })
+        } else {
+            None
+        };
         let (target_pid, target_pname) = resolve_project_id_by_ref(projects, m.project_id.as_deref())
+            .or(entity_owner)
             .unwrap_or_else(|| (fallback_pid.to_string(), fallback_pname.to_string()));
         grouped
             .entry(target_pid)
@@ -225,6 +245,7 @@ use vault_manager::{archive_onboarding_document, archive_raw_user_input};
 pub struct AppState {
     pub db: Mutex<Connection>,
     pub app_data_dir: PathBuf,
+    pub last_core_revision: Mutex<i64>,
 }
 
 fn derive_title_from_content(raw_title: &str, content: &str, fallback: &str) -> String {
@@ -273,9 +294,39 @@ fn format_vault_user_summary(
 
 #[tauri::command]
 fn cmd_get_db_data_version(state: State<'_, AppState>) -> Result<i64, String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
-    conn.query_row("PRAGMA data_version", [], |r| r.get::<_, i64>(0))
-        .map_err(|e| e.to_string())
+    let mut conn = state.db.lock().map_err(|e| e.to_string())?;
+    let mut core_rev: i64 = 0;
+    if let Some(core_path) = ecosystem_core::resolve_default_core_db_path() {
+        let rev = ecosystem_core::get_core_revision_at_path(&core_path);
+        if rev > 0 {
+            let mut last = state
+                .last_core_revision
+                .lock()
+                .map_err(|e| e.to_string())?;
+            if rev != *last {
+                if let Ok(settings) = get_settings(&conn) {
+                    if settings.auto_sync_mab_focus {
+                        let _ = synchronize_with_mab_focus(&mut conn);
+                    } else {
+                        let _ = ecosystem_core::reconcile_compass_with_core_at_path(
+                            &mut conn,
+                            &core_path,
+                            &settings.vault_root_path,
+                        );
+                    }
+                }
+                let updated_rev = ecosystem_core::get_core_revision_at_path(&core_path);
+                *last = updated_rev;
+                core_rev = updated_rev;
+            } else {
+                core_rev = rev;
+            }
+        }
+    }
+    let local_ver: i64 = conn
+        .query_row("PRAGMA data_version", [], |r| r.get::<_, i64>(0))
+        .map_err(|e| e.to_string())?;
+    Ok(local_ver + core_rev)
 }
 
 #[tauri::command]
@@ -285,6 +336,25 @@ fn cmd_get_dashboard(state: State<'_, AppState>) -> Result<DashboardState, Strin
         if s.auto_sync_mab_focus {
             let _ = synchronize_with_mab_focus(&mut conn);
         }
+    }
+    if let Some(core_path) = ecosystem_core::resolve_default_core_db_path() {
+        if let Ok(mut last) = state.last_core_revision.lock() {
+            *last = ecosystem_core::get_core_revision_at_path(&core_path);
+        }
+    }
+    let decoupled_done: i64 = conn
+        .query_row(
+            "SELECT COALESCE(chat_decoupled_v1, 0) FROM app_settings WHERE id = 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if decoupled_done == 0 {
+        set_active_chat_scope(&conn, "GLOBAL");
+        let _ = conn.execute("UPDATE app_settings SET chat_decoupled_v1 = 1 WHERE id = 1", []);
+    }
+    if get_active_chat_scope(&conn) == "GLOBAL" {
+        let _ = ensure_active_chat_session(&conn, GLOBAL_CHAT_PROJECT_ID, "COPILOT");
     }
     let dash = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
     let _ = sync_all_project_projections(&dash, None, None);
@@ -312,10 +382,147 @@ fn cmd_create_project(
     state: State<'_, AppState>,
     id_code: String,
     name: String,
+    parent_id: Option<String>,
+    realm: Option<String>,
+    color: Option<String>,
+    lifecycle_status: Option<String>,
 ) -> Result<DashboardState, String> {
     let mut conn = state.db.lock().map_err(|e| e.to_string())?;
-    create_new_project(&conn, &id_code, &name).map_err(|e| e.to_string())?;
+    let created = create_new_project_with_options(
+        &conn,
+        &id_code,
+        &name,
+        parent_id.as_deref(),
+        realm.as_deref(),
+        color.as_deref(),
+        lifecycle_status.as_deref(),
+    )
+    .map_err(|e| e.to_string())?;
+    if let Some(core_path) = ecosystem_core::resolve_default_core_db_path() {
+        let _ = ecosystem_core::push_compass_project_upsert(&conn, &core_path, &created);
+        if let Ok(mut last) = state.last_core_revision.lock() {
+            *last = ecosystem_core::get_core_revision_at_path(&core_path);
+        }
+    }
     let _ = synchronize_with_mab_focus(&mut conn);
+    let dash = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
+    let _ = sync_all_project_projections(&dash, None, None);
+    Ok(dash)
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn cmd_update_project(
+    state: State<'_, AppState>,
+    project_id: String,
+    name: Option<String>,
+    parent_id: Option<String>,
+    clear_parent: Option<bool>,
+    realm: Option<String>,
+    lifecycle_status: Option<String>,
+    color: Option<String>,
+    daily_quota_minutes: Option<i32>,
+    weekly_quota_minutes: Option<i32>,
+    monthly_quota_minutes: Option<i32>,
+    hourly_rate: Option<f64>,
+) -> Result<DashboardState, String> {
+    let mut conn = state.db.lock().map_err(|e| e.to_string())?;
+    let updated = update_project_details(
+        &conn,
+        &project_id,
+        name.as_deref(),
+        parent_id.as_deref(),
+        clear_parent.unwrap_or(false),
+        realm.as_deref(),
+        lifecycle_status.as_deref(),
+        color.as_deref(),
+        daily_quota_minutes,
+        weekly_quota_minutes,
+        monthly_quota_minutes,
+        hourly_rate,
+    )
+    .map_err(|e| e.to_string())?;
+
+    if let Some(core_path) = ecosystem_core::resolve_default_core_db_path() {
+        let _ = ecosystem_core::push_compass_project_upsert(&conn, &core_path, &updated);
+        if let Ok(mut last) = state.last_core_revision.lock() {
+            *last = ecosystem_core::get_core_revision_at_path(&core_path);
+        }
+    }
+    let _ = synchronize_with_mab_focus(&mut conn);
+    let dash = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
+    let _ = sync_all_project_projections(&dash, None, None);
+    Ok(dash)
+}
+
+#[tauri::command]
+fn cmd_merge_projects(
+    state: State<'_, AppState>,
+    source_id: String,
+    target_id: String,
+) -> Result<DashboardState, String> {
+    if source_id.trim() == target_id.trim() {
+        return Err("پروژه مبدا و مقصد نمی‌توانند یکسان باشند.".into());
+    }
+    let mut conn = state.db.lock().map_err(|e| e.to_string())?;
+    let projects = ecosystem_core::load_compass_projects(&conn)?;
+    let src = projects
+        .iter()
+        .find(|p| p.id == source_id)
+        .cloned()
+        .ok_or_else(|| "پروژه مبدا یافت نشد.".to_string())?;
+    let tgt = projects
+        .iter()
+        .find(|p| p.id == target_id)
+        .cloned()
+        .ok_or_else(|| "پروژه مقصد یافت نشد.".to_string())?;
+
+    let src_core_id = src
+        .external_focus_id
+        .clone()
+        .unwrap_or_else(|| src.id.clone());
+    let tgt_core_id = tgt
+        .external_focus_id
+        .clone()
+        .unwrap_or_else(|| tgt.id.clone());
+
+    ecosystem_core::merge_compass_projects_atomic(&mut conn, &src.id, &tgt.id)?;
+
+    if let Some(core_path) = ecosystem_core::resolve_default_core_db_path() {
+        let _ = ecosystem_core::push_compass_project_merge(
+            &conn,
+            &core_path,
+            &src_core_id,
+            &tgt_core_id,
+            &src.id,
+            &src.name,
+        );
+        if let Ok(mut last) = state.last_core_revision.lock() {
+            *last = ecosystem_core::get_core_revision_at_path(&core_path);
+        }
+    }
+    let _ = synchronize_with_mab_focus(&mut conn);
+    let dash = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
+    let _ = sync_all_project_projections(&dash, None, None);
+    Ok(dash)
+}
+
+#[tauri::command]
+fn cmd_delete_project(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<DashboardState, String> {
+    let mut conn = state.db.lock().map_err(|e| e.to_string())?;
+    let deleted_core_ids = delete_project_local(&mut conn, &project_id).map_err(|e| e.to_string())?;
+    if deleted_core_ids.is_empty() {
+        return Err("حداقل یک پروژه باید در اکوسیستم باقی بماند.".into());
+    }
+    if let Some(core_path) = ecosystem_core::resolve_default_core_db_path() {
+        let _ = ecosystem_core::push_compass_project_delete(&core_path, &deleted_core_ids);
+        if let Ok(mut last) = state.last_core_revision.lock() {
+            *last = ecosystem_core::get_core_revision_at_path(&core_path);
+        }
+    }
     let dash = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
     let _ = sync_all_project_projections(&dash, None, None);
     Ok(dash)
@@ -449,6 +656,7 @@ async fn cmd_run_assistant_turn(
         copilot_history,
         vault_history,
         fts_hits,
+        portfolio_snapshot,
     ) = {
         let conn = state.db.lock().map_err(|e| e.to_string())?;
         let d = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
@@ -460,6 +668,7 @@ async fn cmd_run_assistant_turn(
         };
         let hits = search_raw_events_fts(&conn, fts_pid, &message_text)
             .unwrap_or_default();
+        let portfolio_snap = build_cross_project_portfolio_snapshot(&conn);
         let filtered_copilot: Vec<ChatMessage> = d
             .chat_history
             .iter()
@@ -486,6 +695,7 @@ async fn cmd_run_assistant_turn(
             filtered_copilot,
             filtered_vault,
             hits,
+            portfolio_snap,
         )
     };
 
@@ -513,9 +723,14 @@ async fn cmd_run_assistant_turn(
             &fts_hits,
         )
     };
-    let prompt = append_cross_project_routing_instructions(base_prompt, &chat_pid, &all_projects);
+    let enriched_base = if portfolio_snapshot.trim().is_empty() {
+        base_prompt
+    } else {
+        format!("{base_prompt}\n\n{portfolio_snapshot}")
+    };
+    let prompt = append_cross_project_routing_instructions(enriched_base, &chat_pid, &all_projects);
 
-    let (mcp_sys_prompt, mcp_user_prompt) = build_mcp_tool_turn_prompts_with_projects(
+    let (mcp_sys_prompt, mcp_user_prompt) = build_mcp_tool_turn_prompts_with_portfolio(
         &chat_pid,
         &norm_ch,
         &message_text,
@@ -529,6 +744,7 @@ async fn cmd_run_assistant_turn(
         None,
         false,
         &all_projects,
+        &portfolio_snapshot,
     );
 
     let llm_cfg = LlmConfig::from(&settings);
@@ -699,6 +915,10 @@ async fn cmd_retry_system_message(
 ) -> Result<AssistantTurnOutcome, String> {
     let (
         ctx,
+        active_pid,
+        active_pname,
+        all_projects,
+        portfolio_snapshot,
         settings,
         open_tasks,
         active_decisions,
@@ -718,6 +938,7 @@ async fn cmd_retry_system_message(
             let _ = switch_chat_session(&conn, &ctx.session_id);
         }
         let d = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
+        let portfolio_snap = build_cross_project_portfolio_snapshot(&conn);
 
         let recovered_text = ctx
             .user_archived_path
@@ -728,7 +949,12 @@ async fn cmd_retry_system_message(
             .or_else(|| ctx.raw_content.clone().filter(|s| !s.trim().is_empty()))
             .unwrap_or_else(|| ctx.user_message_text.clone());
 
-        let hits = search_raw_events_fts(&conn, &ctx.project_id, &recovered_text)
+        let fts_pid = if ctx.project_id == GLOBAL_CHAT_PROJECT_ID {
+            d.active_project.id.as_str()
+        } else {
+            ctx.project_id.as_str()
+        };
+        let hits = search_raw_events_fts(&conn, fts_pid, &recovered_text)
             .unwrap_or_default();
 
         let filtered_copilot: Vec<ChatMessage> = d
@@ -746,6 +972,10 @@ async fn cmd_retry_system_message(
 
         (
             ctx,
+            d.active_project.id.clone(),
+            d.active_project.name.clone(),
+            d.projects.clone(),
+            portfolio_snap,
             d.settings.clone(),
             d.open_tasks.clone(),
             d.active_decisions.clone(),
@@ -762,7 +992,7 @@ async fn cmd_retry_system_message(
     let is_vault_doc = ctx.channel == "VAULT"
         && ctx.raw_source_type.as_deref() == Some("DOC_ONBOARDING");
 
-    let prompt = if is_vault_doc {
+    let base_prompt = if is_vault_doc {
         let derived_title = derive_title_from_content("", &recovered_text, "سند بازیابی‌شده");
         build_document_onboarding_prompt(
             &ctx.project_id,
@@ -798,6 +1028,12 @@ async fn cmd_retry_system_message(
             &fts_hits,
         )
     };
+    let enriched_base = if portfolio_snapshot.trim().is_empty() {
+        base_prompt
+    } else {
+        format!("{base_prompt}\n\n{portfolio_snapshot}")
+    };
+    let prompt = append_cross_project_routing_instructions(enriched_base, &ctx.project_id, &all_projects);
 
     let doc_meta_owned = if is_vault_doc {
         Some((
@@ -812,7 +1048,7 @@ async fn cmd_retry_system_message(
         .as_ref()
         .map(|(t, dt, f)| (t.as_str(), dt.as_str(), f.as_str()));
 
-    let (mcp_sys_prompt, mcp_user_prompt) = build_mcp_tool_turn_prompts_with_methods(
+    let (mcp_sys_prompt, mcp_user_prompt) = build_mcp_tool_turn_prompts_with_portfolio(
         &ctx.project_id,
         &ctx.channel,
         &recovered_text,
@@ -825,6 +1061,8 @@ async fn cmd_retry_system_message(
         &fts_hits,
         doc_meta_ref,
         false,
+        &all_projects,
+        &portfolio_snapshot,
     );
 
     let llm_cfg = LlmConfig::from(&settings);
@@ -856,16 +1094,17 @@ async fn cmd_retry_system_message(
                     || !envelope.method_playbooks.is_empty()
                     || turn.mcp_ops_executed.is_empty()
                 {
-                    apply_copilot_envelope_with_artifacts(
+                    apply_envelope_cross_project(
                         &mut conn,
-                        &ctx.project_id,
+                        &all_projects,
+                        &active_pid,
+                        &active_pname,
                         &recovered_text,
                         ctx.user_archived_path.as_deref(),
                         source_origin,
                         &envelope,
                         ctx.raw_event_id,
-                    )
-                    .map_err(|e| e.to_string())?
+                    )?
                 } else {
                     ("بدون تغییر گراف".to_string(), Vec::new())
                 };
@@ -874,7 +1113,7 @@ async fn cmd_retry_system_message(
             let items_count = (envelope.mutations.len() + turn.mcp_ops_executed.len()) as i32;
             let matched_doc_id = find_unanalyzed_knowledge_doc_id(
                 &conn,
-                &ctx.project_id,
+                &active_pid,
                 ctx.system_archived_path.as_deref(),
                 &ctx.user_message_text,
             );
@@ -887,7 +1126,7 @@ async fn cmd_retry_system_message(
                     .unwrap_or_else(|| envelope.conversational_reply.clone());
                 let doc_title_opt = get_knowledge_document_by_id(&conn, doc_id).map(|d| d.title);
                 let new_kp = get_knowledge_document_by_id(&conn, doc_id).and_then(|doc| {
-                    let dash_proj = get_dashboard_state_for_project(&conn, Some(&ctx.project_id)).ok()?;
+                    let dash_proj = get_dashboard_state_for_project(&conn, Some(&active_pid)).ok()?;
                     archive_onboarding_document(
                         &dash_proj.active_project.workspace_path,
                         &doc.title,
@@ -911,7 +1150,8 @@ async fn cmd_retry_system_message(
                     file_path: new_kp,
                     action: "UPDATED".to_string(),
                     version: None,
-                    ..Default::default()
+                    project_id: Some(active_pid.clone()),
+                    project_name: Some(active_pname.clone()),
                 });
             }
 
@@ -936,8 +1176,10 @@ async fn cmd_retry_system_message(
             let _ = complete_pending_items_for_user_msg(&conn, ctx.user_message_id, matched_doc_id);
 
             let updated_dash = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
-            sync_all_project_projections(
+            sync_touched_project_projections(
+                &conn,
                 &updated_dash,
+                &written_artifacts,
                 envelope.meeting_title.as_deref(),
                 envelope.meeting_summary_markdown.as_deref(),
             )?;
@@ -1056,8 +1298,9 @@ fn cmd_commit_user_file_message(
 
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     let d = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
-    let pid = d.active_project.id.clone();
-    let workspace_path = d.active_project.workspace_path.clone();
+    let chat_pid = resolve_chat_session_project_id(&conn, session_id.as_deref(), &d.active_project.id);
+    let doc_pid = d.active_project.id.clone();
+    let workspace_path = resolve_chat_archive_workspace(&d.active_project.workspace_path, &chat_pid);
 
     let archived_path = archive_raw_user_input(
         &workspace_path,
@@ -1068,7 +1311,7 @@ fn cmd_commit_user_file_message(
     let file_source_type = if norm_ch == "VAULT" { "DOC_ONBOARDING" } else { "COPILOT_FILE" };
     let (resolved_sid, raw_event_id, user_message_id) = commit_user_chat_turn(
         &conn,
-        &pid,
+        &chat_pid,
         session_id.as_deref(),
         &norm_ch,
         &display_user_msg,
@@ -1079,7 +1322,7 @@ fn cmd_commit_user_file_message(
 
     let kdoc_id = insert_knowledge_doc_with_status(
         &conn,
-        &pid,
+        &doc_pid,
         &effective_title,
         &effective_doc_type,
         &original_filename,
@@ -1094,7 +1337,7 @@ fn cmd_commit_user_file_message(
     let _ = insert_pending_queue_item(
         &conn,
         PendingQueueInput {
-            project_id: &pid,
+            project_id: &chat_pid,
             session_id: &resolved_sid,
             channel: &norm_ch,
             user_message_id: Some(user_message_id),
@@ -1147,13 +1390,14 @@ fn cmd_commit_vault_text_message(
 
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     let d = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
-    let pid = d.active_project.id.clone();
-    let workspace_path = d.active_project.workspace_path.clone();
+    let chat_pid = resolve_chat_session_project_id(&conn, session_id.as_deref(), &d.active_project.id);
+    let doc_pid = d.active_project.id.clone();
+    let workspace_path = resolve_chat_archive_workspace(&d.active_project.workspace_path, &chat_pid);
 
     let archived_path = archive_raw_user_input(&workspace_path, "vault_text", &content)?;
     let (resolved_sid, raw_event_id, user_message_id) = commit_user_chat_turn(
         &conn,
-        &pid,
+        &chat_pid,
         session_id.as_deref(),
         "VAULT",
         &display_user_msg,
@@ -1164,7 +1408,7 @@ fn cmd_commit_vault_text_message(
 
     let kdoc_id = insert_knowledge_doc_with_status(
         &conn,
-        &pid,
+        &doc_pid,
         &effective_title,
         &doc_type,
         &effective_filename,
@@ -1179,7 +1423,7 @@ fn cmd_commit_vault_text_message(
     let _ = insert_pending_queue_item(
         &conn,
         PendingQueueInput {
-            project_id: &pid,
+            project_id: &chat_pid,
             session_id: &resolved_sid,
             channel: "VAULT",
             user_message_id: Some(user_message_id),
@@ -1227,7 +1471,10 @@ async fn cmd_run_file_assistant_turn(
 ) -> Result<AssistantTurnOutcome, String> {
     let norm_ch = normalize_chat_channel(&channel).to_string();
     let (
+        chat_pid,
         pid,
+        pname,
+        all_projects,
         workspace_path,
         settings,
         open_tasks,
@@ -1238,6 +1485,7 @@ async fn cmd_run_file_assistant_turn(
         copilot_history,
         vault_history,
         resolved_kdoc_id,
+        portfolio_snapshot,
     ) = {
         let conn = state.db.lock().map_err(|e| e.to_string())?;
         let resolved_doc = knowledge_doc_id.or_else(|| {
@@ -1253,6 +1501,8 @@ async fn cmd_run_file_assistant_turn(
             let _ = set_knowledge_doc_processing_status(&conn, did, "PROCESSING", None, None, None);
         }
         let d = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
+        let chat_pid = resolve_chat_session_project_id(&conn, Some(&session_id), &d.active_project.id);
+        let portfolio_snap = build_cross_project_portfolio_snapshot(&conn);
         let filtered_copilot: Vec<ChatMessage> = d
             .chat_history
             .iter()
@@ -1266,7 +1516,10 @@ async fn cmd_run_file_assistant_turn(
             .cloned()
             .collect();
         (
+            chat_pid,
             d.active_project.id.clone(),
+            d.active_project.name.clone(),
+            d.projects.clone(),
             d.active_project.workspace_path.clone(),
             d.settings.clone(),
             d.open_tasks.clone(),
@@ -1277,12 +1530,13 @@ async fn cmd_run_file_assistant_turn(
             filtered_copilot,
             filtered_vault,
             resolved_doc,
+            portfolio_snap,
         )
     };
 
-    let prompt = if norm_ch == "VAULT" {
+    let base_prompt = if norm_ch == "VAULT" {
         build_document_onboarding_prompt(
-            &pid,
+            &chat_pid,
             &effective_title,
             &doc_type,
             &effective_filename,
@@ -1293,7 +1547,7 @@ async fn cmd_run_file_assistant_turn(
         )
     } else {
         build_copilot_chat_prompt(
-            &pid,
+            &chat_pid,
             &combined_prompt_text,
             &copilot_history,
             &vault_history,
@@ -1304,9 +1558,15 @@ async fn cmd_run_file_assistant_turn(
             &[],
         )
     };
+    let enriched_base = if portfolio_snapshot.trim().is_empty() {
+        base_prompt
+    } else {
+        format!("{base_prompt}\n\n{portfolio_snapshot}")
+    };
+    let prompt = append_cross_project_routing_instructions(enriched_base, &chat_pid, &all_projects);
 
-    let (mcp_sys_prompt, mcp_user_prompt) = build_mcp_tool_turn_prompts_with_methods(
-        &pid,
+    let (mcp_sys_prompt, mcp_user_prompt) = build_mcp_tool_turn_prompts_with_portfolio(
+        &chat_pid,
         &norm_ch,
         if norm_ch == "VAULT" { &extracted_text } else { &combined_prompt_text },
         if norm_ch == "VAULT" { &vault_history } else { &copilot_history },
@@ -1318,6 +1578,8 @@ async fn cmd_run_file_assistant_turn(
         &[],
         Some((&effective_title, &doc_type, &effective_filename)),
         false,
+        &all_projects,
+        &portfolio_snapshot,
     );
 
     let llm_cfg = LlmConfig::from(&settings);
@@ -1326,7 +1588,7 @@ async fn cmd_run_file_assistant_turn(
         &state.db,
         state.app_data_dir.clone(),
         &llm_cfg,
-        &pid,
+        &chat_pid,
         Some(raw_event_id),
         source_origin,
         &mcp_sys_prompt,
@@ -1357,16 +1619,17 @@ async fn cmd_run_file_assistant_turn(
                     || !envelope.method_playbooks.is_empty()
                     || turn.mcp_ops_executed.is_empty()
                 {
-                    apply_copilot_envelope_with_artifacts(
+                    apply_envelope_cross_project(
                         &mut conn,
+                        &all_projects,
                         &pid,
+                        &pname,
                         &combined_prompt_text,
                         Some(&knowledge_path),
                         source_origin,
                         &envelope,
                         Some(raw_event_id),
-                    )
-                    .map_err(|e| e.to_string())?
+                    )?
                 } else {
                     ("بدون تغییر گراف".to_string(), Vec::new())
                 };
@@ -1406,7 +1669,8 @@ async fn cmd_run_file_assistant_turn(
                 file_path: Some(knowledge_path.clone()),
                 action: "CREATED".to_string(),
                 version: None,
-                ..Default::default()
+                project_id: Some(pid.clone()),
+                project_name: Some(pname.clone()),
             }];
             if let (Some(mtitle), Some(mbody)) = (
                 envelope.meeting_title.as_deref().map(str::trim).filter(|s| !s.is_empty()),
@@ -1420,7 +1684,8 @@ async fn cmd_run_file_assistant_turn(
                     file_path: None,
                     action: "CREATED".to_string(),
                     version: None,
-                    ..Default::default()
+                    project_id: Some(pid.clone()),
+                    project_name: Some(pname.clone()),
                 });
             }
             let written_artifacts =
@@ -1428,7 +1693,7 @@ async fn cmd_run_file_assistant_turn(
 
             append_assistant_chat_message_with_artifacts(
                 &conn,
-                &pid,
+                &chat_pid,
                 &session_id,
                 &norm_ch,
                 "ASSISTANT",
@@ -1443,8 +1708,10 @@ async fn cmd_run_file_assistant_turn(
             let _ = complete_pending_items_for_user_msg(&conn, user_message_id, inserted_doc_id);
 
             let updated = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
-            sync_all_project_projections(
+            sync_touched_project_projections(
+                &conn,
                 &updated,
+                &written_artifacts,
                 envelope.meeting_title.as_deref(),
                 envelope.meeting_summary_markdown.as_deref(),
             )?;
@@ -1497,7 +1764,7 @@ async fn cmd_run_file_assistant_turn(
             );
             let sys_id = append_assistant_chat_message(
                 &conn,
-                &pid,
+                &chat_pid,
                 &session_id,
                 &norm_ch,
                 "SYSTEM",
@@ -1511,7 +1778,7 @@ async fn cmd_run_file_assistant_turn(
                 .and_then(|(_, arch)| arch);
             let _ = enqueue_pending_ai_item(
                 &conn,
-                &pid,
+                &chat_pid,
                 &session_id,
                 &norm_ch,
                 Some(user_message_id),
@@ -1539,11 +1806,24 @@ fn cmd_quick_complete_step(
     pomos_spent: i32,
 ) -> Result<DashboardState, String> {
     let mut conn = state.db.lock().map_err(|e| e.to_string())?;
+    let owner_pid: Option<String> = conn
+        .query_row(
+            "SELECT project_id FROM work_entities WHERE id = ?1 LIMIT 1",
+            [&task_id],
+            |r| r.get(0),
+        )
+        .ok();
     let dash_before = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
-    quick_complete_task(&mut conn, &dash_before.active_project.id, &task_id, pomos_spent)
+    let target_pid = owner_pid.unwrap_or_else(|| dash_before.active_project.id.clone());
+    quick_complete_task(&mut conn, &target_pid, &task_id, pomos_spent)
         .map_err(|e| e.to_string())?;
     let dash_after = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
     let _ = sync_all_project_projections(&dash_after, None, None);
+    if target_pid != dash_after.active_project.id {
+        if let Ok(other_dash) = get_dashboard_state_for_project(&conn, Some(&target_pid)) {
+            let _ = sync_all_project_projections(&other_dash, None, None);
+        }
+    }
     Ok(dash_after)
 }
 
@@ -1553,14 +1833,27 @@ fn cmd_start_task_step(
     task_id: String,
 ) -> Result<DashboardState, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let owner_pid: Option<String> = conn
+        .query_row(
+            "SELECT project_id FROM work_entities WHERE id = ?1 LIMIT 1",
+            [&task_id],
+            |r| r.get(0),
+        )
+        .ok();
     let dash_before = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
-    let started = start_task_step(&conn, &dash_before.active_project.id, &task_id)
+    let target_pid = owner_pid.unwrap_or_else(|| dash_before.active_project.id.clone());
+    let started = start_task_step(&conn, &target_pid, &task_id)
         .map_err(|e| e.to_string())?;
     if !started {
         return Err("این گام یا در زنجیره قفل است یا از قبل در حال اجرا می‌باشد.".into());
     }
     let dash_after = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
     let _ = sync_all_project_projections(&dash_after, None, None);
+    if target_pid != dash_after.active_project.id {
+        if let Ok(other_dash) = get_dashboard_state_for_project(&conn, Some(&target_pid)) {
+            let _ = sync_all_project_projections(&other_dash, None, None);
+        }
+    }
     Ok(dash_after)
 }
 
@@ -1844,8 +2137,13 @@ async fn cmd_process_pending_queue_item(
         if let Some(doc_id) = item.knowledge_doc_id {
             let _ = set_knowledge_doc_processing_status(&conn, doc_id, "PROCESSING", None, None, None);
         }
-        let target_dash = get_dashboard_state_for_project(&conn, Some(&item.project_id))
-            .map_err(|e| e.to_string())?;
+        let target_dash = if item.project_id == GLOBAL_CHAT_PROJECT_ID {
+            get_dashboard_state(&conn).map_err(|e| e.to_string())?
+        } else {
+            get_dashboard_state_for_project(&conn, Some(&item.project_id))
+                .map_err(|e| e.to_string())?
+        };
+        let portfolio_snapshot = build_cross_project_portfolio_snapshot(&conn);
 
         let raw_row = item
             .raw_event_id
@@ -1918,7 +2216,12 @@ async fn cmd_process_pending_queue_item(
             (session_msgs, target_dash.vault_chat_history.clone())
         };
 
-        let fts_hits = search_raw_events_fts(&conn, &item.project_id, &recovered_text)
+        let fts_pid = if item.project_id == GLOBAL_CHAT_PROJECT_ID {
+            target_dash.active_project.id.as_str()
+        } else {
+            item.project_id.as_str()
+        };
+        let fts_hits = search_raw_events_fts(&conn, fts_pid, &recovered_text)
             .unwrap_or_default();
 
         (
@@ -1932,6 +2235,7 @@ async fn cmd_process_pending_queue_item(
             copilot_history,
             vault_history,
             fts_hits,
+            portfolio_snapshot,
         )
     };
 
@@ -1946,6 +2250,7 @@ async fn cmd_process_pending_queue_item(
         copilot_history,
         vault_history,
         fts_hits,
+        portfolio_snapshot,
     ) = prep;
 
     let norm_ch = normalize_chat_channel(&item.channel).to_string();
@@ -2043,7 +2348,7 @@ async fn cmd_process_pending_queue_item(
         )
     };
 
-    let (mcp_sys_prompt, mcp_user_prompt) = build_mcp_tool_turn_prompts_with_methods(
+    let (mcp_sys_prompt, mcp_user_prompt) = build_mcp_tool_turn_prompts_with_portfolio(
         &item.project_id,
         &norm_ch,
         &recovered_text,
@@ -2060,6 +2365,18 @@ async fn cmd_process_pending_queue_item(
         &fts_hits,
         doc_meta_ref,
         is_legacy_reprocess,
+        &target_dash.projects,
+        &portfolio_snapshot,
+    );
+
+    let enriched_prompt = append_cross_project_routing_instructions(
+        if portfolio_snapshot.trim().is_empty() {
+            prompt
+        } else {
+            format!("{prompt}\n\n{portfolio_snapshot}")
+        },
+        &item.project_id,
+        &target_dash.projects,
     );
 
     let llm_cfg = LlmConfig::from(&target_dash.settings);
@@ -2072,7 +2389,7 @@ async fn cmd_process_pending_queue_item(
         &source_origin,
         &mcp_sys_prompt,
         &mcp_user_prompt,
-        &prompt,
+        &enriched_prompt,
     )
     .await
     {
@@ -2084,16 +2401,17 @@ async fn cmd_process_pending_queue_item(
                     || !envelope.method_playbooks.is_empty()
                     || turn.mcp_ops_executed.is_empty()
                 {
-                    apply_copilot_envelope_with_artifacts(
+                    apply_envelope_cross_project(
                         &mut conn,
-                        &item.project_id,
+                        &target_dash.projects,
+                        &target_dash.active_project.id,
+                        &target_dash.active_project.name,
                         &recovered_text,
                         item.archived_path.as_deref(),
                         &source_origin,
                         &envelope,
                         item.raw_event_id,
-                    )
-                    .map_err(|e| e.to_string())?
+                    )?
                 } else {
                     ("بدون تغییر گراف".to_string(), Vec::new())
                 };
@@ -2196,13 +2514,13 @@ async fn cmd_process_pending_queue_item(
                 let _ = complete_pending_items_for_user_msg(&conn, uid, item.knowledge_doc_id);
             }
 
-            if let Ok(proj_dash) = get_dashboard_state_for_project(&conn, Some(&item.project_id)) {
-                let _ = sync_all_project_projections(
-                    &proj_dash,
-                    envelope.meeting_title.as_deref(),
-                    envelope.meeting_summary_markdown.as_deref(),
-                );
-            }
+            let _ = sync_touched_project_projections(
+                &conn,
+                &target_dash,
+                &written_artifacts,
+                envelope.meeting_title.as_deref(),
+                envelope.meeting_summary_markdown.as_deref(),
+            );
 
             let updated_dash = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
             Ok(PendingQueueProcessOutcome {
@@ -2770,9 +3088,14 @@ pub fn run() {
                 let _ = sync_all_project_projections(&dash, None, None);
             }
 
+            let initial_core_rev = ecosystem_core::resolve_default_core_db_path()
+                .map(|p| ecosystem_core::get_core_revision_at_path(&p))
+                .unwrap_or(0);
+
             app.manage(AppState {
                 db: Mutex::new(conn),
                 app_data_dir,
+                last_core_revision: Mutex::new(initial_core_rev),
             });
             Ok(())
         })
@@ -2781,6 +3104,9 @@ pub fn run() {
             cmd_get_dashboard,
             cmd_switch_project,
             cmd_create_project,
+            cmd_update_project,
+            cmd_merge_projects,
+            cmd_delete_project,
             cmd_quick_complete_step,
             cmd_start_task_step,
             cmd_create_work_line_chain,

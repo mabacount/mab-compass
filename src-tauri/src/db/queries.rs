@@ -54,6 +54,18 @@ pub fn update_settings(conn: &Connection, s: &AppSettings) -> Result<()> {
 }
 
 pub fn create_new_project(conn: &Connection, id_code: &str, name: &str) -> Result<Project> {
+    create_new_project_with_options(conn, id_code, name, None, None, None, None)
+}
+
+pub fn create_new_project_with_options(
+    conn: &Connection,
+    id_code: &str,
+    name: &str,
+    parent_id: Option<&str>,
+    realm: Option<&str>,
+    color: Option<&str>,
+    lifecycle_status: Option<&str>,
+) -> Result<Project> {
     let settings = get_settings(conn)?;
     let raw_code: String = id_code
         .trim()
@@ -80,24 +92,193 @@ pub fn create_new_project(conn: &Connection, id_code: &str, name: &str) -> Resul
         .to_string();
 
     let _ = ensure_project_directories(&workspace_path);
-    let now = Local::now().to_rfc3339();
+    let now = chrono::Utc::now().to_rfc3339();
+    let ext_uuid = uuid::Uuid::new_v4().to_string();
+    let norm_realm = if realm.unwrap_or("WORK").trim().eq_ignore_ascii_case("LIFE") {
+        "LIFE"
+    } else {
+        "WORK"
+    };
+    let norm_color = color
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(if norm_realm == "LIFE" { "#10B981" } else { "#3B82F6" });
+    let norm_status = match lifecycle_status
+        .unwrap_or("ACTIVE")
+        .trim()
+        .to_ascii_uppercase()
+        .as_str()
+    {
+        "PAUSED" | "SUSPENDED" => "PAUSED",
+        "ARCHIVED" => "ARCHIVED",
+        _ => "ACTIVE",
+    };
+    let clean_parent = parent_id
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != clean_id)
+        .map(str::to_string);
 
     conn.execute("UPDATE projects SET is_active = 0", [])?;
     conn.execute(
-        "INSERT OR REPLACE INTO projects (id, name, workspace_path, external_focus_id, is_active, updated_at)
-         VALUES (?1, ?2, ?3, ?1, 1, ?4)",
-        params![clean_id, display_name, workspace_path, now],
+        "INSERT OR REPLACE INTO projects (
+            id, name, workspace_path, external_focus_id, is_active, updated_at,
+            realm, lifecycle_status, parent_id, color, created_at
+         ) VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7, ?8, ?9, ?5)",
+        params![
+            clean_id,
+            display_name,
+            workspace_path,
+            ext_uuid,
+            now,
+            norm_realm,
+            norm_status,
+            clean_parent,
+            norm_color,
+        ],
     )?;
 
     Ok(Project {
-        id: clean_id.clone(),
+        id: clean_id,
         name: display_name,
         workspace_path,
-        external_focus_id: Some(clean_id),
+        external_focus_id: Some(ext_uuid),
         is_active: true,
-        updated_at: now,
+        updated_at: now.clone(),
+        realm: norm_realm.to_string(),
+        lifecycle_status: norm_status.to_string(),
+        parent_id: clean_parent,
+        color: norm_color.to_string(),
+        created_at: now,
         ..Default::default()
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn update_project_details(
+    conn: &Connection,
+    project_id: &str,
+    name: Option<&str>,
+    parent_id: Option<&str>,
+    clear_parent: bool,
+    realm: Option<&str>,
+    lifecycle_status: Option<&str>,
+    color: Option<&str>,
+    daily_quota_minutes: Option<i32>,
+    weekly_quota_minutes: Option<i32>,
+    monthly_quota_minutes: Option<i32>,
+    hourly_rate: Option<f64>,
+) -> Result<Project> {
+    let existing = crate::ecosystem_core::load_compass_projects(conn)
+        .map_err(|_| rusqlite::Error::QueryReturnedNoRows)?
+        .into_iter()
+        .find(|p| p.id == project_id)
+        .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+
+    let next_name = name
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&existing.name)
+        .to_string();
+    let next_parent = if clear_parent {
+        None
+    } else if let Some(pid) = parent_id {
+        let trimmed = pid.trim();
+        if trimmed.is_empty() || trimmed == project_id {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    } else {
+        existing.parent_id.clone()
+    };
+    let next_realm = match realm.map(str::trim) {
+        Some(r) if r.eq_ignore_ascii_case("LIFE") => "LIFE".to_string(),
+        Some(r) if r.eq_ignore_ascii_case("WORK") => "WORK".to_string(),
+        _ => existing.realm.clone(),
+    };
+    let next_status = match lifecycle_status.map(|s| s.trim().to_ascii_uppercase()) {
+        Some(s) if s == "PAUSED" || s == "SUSPENDED" => "PAUSED".to_string(),
+        Some(s) if s == "ARCHIVED" => "ARCHIVED".to_string(),
+        Some(s) if s == "ACTIVE" => "ACTIVE".to_string(),
+        _ => existing.lifecycle_status.clone(),
+    };
+    let next_color = color
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&existing.color)
+        .to_string();
+    let next_daily = daily_quota_minutes.unwrap_or(existing.daily_quota_minutes);
+    let next_weekly = weekly_quota_minutes.unwrap_or(existing.weekly_quota_minutes);
+    let next_monthly = monthly_quota_minutes.unwrap_or(existing.monthly_quota_minutes);
+    let next_rate = hourly_rate.unwrap_or(existing.hourly_rate);
+    let now = chrono::Utc::now().to_rfc3339();
+
+    conn.execute(
+        "UPDATE projects SET
+            name = ?1, parent_id = ?2, realm = ?3, lifecycle_status = ?4,
+            color = ?5, daily_quota_minutes = ?6, weekly_quota_minutes = ?7,
+            monthly_quota_minutes = ?8, hourly_rate = ?9, updated_at = ?10
+         WHERE id = ?11",
+        params![
+            next_name,
+            next_parent,
+            next_realm,
+            next_status,
+            next_color,
+            next_daily,
+            next_weekly,
+            next_monthly,
+            next_rate,
+            now,
+            project_id,
+        ],
+    )?;
+
+    crate::ecosystem_core::load_compass_projects(conn)
+        .map_err(|_| rusqlite::Error::QueryReturnedNoRows)?
+        .into_iter()
+        .find(|p| p.id == project_id)
+        .ok_or(rusqlite::Error::QueryReturnedNoRows)
+}
+
+pub fn delete_project_local(conn: &mut Connection, project_id: &str) -> Result<Vec<String>> {
+    let all = crate::ecosystem_core::load_compass_projects(conn)
+        .map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
+    if all.len() <= 1 {
+        return Ok(Vec::new());
+    }
+    let mut to_delete = vec![project_id.to_string()];
+    let mut i = 0;
+    while i < to_delete.len() {
+        let cur = to_delete[i].clone();
+        for p in &all {
+            if p.parent_id.as_deref() == Some(cur.as_str()) && !to_delete.contains(&p.id) {
+                to_delete.push(p.id.clone());
+            }
+        }
+        i += 1;
+    }
+
+    let mut deleted_core_ids = Vec::new();
+    for pid in &to_delete {
+        if let Some(proj) = all.iter().find(|p| p.id == *pid) {
+            if let Some(ref ext) = proj.external_focus_id {
+                deleted_core_ids.push(ext.clone());
+            }
+        }
+        conn.execute("DELETE FROM projects WHERE id = ?1", params![pid])?;
+    }
+
+    let active_cnt: i64 = conn
+        .query_row("SELECT COUNT(*) FROM projects WHERE is_active = 1", [], |r| r.get(0))
+        .unwrap_or(0);
+    if active_cnt == 0 {
+        let _ = conn.execute(
+            "UPDATE projects SET is_active = 1 WHERE id = (SELECT id FROM projects ORDER BY id LIMIT 1)",
+            [],
+        );
+    }
+    Ok(deleted_core_ids)
 }
 
 pub fn get_dashboard_state(conn: &Connection) -> Result<DashboardState> {
@@ -109,24 +290,8 @@ pub fn get_dashboard_state_for_project(
     project_id_override: Option<&str>,
 ) -> Result<DashboardState> {
     let settings = get_settings(conn)?;
-    let mut stmt = conn.prepare(
-        "SELECT id, name, workspace_path, external_focus_id, is_active, updated_at
-         FROM projects ORDER BY is_active DESC, id",
-    )?;
-    let projects: Vec<Project> = stmt
-        .query_map([], |r| {
-            Ok(Project {
-                id: r.get(0)?,
-                name: r.get(1)?,
-                workspace_path: r.get(2)?,
-                external_focus_id: r.get(3)?,
-                is_active: r.get::<_, i32>(4)? == 1,
-                updated_at: r.get(5)?,
-                ..Default::default()
-            })
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
+    let projects = crate::ecosystem_core::load_compass_projects(conn)
+        .map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
 
     let active_project = if let Some(req_id) = project_id_override.map(str::trim).filter(|s| !s.is_empty()) {
         projects
@@ -446,6 +611,11 @@ pub fn get_dashboard_state_for_project(
     let personal_vault_items = query_all_personal_vault_items(conn).unwrap_or_default();
     let methods_playbooks =
         crate::method_engine::query_all_methods_playbooks(conn, pid).unwrap_or_default();
+    let (portfolio_projects, cross_project_priorities) = if project_id_override.is_none() {
+        query_portfolio_path_summary(conn, &projects).unwrap_or_default()
+    } else {
+        (Vec::new(), Vec::new())
+    };
 
     Ok(DashboardState {
         projects,
@@ -479,7 +649,135 @@ pub fn get_dashboard_state_for_project(
         pending_proposals,
         personal_vault_items,
         methods_playbooks,
+        active_chat_scope,
+        portfolio_projects,
+        cross_project_priorities,
     })
+}
+
+pub fn query_portfolio_path_summary(
+    conn: &Connection,
+    projects: &[Project],
+) -> Result<(Vec<ProjectPathSummary>, Vec<WorkEntity>)> {
+    let mut summaries = Vec::new();
+    let mut global_candidates: Vec<(bool, bool, i32, String, String, WorkEntity)> = Vec::new();
+
+    for proj in projects {
+        let is_archived = proj.lifecycle_status.eq_ignore_ascii_case("ARCHIVED");
+        if is_archived && !proj.is_active {
+            continue;
+        }
+        let pid = &proj.id;
+        let work_lines = query_all_work_lines(conn, pid).unwrap_or_default();
+        let active_wl_count = work_lines
+            .iter()
+            .filter(|w| !w.status.eq_ignore_ascii_case("COMPLETED") && !w.status.eq_ignore_ascii_case("ARCHIVED"))
+            .count() as i32;
+
+        let mut open_tasks = query_entities(
+            conn,
+            pid,
+            "TASK",
+            &["OPEN", "IN_PROGRESS", "BLOCKED", "QUEUED_IN_CHAIN"],
+        )
+        .unwrap_or_default();
+
+        for task in &mut open_tasks {
+            task.project_name = proj.name.clone();
+            if let Some(ref wl_id) = task.work_line_id {
+                if let Some(wl) = work_lines.iter().find(|w| w.id == *wl_id) {
+                    task.work_line_title = Some(wl.title.clone());
+                    if task.outcome_id.is_none() {
+                        task.outcome_id = wl.outcome_id.clone();
+                    }
+                }
+                if task.status == "QUEUED_IN_CHAIN"
+                    || is_locked_by_chain(conn, &task.id).unwrap_or(false)
+                {
+                    task.is_locked_by_chain = true;
+                }
+            } else if task.status == "QUEUED_IN_CHAIN" {
+                task.is_locked_by_chain = true;
+            }
+        }
+
+        let unblocked: Vec<WorkEntity> = open_tasks
+            .iter()
+            .filter(|t| {
+                t.status != "BLOCKED"
+                    && t.status != "QUEUED_IN_CHAIN"
+                    && !t.is_locked_by_chain
+            })
+            .cloned()
+            .collect();
+
+        let next_step_task = unblocked
+            .iter()
+            .find(|t| t.status == "IN_PROGRESS" && t.is_on_critical_path)
+            .or_else(|| unblocked.iter().find(|t| t.status == "IN_PROGRESS"))
+            .or_else(|| unblocked.first())
+            .cloned();
+
+        let horizon_tasks: Vec<WorkEntity> = unblocked
+            .iter()
+            .filter(|t| next_step_task.as_ref().map(|ns| ns.id != t.id).unwrap_or(true))
+            .take(3)
+            .cloned()
+            .collect();
+
+        let mut blockers = query_entities(conn, pid, "BLOCKER", &["OPEN", "IN_PROGRESS", "BLOCKED"])
+            .unwrap_or_default();
+        for b in &mut blockers {
+            b.project_name = proj.name.clone();
+        }
+
+        let open_tasks_count = open_tasks.len() as i32;
+        let in_progress_count = open_tasks.iter().filter(|t| t.status == "IN_PROGRESS").count() as i32;
+
+        if !proj.lifecycle_status.eq_ignore_ascii_case("ARCHIVED")
+            && !proj.lifecycle_status.eq_ignore_ascii_case("PAUSED")
+        {
+            for task in &unblocked {
+                let is_ip = task.status == "IN_PROGRESS";
+                let sched = task.scheduled_date.clone().unwrap_or_else(|| "9999-99-99".to_string());
+                let due = task.due_date.clone().unwrap_or_else(|| "9999-99-99".to_string());
+                global_candidates.push((
+                    is_ip,
+                    task.is_on_critical_path,
+                    task.priority_score,
+                    sched,
+                    due,
+                    task.clone(),
+                ));
+            }
+        }
+
+        summaries.push(ProjectPathSummary {
+            project: proj.clone(),
+            next_step_task,
+            horizon_tasks,
+            blockers,
+            open_tasks_count,
+            in_progress_count,
+            active_work_lines_count: active_wl_count,
+        });
+    }
+
+    global_candidates.sort_by(|a, b| {
+        b.2.cmp(&a.2) // priority_score DESC
+            .then_with(|| b.0.cmp(&a.0)) // IN_PROGRESS DESC
+            .then_with(|| b.1.cmp(&a.1)) // is_on_critical_path DESC
+            .then_with(|| a.3.cmp(&b.3)) // earliest scheduled_date ASC
+            .then_with(|| a.4.cmp(&b.4)) // earliest due_date ASC
+    });
+
+    let cross_project_priorities = global_candidates
+        .into_iter()
+        .take(30)
+        .map(|(_, _, _, _, _, t)| t)
+        .collect();
+
+    Ok((summaries, cross_project_priorities))
 }
 
 pub fn query_all_domains(conn: &Connection) -> Result<Vec<LifeDomain>> {
@@ -692,14 +990,14 @@ pub fn get_active_chat_scope(conn: &Connection) -> String {
         conn,
         "app_settings",
         "active_chat_scope",
-        "ALTER TABLE app_settings ADD COLUMN active_chat_scope TEXT NOT NULL DEFAULT 'PROJECT'",
+        "ALTER TABLE app_settings ADD COLUMN active_chat_scope TEXT NOT NULL DEFAULT 'GLOBAL'",
     );
     conn.query_row(
-        "SELECT COALESCE(active_chat_scope, 'PROJECT') FROM app_settings WHERE id = 1",
+        "SELECT COALESCE(active_chat_scope, 'GLOBAL') FROM app_settings WHERE id = 1",
         [],
         |r| r.get::<_, String>(0),
     )
-    .unwrap_or_else(|_| "PROJECT".to_string())
+    .unwrap_or_else(|_| "GLOBAL".to_string())
 }
 
 pub fn set_active_chat_scope(conn: &Connection, scope: &str) {
@@ -707,7 +1005,7 @@ pub fn set_active_chat_scope(conn: &Connection, scope: &str) {
         conn,
         "app_settings",
         "active_chat_scope",
-        "ALTER TABLE app_settings ADD COLUMN active_chat_scope TEXT NOT NULL DEFAULT 'PROJECT'",
+        "ALTER TABLE app_settings ADD COLUMN active_chat_scope TEXT NOT NULL DEFAULT 'GLOBAL'",
     );
     let norm = if scope.eq_ignore_ascii_case("GLOBAL") {
         "GLOBAL"
@@ -875,18 +1173,7 @@ pub fn delete_chat_session(conn: &Connection, session_id: &str) -> Result<()> {
             params![session_id],
         )?;
         if pid == GLOBAL_CHAT_PROJECT_ID {
-            let remaining: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM chat_sessions WHERE project_id = ?1 AND channel = ?2",
-                    params![GLOBAL_CHAT_PROJECT_ID, ch],
-                    |r| r.get(0),
-                )
-                .unwrap_or(0);
-            if remaining == 0 {
-                set_active_chat_scope(conn, "PROJECT");
-            } else {
-                let _ = ensure_active_chat_session(conn, &pid, &ch);
-            }
+            let _ = ensure_active_chat_session(conn, &pid, &ch);
         } else {
             let _ = ensure_active_chat_session(conn, &pid, &ch);
         }
@@ -1061,6 +1348,7 @@ pub fn query_entities(
                  WHEN status = 'BLOCKED' THEN 2
                  ELSE 3 END ASC,
             is_on_critical_path DESC,
+            priority_score DESC,
             updated_at DESC",
     )?;
 
@@ -1140,36 +1428,44 @@ pub fn quick_complete_task(
     pomos_spent: i32,
 ) -> Result<String> {
     let now = Local::now().to_rfc3339();
-    let task_info: Option<(String, String, f64)> = conn
+    let direct_info: Option<(String, String, String, f64)> = conn
         .query_row(
-            "SELECT title, category, calibrated_pomos FROM work_entities WHERE id = ?1 AND project_id = ?2",
+            "SELECT project_id, title, category, calibrated_pomos FROM work_entities WHERE id = ?1 AND project_id = ?2",
             params![task_id, project_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .ok();
+    let task_info = direct_info.or_else(|| {
+        conn.query_row(
+            "SELECT project_id, title, category, calibrated_pomos FROM work_entities WHERE id = ?1 LIMIT 1",
+            params![task_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .ok()
+    });
 
-    if let Some((title, cat, est)) = task_info {
-        let snapshot_json = capture_undo_snapshot(conn, project_id)?;
+    if let Some((owner_pid, title, cat, est)) = task_info {
+        let snapshot_json = capture_undo_snapshot(conn, &owner_pid)?;
         let pomos = pomos_spent.max(1);
         let note = format!("تکمیل و تحویل گام [{}]: {}", task_id, title);
 
         let tx = conn.transaction()?;
         tx.execute(
             "UPDATE work_entities SET status = 'CLOSED', updated_at = ?1 WHERE id = ?2 AND project_id = ?3",
-            params![now, task_id, project_id],
+            params![now, task_id, owner_pid],
         )?;
         tx.execute(
             "INSERT INTO session_work_logs (
                 project_id, task_id, category, estimated_pomos, effective_pomos,
                 deliverable_summary, internal_friction_note, client_sanitized_note, source_origin, logged_at
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, '', ?6, 'QUICK_COMPLETE', ?7)",
-            params![project_id, task_id, cat, est, pomos, note, now],
+            params![owner_pid, task_id, cat, est, pomos, note, now],
         )?;
         tx.execute(
             "INSERT INTO mutation_audit_logs (project_id, summary_text, snapshot_json, created_at)
              VALUES (?1, ?2, ?3, ?4)",
             params![
-                project_id,
+                owner_pid,
                 format!("تکمیل سریع گام [{}]", task_id),
                 snapshot_json,
                 now
@@ -1177,7 +1473,7 @@ pub fn quick_complete_task(
         )?;
         tx.commit()?;
         // Domino advancement: if this task belonged to a SEQUENTIAL_CHAIN, unlock the next step
-        let _ = advance_sequential_chain_on_complete(conn, project_id, task_id);
+        let _ = advance_sequential_chain_on_complete(conn, &owner_pid, task_id);
         Ok(format!(
             "گام [{}] مختومه شد و گام بعدی در مسیر پیش‌رو فعال گردید.",
             task_id
@@ -1197,12 +1493,26 @@ pub fn start_task_step(
     if locked {
         return Ok(false);
     }
+    let owner_pid: String = conn
+        .query_row(
+            "SELECT project_id FROM work_entities WHERE id = ?1 AND project_id = ?2",
+            params![task_id, project_id],
+            |r| r.get(0),
+        )
+        .or_else(|_| {
+            conn.query_row(
+                "SELECT project_id FROM work_entities WHERE id = ?1 LIMIT 1",
+                params![task_id],
+                |r| r.get(0),
+            )
+        })
+        .unwrap_or_else(|_| project_id.to_string());
     let now = Local::now().to_rfc3339();
     let affected = conn.execute(
         "UPDATE work_entities
          SET status = 'IN_PROGRESS', updated_at = ?1
          WHERE id = ?2 AND project_id = ?3 AND status = 'OPEN'",
-        params![now, task_id, project_id],
+        params![now, task_id, owner_pid],
     )?;
     Ok(affected > 0)
 }
@@ -1385,13 +1695,26 @@ pub fn apply_copilot_envelope_with_artifacts(
                         let bias = calculate_category_bias(&tx, project_id, &next_cat);
                         let calibrated = ((pert_base * bias) * 10.0).round() / 10.0;
 
+                        let next_duration = m
+                            .duration_minutes
+                            .unwrap_or(cur.duration_minutes)
+                            .max(5);
+                        let next_scheduled_date = m.scheduled_date.clone().or(cur.scheduled_date);
+                        let next_scheduled_slot = m.scheduled_slot.clone().or(cur.scheduled_slot);
+                        let next_due_date = m.due_date.clone().or(cur.due_date);
+                        let next_priority = m
+                            .priority_score
+                            .unwrap_or(cur.priority_score)
+                            .clamp(0, 100);
+
                         tx.execute(
                             "UPDATE work_entities SET
                                 category = ?1, title = ?2, definition_of_done = ?3,
                                 first_physical_action = ?4, status = 'IN_PROGRESS', is_on_critical_path = 1,
                                 optimistic_pomos = ?5, most_likely_pomos = ?6, pessimistic_pomos = ?7,
-                                calibrated_pomos = ?8, updated_at = ?9
-                             WHERE id = ?10 AND project_id = ?11",
+                                calibrated_pomos = ?8, duration_minutes = ?9, scheduled_date = ?10,
+                                scheduled_slot = ?11, due_date = ?12, priority_score = ?13, updated_at = ?14
+                             WHERE id = ?15 AND project_id = ?16",
                             params![
                                 next_cat,
                                 next_title,
@@ -1401,6 +1724,11 @@ pub fn apply_copilot_envelope_with_artifacts(
                                 ml,
                                 p,
                                 calibrated,
+                                next_duration,
+                                next_scheduled_date,
+                                next_scheduled_slot,
+                                next_due_date,
+                                next_priority,
                                 now,
                                 tid,
                                 project_id
@@ -1465,8 +1793,9 @@ pub fn apply_copilot_envelope_with_artifacts(
                         id, project_id, entity_type, category, title, definition_of_done,
                         first_physical_action, status, is_on_critical_path, optimistic_pomos,
                         most_likely_pomos, pessimistic_pomos, calibrated_pomos, stakeholder_tag,
+                        duration_minutes, scheduled_date, scheduled_slot, due_date, priority_score,
                         source_event_id, updated_at
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
                     params![
                         new_id,
                         project_id,
@@ -1482,6 +1811,11 @@ pub fn apply_copilot_envelope_with_artifacts(
                         p,
                         calibrated,
                         m.stakeholder_tag,
+                        m.duration_minutes.unwrap_or(25).max(5),
+                        m.scheduled_date,
+                        m.scheduled_slot,
+                        m.due_date,
+                        m.priority_score.unwrap_or(if m.is_on_critical_path.unwrap_or(true) { 75 } else { 50 }).clamp(0, 100),
                         event_id,
                         now
                     ],
@@ -1590,14 +1924,27 @@ pub fn apply_copilot_envelope_with_artifacts(
                             .filter(|s| !s.is_empty())
                             .map(str::to_string)
                             .or(cur.stakeholder_tag);
+                        let next_duration = m
+                            .duration_minutes
+                            .unwrap_or(cur.duration_minutes)
+                            .max(5);
+                        let next_scheduled_date = m.scheduled_date.clone().or(cur.scheduled_date);
+                        let next_scheduled_slot = m.scheduled_slot.clone().or(cur.scheduled_slot);
+                        let next_due_date = m.due_date.clone().or(cur.due_date);
+                        let next_priority = m
+                            .priority_score
+                            .unwrap_or(cur.priority_score)
+                            .clamp(0, 100);
 
                         tx.execute(
                             "UPDATE work_entities SET
                                 entity_type = ?1, category = ?2, title = ?3, definition_of_done = ?4,
                                 first_physical_action = ?5, status = ?6, is_on_critical_path = ?7,
                                 optimistic_pomos = ?8, most_likely_pomos = ?9, pessimistic_pomos = ?10,
-                                calibrated_pomos = ?11, stakeholder_tag = ?12, updated_at = ?13
-                             WHERE id = ?14 AND project_id = ?15",
+                                calibrated_pomos = ?11, stakeholder_tag = ?12,
+                                duration_minutes = ?13, scheduled_date = ?14, scheduled_slot = ?15,
+                                due_date = ?16, priority_score = ?17, updated_at = ?18
+                             WHERE id = ?19 AND project_id = ?20",
                             params![
                                 next_etype,
                                 next_cat,
@@ -1611,6 +1958,11 @@ pub fn apply_copilot_envelope_with_artifacts(
                                 p,
                                 calibrated,
                                 next_stakeholder,
+                                next_duration,
+                                next_scheduled_date,
+                                next_scheduled_slot,
+                                next_due_date,
+                                next_priority,
                                 now,
                                 tid,
                                 project_id
@@ -1817,6 +2169,11 @@ pub fn commit_user_chat_turn(
 ) -> Result<(String, i64, i64)> {
     let norm_ch = normalize_chat_channel(channel);
     let now = Local::now().to_rfc3339();
+    if project_id.eq_ignore_ascii_case(GLOBAL_CHAT_PROJECT_ID) {
+        set_active_chat_scope(conn, "GLOBAL");
+    } else {
+        set_active_chat_scope(conn, "PROJECT");
+    }
 
     let session_id = if let Some(req_sid) = requested_session_id
         .map(str::trim)

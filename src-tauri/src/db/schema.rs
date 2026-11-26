@@ -328,6 +328,12 @@ pub fn init_database(db_path: &Path, default_vault_root: &Path) -> Result<Connec
     )?;
     ensure_column_exists(
         &conn,
+        "app_settings",
+        "chat_decoupled_v1",
+        "ALTER TABLE app_settings ADD COLUMN chat_decoupled_v1 INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column_exists(
+        &conn,
         "chat_messages",
         "channel",
         "ALTER TABLE chat_messages ADD COLUMN channel TEXT NOT NULL DEFAULT 'COPILOT'",
@@ -393,6 +399,63 @@ pub fn init_database(db_path: &Path, default_vault_root: &Path) -> Result<Connec
         "projects",
         "pause_resume_note",
         "ALTER TABLE projects ADD COLUMN pause_resume_note TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column_exists(
+        &conn,
+        "projects",
+        "parent_id",
+        "ALTER TABLE projects ADD COLUMN parent_id TEXT NULL",
+    )?;
+    ensure_column_exists(
+        &conn,
+        "projects",
+        "color",
+        "ALTER TABLE projects ADD COLUMN color TEXT NOT NULL DEFAULT '#3B82F6'",
+    )?;
+    ensure_column_exists(
+        &conn,
+        "projects",
+        "daily_quota_minutes",
+        "ALTER TABLE projects ADD COLUMN daily_quota_minutes INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column_exists(
+        &conn,
+        "projects",
+        "weekly_quota_minutes",
+        "ALTER TABLE projects ADD COLUMN weekly_quota_minutes INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column_exists(
+        &conn,
+        "projects",
+        "monthly_quota_minutes",
+        "ALTER TABLE projects ADD COLUMN monthly_quota_minutes INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column_exists(
+        &conn,
+        "projects",
+        "hourly_rate",
+        "ALTER TABLE projects ADD COLUMN hourly_rate REAL NOT NULL DEFAULT 0.0",
+    )?;
+    ensure_column_exists(
+        &conn,
+        "projects",
+        "google_calendar_id",
+        "ALTER TABLE projects ADD COLUMN google_calendar_id TEXT NULL",
+    )?;
+    ensure_column_exists(
+        &conn,
+        "projects",
+        "created_at",
+        "ALTER TABLE projects ADD COLUMN created_at TEXT NOT NULL DEFAULT ''",
+    )?;
+
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS applied_core_merges (
+            merge_id TEXT PRIMARY KEY,
+            applied_at TEXT NOT NULL
+        );
+        ",
     )?;
 
     // Work entities alterations

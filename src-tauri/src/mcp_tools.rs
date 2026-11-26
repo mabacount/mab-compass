@@ -1,10 +1,10 @@
 use crate::db::queries::{
-    apply_copilot_envelope_with_artifacts, apply_copilot_envelope_with_event, create_new_project,
+    apply_copilot_envelope_with_artifacts, apply_copilot_envelope_with_event,
     get_dashboard_state_for_project, quick_complete_task, search_raw_events_fts,
     undo_last_mutation,
 };
 use crate::mab_focus_sync::synchronize_with_mab_focus;
-use crate::models::{AtomicMutation, ChainStepInput, CopilotEnvelope};
+use crate::models::{AtomicMutation, ChainStepInput, CopilotEnvelope, WrittenArtifactRef};
 use crate::projector::markdown_writer::sync_all_project_projections;
 use crate::vault_manager::archive_raw_user_input;
 use chrono::Local;
@@ -57,6 +57,47 @@ fn legacy_tool_definitions() -> Value {
             }
         },
         {
+            "name": "get_all_projects_path_ahead",
+            "description": "Strategic layer tool ABOVE individual projects: inspect the Path Ahead (#1 next_step_task, horizon_tasks, blockers, open counts), active outcomes, today's calendar load, and globally ranked cross-project priority queue across ALL active/paused projects in one call.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "realm": { "type": "string", "enum": ["WORK", "LIFE"], "description": "Optional filter by WORK or LIFE realm" },
+                    "include_paused": { "type": "boolean", "description": "Include PAUSED projects (default true)" },
+                    "include_archived": { "type": "boolean", "description": "Include ARCHIVED projects (default false)" }
+                }
+            }
+        },
+        {
+            "name": "prioritize_across_projects",
+            "description": "Strategic layer tool ABOVE individual projects: batch-prioritize, rank, promote next_step, or schedule tasks across MULTIPLE projects in a single atomic call. Automatically resolves each task_id's owning project if project_id is omitted.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "description": "Ordered prioritization updates across one or more projects",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "task_id": { "type": "string", "description": "Task ID (TSK-xxxx)" },
+                                "project_id": { "type": "string", "description": "Optional owning project ID (auto-resolved from task_id if omitted)" },
+                                "priority_score": { "type": "integer", "minimum": 0, "maximum": 100, "description": "Global/project priority 0..100 (e.g. 95 top priority today)" },
+                                "is_on_critical_path": { "type": "boolean" },
+                                "status": { "type": "string", "enum": ["OPEN", "IN_PROGRESS", "BLOCKED", "CLOSED"] },
+                                "make_next_step": { "type": "boolean", "description": "Promote this task to #1 IN_PROGRESS next step on its owning project's Path Ahead" },
+                                "scheduled_date": { "type": "string", "description": "Optional ISO date YYYY-MM-DD" },
+                                "scheduled_slot": { "type": "string", "enum": ["MORNING_DEEP", "MIDDAY_EXEC", "AFTERNOON_LIGHT", "COMMUTE_SLOT"] },
+                                "due_date": { "type": "string", "description": "Optional ISO due date YYYY-MM-DD" }
+                            },
+                            "required": ["task_id"]
+                        }
+                    }
+                },
+                "required": ["items"]
+            }
+        },
+        {
             "name": "search_memory",
             "description": "Full-text search (SQLite FTS5) over all raw_events (chat messages, ingested docs, Mab-Focus notes) for a project.",
             "inputSchema": {
@@ -92,11 +133,11 @@ fn legacy_tool_definitions() -> Value {
         },
         {
             "name": "update_work_entity",
-            "description": "Update an existing TASK, DECISION, or BLOCKER by target_id (e.g. TSK-xxxx, ADR-xxxx, BLK-xxxx).",
+            "description": "Update an existing TASK, DECISION, or BLOCKER by target_id (e.g. TSK-xxxx, ADR-xxxx, BLK-xxxx). Supports priority_score, critical path, status, and scheduling.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "project_id": { "type": "string" },
+                    "project_id": { "type": "string", "description": "Optional project ID (auto-resolved from target_id if omitted)" },
                     "target_id": { "type": "string" },
                     "entity_type": { "type": "string", "enum": ["TASK", "DECISION", "BLOCKER"] },
                     "category": { "type": "string", "enum": ["BACKEND", "UI_UX", "DEPLOY", "VIDEO", "ARCHITECTURE", "GENERAL"] },
@@ -105,6 +146,11 @@ fn legacy_tool_definitions() -> Value {
                     "first_physical_action": { "type": "string" },
                     "status": { "type": "string", "enum": ["OPEN", "IN_PROGRESS", "BLOCKED", "CLOSED", "SUPERSEDED"] },
                     "is_on_critical_path": { "type": "boolean" },
+                    "priority_score": { "type": "integer", "minimum": 0, "maximum": 100, "description": "Priority score 0..100 (higher = earlier)" },
+                    "scheduled_date": { "type": "string", "description": "Optional ISO date YYYY-MM-DD" },
+                    "scheduled_slot": { "type": "string", "enum": ["MORNING_DEEP", "MIDDAY_EXEC", "AFTERNOON_LIGHT", "COMMUTE_SLOT"] },
+                    "due_date": { "type": "string", "description": "Optional ISO due date YYYY-MM-DD" },
+                    "duration_minutes": { "type": "integer", "minimum": 5 },
                     "optimistic_pomos": { "type": "number" },
                     "most_likely_pomos": { "type": "number" },
                     "pessimistic_pomos": { "type": "number" },
@@ -514,6 +560,52 @@ pub fn copilot_envelope_json_schema() -> Value {
         },
         "required": ["title"]
     });
+    let mutation_item_schema = json!({
+        "type": "object",
+        "properties": {
+            "project_id": { "type": ["string", "null"] },
+            "priority_score": { "type": ["integer", "null"] },
+            "scheduled_date": { "type": ["string", "null"] },
+            "scheduled_slot": { "type": ["string", "null"] },
+            "due_date": { "type": ["string", "null"] },
+            "duration_minutes": { "type": ["integer", "null"] },
+            "op": {
+                "type": "string",
+                "enum": [
+                    "RESOLVE_ENTITY",
+                    "CREATE_ENTITY",
+                    "UPDATE_ENTITY",
+                    "SET_NEXT_STEP",
+                    "DELETE_ENTITY",
+                    "SUPERSEDE_DECISION",
+                    "UPSERT_SOP",
+                    "REGISTER_ANTIPATTERN",
+                    "LOG_WORK"
+                ]
+            },
+            "target_id": { "type": ["string", "null"] },
+            "entity_type": { "type": ["string", "null"] },
+            "category": { "type": ["string", "null"] },
+            "title": { "type": ["string", "null"] },
+            "definition_of_done": { "type": ["string", "null"] },
+            "first_physical_action": { "type": ["string", "null"] },
+            "status": { "type": ["string", "null"] },
+            "is_on_critical_path": { "type": ["boolean", "null"] },
+            "optimistic_pomos": { "type": ["number", "null"] },
+            "most_likely_pomos": { "type": ["number", "null"] },
+            "pessimistic_pomos": { "type": ["number", "null"] },
+            "stakeholder_tag": { "type": ["string", "null"] },
+            "sop_rule_statement": { "type": ["string", "null"] },
+            "mistake_pattern": { "type": ["string", "null"] },
+            "preventive_gate_question": { "type": ["string", "null"] },
+            "severity_score": { "type": ["number", "null"] },
+            "effective_pomos": { "type": ["number", "null"] },
+            "deliverable_summary": { "type": ["string", "null"] },
+            "internal_friction_note": { "type": ["string", "null"] },
+            "client_sanitized_note": { "type": ["string", "null"] }
+        },
+        "required": ["op"]
+    });
     json!({
         "type": "object",
         "properties": {
@@ -529,46 +621,7 @@ pub fn copilot_envelope_json_schema() -> Value {
             "executive_doc_summary": { "type": ["string", "null"] },
             "mutations": {
                 "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "op": {
-                            "type": "string",
-                            "enum": [
-                                "RESOLVE_ENTITY",
-                                "CREATE_ENTITY",
-                                "UPDATE_ENTITY",
-                                "SET_NEXT_STEP",
-                                "DELETE_ENTITY",
-                                "SUPERSEDE_DECISION",
-                                "UPSERT_SOP",
-                                "REGISTER_ANTIPATTERN",
-                                "LOG_WORK"
-                            ]
-                        },
-                        "target_id": { "type": ["string", "null"] },
-                        "entity_type": { "type": ["string", "null"] },
-                        "category": { "type": ["string", "null"] },
-                        "title": { "type": ["string", "null"] },
-                        "definition_of_done": { "type": ["string", "null"] },
-                        "first_physical_action": { "type": ["string", "null"] },
-                        "status": { "type": ["string", "null"] },
-                        "is_on_critical_path": { "type": ["boolean", "null"] },
-                        "optimistic_pomos": { "type": ["number", "null"] },
-                        "most_likely_pomos": { "type": ["number", "null"] },
-                        "pessimistic_pomos": { "type": ["number", "null"] },
-                        "stakeholder_tag": { "type": ["string", "null"] },
-                        "sop_rule_statement": { "type": ["string", "null"] },
-                        "mistake_pattern": { "type": ["string", "null"] },
-                        "preventive_gate_question": { "type": ["string", "null"] },
-                        "severity_score": { "type": ["number", "null"] },
-                        "effective_pomos": { "type": ["number", "null"] },
-                        "deliverable_summary": { "type": ["string", "null"] },
-                        "internal_friction_note": { "type": ["string", "null"] },
-                        "client_sanitized_note": { "type": ["string", "null"] }
-                    },
-                    "required": ["op"]
-                }
+                "items": mutation_item_schema
             },
             "method_playbooks": {
                 "type": "array",
@@ -757,6 +810,15 @@ fn resolve_optional_project_pair(conn: &Connection, req: Option<&str>) -> Option
     None
 }
 
+fn resolve_entity_project_id(conn: &Connection, target_id: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT project_id FROM work_entities WHERE id = ?1 LIMIT 1",
+        params![target_id.trim()],
+        |r| r.get::<_, String>(0),
+    )
+    .ok()
+}
+
 pub fn execute_tool_with_context(
     conn: &mut Connection,
     name: &str,
@@ -809,7 +871,24 @@ pub fn execute_tool_with_context(
                 .ok_or_else(|| "فیلد id_code الزامی است.".to_string())?;
             let name_str = opt_str(args, "name")
                 .ok_or_else(|| "فیلد name الزامی است.".to_string())?;
-            let created = create_new_project(conn, &id_code, &name_str).map_err(|e| e.to_string())?;
+            let parent_id = opt_str(args, "parent_id");
+            let realm = opt_str(args, "realm");
+            let color = opt_str(args, "color");
+            let created = crate::db::queries::create_new_project_with_options(
+                conn,
+                &id_code,
+                &name_str,
+                parent_id.as_deref(),
+                realm.as_deref(),
+                color.as_deref(),
+                None,
+            )
+            .map_err(|e| e.to_string())?;
+            if !cfg!(test) {
+                if let Some(core_path) = crate::ecosystem_core::resolve_default_core_db_path() {
+                    let _ = crate::ecosystem_core::push_compass_project_upsert(conn, &core_path, &created);
+                }
+            }
             let updated = get_dashboard_state_for_project(conn, None).map_err(|e| e.to_string())?;
             let _ = sync_all_project_projections(&updated, None, None);
             Ok(json!({ "created_project": created }))
@@ -829,6 +908,182 @@ pub fn execute_tool_with_context(
                 "active_decisions": dash.active_decisions,
                 "recent_logs": dash.recent_logs,
                 "knowledge_docs": dash.knowledge_docs
+            }))
+        }
+        "get_all_projects_path_ahead" => {
+            let realm_filter = opt_str(args, "realm");
+            let include_paused = args.get("include_paused").and_then(|v| v.as_bool()).unwrap_or(true);
+            let include_archived = args.get("include_archived").and_then(|v| v.as_bool()).unwrap_or(false);
+            let all_projects = crate::ecosystem_core::load_compass_projects(conn)
+                .map_err(|e| e.to_string())?;
+            let filtered_projects: Vec<crate::models::Project> = all_projects
+                .into_iter()
+                .filter(|p| {
+                    if !include_archived && p.lifecycle_status.eq_ignore_ascii_case("ARCHIVED") {
+                        return false;
+                    }
+                    if !include_paused && p.lifecycle_status.eq_ignore_ascii_case("PAUSED") {
+                        return false;
+                    }
+                    if let Some(ref rf) = realm_filter {
+                        if !p.realm.eq_ignore_ascii_case(rf) {
+                            return false;
+                        }
+                    }
+                    true
+                })
+                .collect();
+            let (summaries, global_queue) = crate::db::queries::query_portfolio_path_summary(
+                conn,
+                &filtered_projects,
+            )
+            .map_err(|e| e.to_string())?;
+            let outcomes = crate::db::queries::query_all_outcomes(conn).unwrap_or_default();
+            let today_key = Local::now().format("%Y-%m-%d").to_string();
+            let calendar_days = crate::db::queries::query_all_calendar_days(conn).unwrap_or_default();
+            let today_calendar = calendar_days.into_iter().find(|c| c.date_key == today_key);
+            Ok(json!({
+                "today": today_key,
+                "projects_count": summaries.len(),
+                "projects_summaries": summaries,
+                "global_prioritized_queue": global_queue,
+                "active_outcomes": outcomes.into_iter().filter(|o| o.status == "ACTIVE").collect::<Vec<_>>(),
+                "today_calendar": today_calendar
+            }))
+        }
+        "prioritize_across_projects" => {
+            let items = args
+                .get("items")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| "فیلد items الزامی است.".to_string())?;
+            if items.is_empty() {
+                return Err("آرایه items نمی‌تواند خالی باشد.".to_string());
+            }
+
+            let all_projects = crate::ecosystem_core::load_compass_projects(conn)
+                .map_err(|e| e.to_string())?;
+            let now = Local::now().to_rfc3339();
+            let mut touched_pids: std::collections::BTreeSet<String> =
+                std::collections::BTreeSet::new();
+            let mut updated_results: Vec<Value> = Vec::new();
+            let mut env_by_project: std::collections::BTreeMap<String, Vec<AtomicMutation>> =
+                std::collections::BTreeMap::new();
+
+            for item in items {
+                let task_id = item
+                    .get("task_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| "هر آیتم باید task_id داشته باشد.".to_string())?
+                    .to_string();
+
+                let explicit_pid = item
+                    .get("project_id")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| resolve_optional_project_pair(conn, Some(s)).map(|(id, _)| id));
+                let owner_pid = explicit_pid
+                    .or_else(|| resolve_entity_project_id(conn, &task_id))
+                    .ok_or_else(|| format!("پروژه مالک تسک {} یافت نشد.", task_id))?;
+
+                let make_next = item
+                    .get("make_next_step")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let mut mut_item = empty_mutation(if make_next {
+                    "SET_NEXT_STEP"
+                } else {
+                    "UPDATE_ENTITY"
+                });
+                mut_item.project_id = Some(owner_pid.clone());
+                mut_item.target_id = Some(task_id.clone());
+                mut_item.priority_score = item
+                    .get("priority_score")
+                    .and_then(|v| v.as_i64())
+                    .map(|n| n.clamp(0, 100) as i32);
+                mut_item.is_on_critical_path = item
+                    .get("is_on_critical_path")
+                    .and_then(|v| v.as_bool());
+                mut_item.status = item
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                mut_item.scheduled_date = item
+                    .get("scheduled_date")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                mut_item.scheduled_slot = item
+                    .get("scheduled_slot")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                mut_item.due_date = item
+                    .get("due_date")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+
+                if let Some(ref sd) = mut_item.scheduled_date {
+                    let _ = conn.execute(
+                        "INSERT OR IGNORE INTO calendar_days (date_key, total_capacity_minutes, deep_capacity_minutes, day_note, is_off_day, updated_at)
+                         VALUES (?1, 300, 150, '', 0, ?2)",
+                        params![sd, now],
+                    );
+                }
+
+                env_by_project
+                    .entry(owner_pid)
+                    .or_default()
+                    .push(mut_item);
+            }
+
+            let mut artifacts_out: Vec<WrittenArtifactRef> = Vec::new();
+            for (pid, muts) in env_by_project {
+                let count_for_proj = muts.len();
+                let env = CopilotEnvelope {
+                    conversational_reply: format!("اولویت‌بندی فراپروژه‌ای برای {}", pid),
+                    mutations: muts,
+                    ..Default::default()
+                };
+                let badge = apply_copilot_envelope_with_event(
+                    conn,
+                    &pid,
+                    "[MCP] prioritize_across_projects",
+                    None,
+                    source_origin,
+                    &env,
+                    existing_event_id,
+                )
+                .map_err(|e| e.to_string())?;
+                if let Ok(d) = get_dashboard_state_for_project(conn, Some(&pid)) {
+                    let _ = sync_all_project_projections(&d, None, None);
+                    artifacts_out.push(WrittenArtifactRef {
+                        artifact_type: "WORK_LINE".to_string(),
+                        entity_id: format!("PRIO-{}", pid),
+                        title: format!("اولویت‌بندی مسیر پیش‌رو: {}", d.active_project.name),
+                        summary: badge.clone(),
+                        file_path: None,
+                        action: "UPDATED".to_string(),
+                        version: None,
+                        project_id: Some(pid.clone()),
+                        project_name: Some(d.active_project.name.clone()),
+                    });
+                }
+                touched_pids.insert(pid.clone());
+                updated_results.push(json!({
+                    "project_id": pid,
+                    "updated_items": count_for_proj,
+                    "badge": badge
+                }));
+            }
+
+            let (_summaries, refreshed_queue) =
+                crate::db::queries::query_portfolio_path_summary(conn, &all_projects)
+                    .unwrap_or_default();
+            Ok(json!({
+                "status": "ok",
+                "touched_projects": touched_pids.into_iter().collect::<Vec<_>>(),
+                "results": updated_results,
+                "global_prioritized_queue": refreshed_queue.into_iter().take(15).collect::<Vec<_>>(),
+                "artifact_ref": artifacts_out.into_iter().next()
             }))
         }
         "search_memory" => {
@@ -908,14 +1163,15 @@ pub fn execute_tool_with_context(
             Ok(out)
         }
         "update_work_entity" => {
-            let req_pid = resolve_pid(args);
+            let target_id = opt_str(args, "target_id")
+                .ok_or_else(|| "فیلد target_id الزامی است.".to_string())?;
+            let req_pid = resolve_pid(args).or_else(|| resolve_entity_project_id(conn, &target_id));
             let dash = get_dashboard_state_for_project(conn, req_pid.as_deref())
                 .map_err(|e| e.to_string())?;
             let pid = dash.active_project.id.clone();
-            let target_id = opt_str(args, "target_id")
-                .ok_or_else(|| "فیلد target_id الزامی است.".to_string())?;
 
             let mut m = empty_mutation("UPDATE_ENTITY");
+            m.project_id = Some(pid.clone());
             m.target_id = Some(target_id.clone());
             m.entity_type = opt_str(args, "entity_type");
             m.category = opt_str(args, "category");
@@ -924,6 +1180,11 @@ pub fn execute_tool_with_context(
             m.first_physical_action = opt_str(args, "first_physical_action");
             m.status = opt_str(args, "status");
             m.is_on_critical_path = args.get("is_on_critical_path").and_then(|v| v.as_bool());
+            m.priority_score = opt_i32(args, "priority_score");
+            m.scheduled_date = opt_str(args, "scheduled_date");
+            m.scheduled_slot = opt_str(args, "scheduled_slot");
+            m.due_date = opt_str(args, "due_date");
+            m.duration_minutes = opt_i32(args, "duration_minutes");
             m.optimistic_pomos = opt_f64(args, "optimistic_pomos");
             m.most_likely_pomos = opt_f64(args, "most_likely_pomos");
             m.pessimistic_pomos = opt_f64(args, "pessimistic_pomos");
@@ -948,20 +1209,23 @@ pub fn execute_tool_with_context(
                 .map_err(|e| e.to_string())?;
             let _ = sync_all_project_projections(&updated, None, None);
             Ok(json!({
+                "project_id": pid,
+                "project_name": dash.active_project.name,
                 "badge": badge,
                 "next_step_task": updated.next_step_task,
                 "open_tasks": updated.open_tasks
             }))
         }
         "set_next_step" => {
-            let req_pid = resolve_pid(args);
+            let target_id = opt_str(args, "target_id")
+                .ok_or_else(|| "فیلد target_id الزامی است.".to_string())?;
+            let req_pid = resolve_pid(args).or_else(|| resolve_entity_project_id(conn, &target_id));
             let dash = get_dashboard_state_for_project(conn, req_pid.as_deref())
                 .map_err(|e| e.to_string())?;
             let pid = dash.active_project.id.clone();
-            let target_id = opt_str(args, "target_id")
-                .ok_or_else(|| "فیلد target_id الزامی است.".to_string())?;
 
             let mut m = empty_mutation("SET_NEXT_STEP");
+            m.project_id = Some(pid.clone());
             m.target_id = Some(target_id.clone());
             m.title = opt_str(args, "title");
             m.definition_of_done = opt_str(args, "definition_of_done");
@@ -986,18 +1250,20 @@ pub fn execute_tool_with_context(
                 .map_err(|e| e.to_string())?;
             let _ = sync_all_project_projections(&updated, None, None);
             Ok(json!({
+                "project_id": pid,
+                "project_name": dash.active_project.name,
                 "badge": badge,
                 "next_step_task": updated.next_step_task,
                 "horizon_tasks": updated.horizon_tasks
             }))
         }
         "complete_task" => {
-            let req_pid = resolve_pid(args);
+            let task_id = opt_str(args, "task_id")
+                .ok_or_else(|| "فیلد task_id الزامی است.".to_string())?;
+            let req_pid = resolve_pid(args).or_else(|| resolve_entity_project_id(conn, &task_id));
             let dash = get_dashboard_state_for_project(conn, req_pid.as_deref())
                 .map_err(|e| e.to_string())?;
             let pid = dash.active_project.id.clone();
-            let task_id = opt_str(args, "task_id")
-                .ok_or_else(|| "فیلد task_id الزامی است.".to_string())?;
             let pomos = opt_i32(args, "pomos_spent").unwrap_or(1).max(1);
             let msg = quick_complete_task(conn, &pid, &task_id, pomos)
                 .map_err(|e| e.to_string())?;
@@ -1005,20 +1271,23 @@ pub fn execute_tool_with_context(
                 .map_err(|e| e.to_string())?;
             let _ = sync_all_project_projections(&updated, None, None);
             Ok(json!({
+                "project_id": pid,
+                "project_name": dash.active_project.name,
                 "message": msg,
                 "next_step_task": updated.next_step_task,
                 "closed_tasks_count": updated.closed_tasks_count
             }))
         }
         "delete_work_entity" => {
-            let req_pid = resolve_pid(args);
+            let target_id = opt_str(args, "target_id")
+                .ok_or_else(|| "فیلد target_id الزامی است.".to_string())?;
+            let req_pid = resolve_pid(args).or_else(|| resolve_entity_project_id(conn, &target_id));
             let dash = get_dashboard_state_for_project(conn, req_pid.as_deref())
                 .map_err(|e| e.to_string())?;
             let pid = dash.active_project.id.clone();
-            let target_id = opt_str(args, "target_id")
-                .ok_or_else(|| "فیلد target_id الزامی است.".to_string())?;
 
             let mut m = empty_mutation("DELETE_ENTITY");
+            m.project_id = Some(pid.clone());
             m.target_id = Some(target_id.clone());
 
             let env = CopilotEnvelope {
@@ -1040,6 +1309,8 @@ pub fn execute_tool_with_context(
                 .map_err(|e| e.to_string())?;
             let _ = sync_all_project_projections(&updated, None, None);
             Ok(json!({
+                "project_id": pid,
+                "project_name": dash.active_project.name,
                 "badge": badge,
                 "open_tasks_count": updated.open_tasks.len()
             }))
