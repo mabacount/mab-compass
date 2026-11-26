@@ -135,6 +135,8 @@ export interface WrittenArtifactRef {
   file_path?: string | null;
   action: "CREATED" | "UPDATED" | string;
   version?: number | null;
+  project_id?: string | null;
+  project_name?: string | null;
 }
 
 export interface ChatMessage {

@@ -723,6 +723,40 @@ pub fn execute_mcp_tool(conn: &mut Connection, name: &str, args: &Value) -> Resu
     execute_tool(conn, name, args)
 }
 
+fn resolve_optional_project_pair(conn: &Connection, req: Option<&str>) -> Option<(String, String)> {
+    let raw = req.map(str::trim).filter(|s| {
+        !s.is_empty()
+            && !s.eq_ignore_ascii_case("GLOBAL")
+            && !s.eq_ignore_ascii_case("NONE")
+            && !s.eq_ignore_ascii_case("GENERAL")
+    })?;
+    let mut stmt = conn
+        .prepare("SELECT id, name FROM projects ORDER BY is_active DESC, id")
+        .ok()?;
+    let rows: Vec<(String, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .ok()?
+        .filter_map(|r| r.ok())
+        .collect();
+    if let Some(exact) = rows
+        .iter()
+        .find(|(id, name)| id.eq_ignore_ascii_case(raw) || name.trim().eq_ignore_ascii_case(raw))
+    {
+        return Some(exact.clone());
+    }
+    let raw_lower = raw.to_lowercase();
+    let partial: Vec<(String, String)> = rows
+        .into_iter()
+        .filter(|(id, name)| {
+            id.to_lowercase().contains(&raw_lower) || name.to_lowercase().contains(&raw_lower)
+        })
+        .collect();
+    if partial.len() == 1 {
+        return partial.into_iter().next();
+    }
+    None
+}
+
 pub fn execute_tool_with_context(
     conn: &mut Connection,
     name: &str,
@@ -732,7 +766,16 @@ pub fn execute_tool_with_context(
     source_origin: &str,
 ) -> Result<Value, String> {
     let resolve_pid = |args: &Value| -> Option<String> {
-        opt_str(args, "project_id").or_else(|| default_project_id.map(str::to_string))
+        let explicit = opt_str(args, "project_id").filter(|s| {
+            let t = s.trim();
+            !t.is_empty() && !t.eq_ignore_ascii_case("GLOBAL")
+        });
+        explicit.or_else(|| {
+            default_project_id
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("GLOBAL"))
+                .map(str::to_string)
+        })
     };
 
     match name {
@@ -853,8 +896,13 @@ pub fn execute_tool_with_context(
                 "active_decisions": updated.active_decisions
             });
             if let Some(first_art) = artifacts.first() {
+                let mut art_val = json!(first_art);
+                if let Some(obj) = art_val.as_object_mut() {
+                    obj.insert("project_id".to_string(), json!(dash.active_project.id));
+                    obj.insert("project_name".to_string(), json!(dash.active_project.name));
+                }
                 if let Some(obj) = out.as_object_mut() {
-                    obj.insert("artifact_ref".to_string(), json!(first_art));
+                    obj.insert("artifact_ref".to_string(), art_val);
                 }
             }
             Ok(out)
@@ -1039,7 +1087,9 @@ pub fn execute_tool_with_context(
                         "summary": note_preview,
                         "file_path": archived_path,
                         "action": "CREATED",
-                        "version": null
+                        "version": null,
+                        "project_id": pid,
+                        "project_name": dash.active_project.name
                     }
                 }));
             }
@@ -1580,7 +1630,10 @@ pub fn execute_tool_with_context(
                 .ok_or_else(|| "Missing content_markdown".to_string())?;
             let realm = opt_str(args, "realm").unwrap_or_else(|| "LIFE".to_string());
             let domain_code = opt_str(args, "domain_code").unwrap_or_else(|| "MIND_LEARNING".to_string());
-            let project_id = resolve_pid(args);
+            let req_pid = resolve_pid(args);
+            let resolved_proj = resolve_optional_project_pair(conn, req_pid.as_deref());
+            let project_id = resolved_proj.as_ref().map(|(id, _)| id.clone());
+            let project_name = resolved_proj.as_ref().map(|(_, name)| name.clone());
             let tags_val = args.get("tags").cloned().unwrap_or_else(|| json!([]));
             let tags_json = tags_val.to_string();
             let now = Local::now().to_rfc3339();
@@ -1599,6 +1652,8 @@ pub fn execute_tool_with_context(
                 "item_id": item_id,
                 "item_type": item_type,
                 "domain_code": domain_code,
+                "project_id": project_id,
+                "project_name": project_name,
                 "title": title,
                 "artifact_ref": {
                     "artifact_type": "VAULT_CARD",
@@ -1607,7 +1662,9 @@ pub fn execute_tool_with_context(
                     "summary": summary_preview,
                     "file_path": null,
                     "action": "CREATED",
-                    "version": null
+                    "version": null,
+                    "project_id": project_id,
+                    "project_name": project_name
                 }
             }))
         }
@@ -1624,13 +1681,15 @@ pub fn execute_tool_with_context(
                 .map(|id| format!("event:{}", id))
                 .unwrap_or_else(|| format!("mcp:{}", source_origin));
 
-            let (method, is_created, artifact_ref) = crate::method_engine::upsert_method_playbook(
+            let (method, is_created, mut artifact_ref) = crate::method_engine::upsert_method_playbook(
                 conn,
                 &pid,
                 &workspace_path,
                 input,
                 Some(&src_ref),
             )?;
+            artifact_ref.project_id = Some(pid.clone());
+            artifact_ref.project_name = Some(dash.active_project.name.clone());
 
             Ok(json!({
                 "status": "ok",

@@ -928,6 +928,7 @@ pub fn upsert_method_playbook(
             "UPDATED".to_string()
         },
         version: Some(method.version),
+        ..Default::default()
     };
 
     Ok((method, is_created, artifact_ref))

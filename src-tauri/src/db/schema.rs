@@ -322,6 +322,12 @@ pub fn init_database(db_path: &Path, default_vault_root: &Path) -> Result<Connec
     )?;
     ensure_column_exists(
         &conn,
+        "app_settings",
+        "active_chat_scope",
+        "ALTER TABLE app_settings ADD COLUMN active_chat_scope TEXT NOT NULL DEFAULT 'PROJECT'",
+    )?;
+    ensure_column_exists(
+        &conn,
         "chat_messages",
         "channel",
         "ALTER TABLE chat_messages ADD COLUMN channel TEXT NOT NULL DEFAULT 'COPILOT'",

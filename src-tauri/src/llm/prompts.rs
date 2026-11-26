@@ -1,4 +1,4 @@
-use crate::models::{ChatMessage, KnowledgeDocument, MethodPlaybook, SopRule, WorkEntity};
+use crate::models::{ChatMessage, KnowledgeDocument, MethodPlaybook, Project, SopRule, WorkEntity};
 use chrono::Local;
 use rusqlite::{params, Connection, Result};
 
@@ -132,6 +132,36 @@ pub fn build_mcp_tool_turn_prompts(
     )
 }
 
+pub fn format_projects_catalog(projects: &[Project]) -> String {
+    if projects.is_empty() {
+        return "None listed.".to_string();
+    }
+    projects
+        .iter()
+        .map(|p| {
+            let active_tag = if p.is_active { " (currently open in canvas)" } else { "" };
+            format!("- project_id=\"{}\" | name=\"{}\"{}", p.id, p.name, active_tag)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub fn append_cross_project_routing_instructions(
+    prompt: String,
+    chat_project_id: &str,
+    projects: &[Project],
+) -> String {
+    let catalog = format_projects_catalog(projects);
+    let scope_note = if chat_project_id.eq_ignore_ascii_case("GLOBAL") {
+        "This is a CROSS-PROJECT (GLOBAL) conversation. The user is NOT restricted to a single project and may discuss multiple projects in one message."
+    } else {
+        "Even though this chat is inside a project, the user may mention notes, tasks, or decisions belonging to OTHER projects."
+    };
+    format!(
+        "{prompt}\n\nAVAILABLE PROJECTS IN WORKSPACE:\n{catalog}\n\nCROSS-PROJECT ROUTING RULE:\n{scope_note}\nWhenever the user mentions a note, insight, decision, task, or rule for a SPECIFIC project (by name or ID), set `project_id` on each mutation (or MCP tool call) to that target project's exact `project_id` so it is recorded in THAT project."
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn build_mcp_tool_turn_prompts_with_methods(
     project_id: &str,
@@ -146,6 +176,39 @@ pub fn build_mcp_tool_turn_prompts_with_methods(
     fts_snippets: &[(String, String)],
     doc_meta: Option<(&str, &str, &str)>, // (title, doc_type, filename)
     is_legacy_reprocess: bool,
+) -> (String, String) {
+    build_mcp_tool_turn_prompts_with_projects(
+        project_id,
+        channel,
+        user_message_or_doc,
+        recent_history,
+        open_tasks,
+        active_decisions,
+        active_sops,
+        recent_docs,
+        existing_methods,
+        fts_snippets,
+        doc_meta,
+        is_legacy_reprocess,
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_mcp_tool_turn_prompts_with_projects(
+    project_id: &str,
+    channel: &str,
+    user_message_or_doc: &str,
+    recent_history: &[ChatMessage],
+    open_tasks: &[WorkEntity],
+    active_decisions: &[WorkEntity],
+    active_sops: &[SopRule],
+    recent_docs: &[KnowledgeDocument],
+    existing_methods: &[MethodPlaybook],
+    fts_snippets: &[(String, String)],
+    doc_meta: Option<(&str, &str, &str)>, // (title, doc_type, filename)
+    is_legacy_reprocess: bool,
+    all_projects: &[Project],
 ) -> (String, String) {
     let current_hero = format_active_next_step_summary(open_tasks);
     let tasks_compact = compact_tasks_summary(open_tasks);
@@ -199,9 +262,27 @@ CRITICAL ANTI-DUPLICATE LEGACY REPROCESSING RULES:
         ""
     };
 
+    let is_global_chat = project_id.eq_ignore_ascii_case("GLOBAL");
+    let projects_catalog = format_projects_catalog(all_projects);
+    let cross_project_rules = if is_global_chat {
+        r#"
+CROSS-PROJECT (GLOBAL) CHAT & MULTI-PROJECT NOTE ROUTING:
+- This conversation is a FREE / CROSS-PROJECT chat (NOT restricted to a single project).
+- The user may talk about multiple projects in the same chat or even in the same message!
+- WHENEVER the user mentions a note, point, insight, lesson, instruction, task, decision (ADR), SOP rule, antipattern, or method/playbook about a SPECIFIC project (by name or ID from `AVAILABLE PROJECTS IN WORKSPACE` below), you MUST pass that target project's `project_id` in your MCP tool call (`save_personal_or_lesson_item`, `log_work_and_knowledge`, `create_work_entity`, `update_work_entity`, `upsert_method_playbook`, `create_work_line_chain`, etc.) so it is recorded directly in THAT project!
+- If the user mentions points about 2 or more different projects in one message, invoke the recording tools separately for each respective `project_id`.
+- For general personal notes not tied to any specific project, you may omit `project_id` on `save_personal_or_lesson_item` (or pass `project_id: null`).
+- You can also call `get_path_ahead` or `search_memory` with any `project_id` to inspect another project's live state before recording."#
+    } else {
+        r#"
+CROSS-PROJECT NOTE ROUTING:
+- Even though this chat is inside a specific project, if the user mentions a note, insight, task, decision, or method belonging to ANOTHER project from `AVAILABLE PROJECTS IN WORKSPACE`, pass that other project's `project_id` in your MCP tool call so it is recorded in THAT project instead!"#
+    };
+
     let system_prompt = format!(
         r#"You are Mab-Compass v4.0's interactive AI Copilot, Knowledge & Method Architect for project "{project_id}" ({mode_desc}).
 {legacy_rules}
+{cross_project_rules}
 YOU HAVE NATIVE MCP TOOLS TO READ & UPDATE THE FULL ECOSYSTEM DIRECTLY:
 1. Methods, Playbooks & BPMN 2.0 Workflows (دستورالعمل و متد انجام کار):
    - `upsert_method_playbook`: WHENEVER you detect a repeatable work pattern, procedure, workflow, or method in a work report, incremental messages, or document — OR whenever the user explicitly asks for a method/playbook/workflow — call `upsert_method_playbook`!
@@ -231,7 +312,10 @@ DOCUMENT & INPUT PROCESSING RULES:
     let bounded_input: String = user_message_or_doc.chars().take(48000).collect();
 
     let user_prompt = format!(
-        r#"CURRENT #1 ACTIVE STEP ON PATH AHEAD:
+        r#"AVAILABLE PROJECTS IN WORKSPACE:
+{projects_catalog}
+
+CURRENT #1 ACTIVE STEP ON PATH AHEAD:
 {current_hero}
 
 EXISTING METHODS & PLAYBOOKS (UPDATE/ENRICH BY method_id IF SIMILAR):

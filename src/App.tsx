@@ -1191,7 +1191,7 @@ export default function App() {
             isNarrowViewport={isNarrowViewport}
             onCloseMobile={() => setIsSidebarOpen(false)}
             onNewConversation={() =>
-              void handleCreateChatSession(dash.active_project.id, activeChatChannel)
+              void handleCreateChatSession("GLOBAL", activeChatChannel)
             }
             onOpenBuiltinView={openBuiltinView}
             onSwitchProject={(pid) => void handleSwitchProject(pid)}

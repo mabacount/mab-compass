@@ -417,6 +417,10 @@ pub struct WrittenArtifactRef {
     pub action: String, // "CREATED" | "UPDATED"
     #[serde(default)]
     pub version: Option<i32>,
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub project_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1047,6 +1051,8 @@ pub struct CopilotEnvelope {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AtomicMutation {
+    #[serde(default, deserialize_with = "deserialize_opt_string_lenient")]
+    pub project_id: Option<String>,
     #[serde(default, deserialize_with = "deserialize_string_lenient")]
     pub op: String, // "RESOLVE_ENTITY" | "CREATE_ENTITY" | "UPDATE_ENTITY" | "SET_NEXT_STEP" | "DELETE_ENTITY" | "SUPERSEDE_DECISION" | "UPSERT_SOP" | "REGISTER_ANTIPATTERN" | "LOG_WORK"
     #[serde(default, deserialize_with = "deserialize_opt_string_lenient")]

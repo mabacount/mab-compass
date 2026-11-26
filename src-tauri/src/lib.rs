@@ -27,6 +27,173 @@ fn merge_written_artifacts(
     out
 }
 
+fn resolve_chat_session_project_id(
+    conn: &Connection,
+    session_id: Option<&str>,
+    fallback_pid: &str,
+) -> String {
+    if let Some(sid) = session_id.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Ok(pid) = conn.query_row(
+            "SELECT project_id FROM chat_sessions WHERE id = ?1",
+            [sid],
+            |r| r.get::<_, String>(0),
+        ) {
+            return pid;
+        }
+    }
+    if get_active_chat_scope(conn) == "GLOBAL" {
+        return GLOBAL_CHAT_PROJECT_ID.to_string();
+    }
+    fallback_pid.to_string()
+}
+
+fn resolve_chat_archive_workspace(workspace_path: &str, chat_pid: &str) -> String {
+    if chat_pid == GLOBAL_CHAT_PROJECT_ID {
+        let p = std::path::Path::new(workspace_path);
+        if let Some(parent) = p.parent() {
+            return parent.join("_global_compass_chats").to_string_lossy().to_string();
+        }
+        return format!("{}_global", workspace_path);
+    }
+    workspace_path.to_string()
+}
+
+fn resolve_project_id_by_ref(projects: &[Project], raw_ref: Option<&str>) -> Option<(String, String)> {
+    let raw = raw_ref.map(str::trim).filter(|s| {
+        !s.is_empty() && !s.eq_ignore_ascii_case(GLOBAL_CHAT_PROJECT_ID)
+    })?;
+    if let Some(p) = projects
+        .iter()
+        .find(|p| p.id.eq_ignore_ascii_case(raw) || p.name.trim().eq_ignore_ascii_case(raw))
+    {
+        return Some((p.id.clone(), p.name.clone()));
+    }
+    let raw_lower = raw.to_lowercase();
+    let partial: Vec<&Project> = projects
+        .iter()
+        .filter(|p| {
+            p.id.to_lowercase().contains(&raw_lower) || p.name.to_lowercase().contains(&raw_lower)
+        })
+        .collect();
+    if partial.len() == 1 {
+        return Some((partial[0].id.clone(), partial[0].name.clone()));
+    }
+    None
+}
+
+fn sync_touched_project_projections(
+    conn: &Connection,
+    primary_dash: &DashboardState,
+    artifacts: &[WrittenArtifactRef],
+    meeting_title: Option<&str>,
+    meeting_summary: Option<&str>,
+) -> Result<(), String> {
+    let mut synced: std::collections::HashSet<String> = std::collections::HashSet::new();
+    sync_all_project_projections(primary_dash, meeting_title, meeting_summary)?;
+    synced.insert(primary_dash.active_project.id.clone());
+
+    for art in artifacts {
+        if let Some(ref pid) = art.project_id {
+            if !pid.is_empty()
+                && pid != GLOBAL_CHAT_PROJECT_ID
+                && synced.insert(pid.clone())
+            {
+                if let Ok(other_dash) = get_dashboard_state_for_project(conn, Some(pid)) {
+                    let _ = sync_all_project_projections(&other_dash, None, None);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn apply_envelope_cross_project(
+    conn: &mut Connection,
+    projects: &[Project],
+    fallback_pid: &str,
+    fallback_pname: &str,
+    raw_text: &str,
+    archived_path: Option<&str>,
+    source_origin: &str,
+    envelope: &CopilotEnvelope,
+    raw_event_id: Option<i64>,
+) -> Result<(String, Vec<WrittenArtifactRef>), String> {
+    let mut grouped: std::collections::BTreeMap<String, (String, Vec<AtomicMutation>)> =
+        std::collections::BTreeMap::new();
+
+    for m in &envelope.mutations {
+        let (target_pid, target_pname) = resolve_project_id_by_ref(projects, m.project_id.as_deref())
+            .unwrap_or_else(|| (fallback_pid.to_string(), fallback_pname.to_string()));
+        grouped
+            .entry(target_pid)
+            .or_insert_with(|| (target_pname, Vec::new()))
+            .1
+            .push(m.clone());
+    }
+
+    if grouped.is_empty() {
+        let (badge, mut arts) = apply_copilot_envelope_with_artifacts(
+            conn,
+            fallback_pid,
+            raw_text,
+            archived_path,
+            source_origin,
+            envelope,
+            raw_event_id,
+        )
+        .map_err(|e| e.to_string())?;
+        for a in &mut arts {
+            if a.project_id.is_none() {
+                a.project_id = Some(fallback_pid.to_string());
+                a.project_name = Some(fallback_pname.to_string());
+            }
+        }
+        return Ok((badge, arts));
+    }
+
+    let mut badges: Vec<String> = Vec::new();
+    let mut all_arts: Vec<WrittenArtifactRef> = Vec::new();
+    for (idx, (target_pid, (target_pname, muts))) in grouped.into_iter().enumerate() {
+        let sub_env = CopilotEnvelope {
+            conversational_reply: envelope.conversational_reply.clone(),
+            mutations: muts,
+            method_playbooks: if idx == 0 {
+                envelope.method_playbooks.clone()
+            } else {
+                Vec::new()
+            },
+            ..Default::default()
+        };
+        let (badge, mut arts) = apply_copilot_envelope_with_artifacts(
+            conn,
+            &target_pid,
+            raw_text,
+            archived_path,
+            source_origin,
+            &sub_env,
+            if idx == 0 { raw_event_id } else { None },
+        )
+        .map_err(|e| e.to_string())?;
+        if !badge.is_empty() && badge != "بدون تغییر گراف" {
+            badges.push(badge);
+        }
+        for a in &mut arts {
+            if a.project_id.is_none() {
+                a.project_id = Some(target_pid.clone());
+                a.project_name = Some(target_pname.clone());
+            }
+        }
+        all_arts.extend(arts);
+    }
+
+    let final_badge = if badges.is_empty() {
+        "بدون تغییر گراف".to_string()
+    } else {
+        badges.join(" • ")
+    };
+    Ok((final_badge, all_arts))
+}
+
 fn format_turn_badge(mcp_ops: &[String], envelope_badge: &str, transport_label: &str) -> String {
     if !mcp_ops.is_empty() {
         let mcp_part = format!("🛠 MCP: {}", mcp_ops.join(" • "));
@@ -202,8 +369,8 @@ fn cmd_commit_user_chat_message(
     let norm_ch = normalize_chat_channel(&channel);
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     let d = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
-    let pid = d.active_project.id.clone();
-    let workspace_path = d.active_project.workspace_path.clone();
+    let pid = resolve_chat_session_project_id(&conn, session_id.as_deref(), &d.active_project.id);
+    let workspace_path = resolve_chat_archive_workspace(&d.active_project.workspace_path, &pid);
 
     let (arch_tag, source_type) = if norm_ch == "VAULT" {
         ("vault_dialogue", "VAULT_CHAT")
@@ -269,7 +436,10 @@ async fn cmd_run_assistant_turn(
 ) -> Result<AssistantTurnOutcome, String> {
     let norm_ch = normalize_chat_channel(&channel).to_string();
     let (
-        pid,
+        chat_pid,
+        active_pid,
+        active_pname,
+        all_projects,
         settings,
         open_tasks,
         active_decisions,
@@ -282,7 +452,13 @@ async fn cmd_run_assistant_turn(
     ) = {
         let conn = state.db.lock().map_err(|e| e.to_string())?;
         let d = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
-        let hits = search_raw_events_fts(&conn, &d.active_project.id, &message_text)
+        let chat_pid = resolve_chat_session_project_id(&conn, Some(&session_id), &d.active_project.id);
+        let fts_pid = if chat_pid == GLOBAL_CHAT_PROJECT_ID {
+            d.active_project.id.as_str()
+        } else {
+            chat_pid.as_str()
+        };
+        let hits = search_raw_events_fts(&conn, fts_pid, &message_text)
             .unwrap_or_default();
         let filtered_copilot: Vec<ChatMessage> = d
             .chat_history
@@ -297,7 +473,10 @@ async fn cmd_run_assistant_turn(
             .cloned()
             .collect();
         (
+            chat_pid,
             d.active_project.id.clone(),
+            d.active_project.name.clone(),
+            d.projects.clone(),
             d.settings.clone(),
             d.open_tasks.clone(),
             d.active_decisions.clone(),
@@ -310,9 +489,9 @@ async fn cmd_run_assistant_turn(
         )
     };
 
-    let prompt = if norm_ch == "VAULT" {
+    let base_prompt = if norm_ch == "VAULT" {
         build_vault_chat_prompt(
-            &pid,
+            &chat_pid,
             &message_text,
             &vault_history,
             &open_tasks,
@@ -323,7 +502,7 @@ async fn cmd_run_assistant_turn(
         )
     } else {
         build_copilot_chat_prompt(
-            &pid,
+            &chat_pid,
             &message_text,
             &copilot_history,
             &vault_history,
@@ -334,9 +513,10 @@ async fn cmd_run_assistant_turn(
             &fts_hits,
         )
     };
+    let prompt = append_cross_project_routing_instructions(base_prompt, &chat_pid, &all_projects);
 
-    let (mcp_sys_prompt, mcp_user_prompt) = build_mcp_tool_turn_prompts_with_methods(
-        &pid,
+    let (mcp_sys_prompt, mcp_user_prompt) = build_mcp_tool_turn_prompts_with_projects(
+        &chat_pid,
         &norm_ch,
         &message_text,
         if norm_ch == "VAULT" { &vault_history } else { &copilot_history },
@@ -348,6 +528,7 @@ async fn cmd_run_assistant_turn(
         &fts_hits,
         None,
         false,
+        &all_projects,
     );
 
     let llm_cfg = LlmConfig::from(&settings);
@@ -360,7 +541,7 @@ async fn cmd_run_assistant_turn(
         &state.db,
         state.app_data_dir.clone(),
         &llm_cfg,
-        &pid,
+        &chat_pid,
         raw_event_id,
         source_origin,
         &mcp_sys_prompt,
@@ -377,16 +558,17 @@ async fn cmd_run_assistant_turn(
                     || !envelope.method_playbooks.is_empty()
                     || turn.mcp_ops_executed.is_empty()
                 {
-                    apply_copilot_envelope_with_artifacts(
+                    apply_envelope_cross_project(
                         &mut conn,
-                        &pid,
+                        &all_projects,
+                        &active_pid,
+                        &active_pname,
                         &message_text,
                         Some(&archived_path),
                         source_origin,
                         &envelope,
                         raw_event_id,
-                    )
-                    .map_err(|e| e.to_string())?
+                    )?
                 } else {
                     ("بدون تغییر گراف".to_string(), Vec::new())
                 };
@@ -405,6 +587,8 @@ async fn cmd_run_assistant_turn(
                     file_path: None,
                     action: "CREATED".to_string(),
                     version: None,
+                    project_id: Some(active_pid.clone()),
+                    project_name: Some(active_pname.clone()),
                 });
             }
             let written_artifacts =
@@ -412,7 +596,7 @@ async fn cmd_run_assistant_turn(
 
             append_assistant_chat_message_with_artifacts(
                 &conn,
-                &pid,
+                &chat_pid,
                 &session_id,
                 &norm_ch,
                 "ASSISTANT",
@@ -427,8 +611,10 @@ async fn cmd_run_assistant_turn(
             let _ = complete_pending_items_for_user_msg(&conn, user_message_id, None);
 
             let updated_dash = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
-            sync_all_project_projections(
+            sync_touched_project_projections(
+                &conn,
                 &updated_dash,
+                &written_artifacts,
                 envelope.meeting_title.as_deref(),
                 envelope.meeting_summary_markdown.as_deref(),
             )?;
@@ -446,7 +632,7 @@ async fn cmd_run_assistant_turn(
             let conn = state.db.lock().map_err(|e| e.to_string())?;
             let sys_id = append_assistant_chat_message(
                 &conn,
-                &pid,
+                &chat_pid,
                 &session_id,
                 &norm_ch,
                 "SYSTEM",
@@ -466,7 +652,7 @@ async fn cmd_run_assistant_turn(
                 .collect();
             let _ = enqueue_pending_ai_item(
                 &conn,
-                &pid,
+                &chat_pid,
                 &session_id,
                 &norm_ch,
                 Some(user_message_id),
@@ -725,6 +911,7 @@ async fn cmd_retry_system_message(
                     file_path: new_kp,
                     action: "UPDATED".to_string(),
                     version: None,
+                    ..Default::default()
                 });
             }
 
@@ -1219,6 +1406,7 @@ async fn cmd_run_file_assistant_turn(
                 file_path: Some(knowledge_path.clone()),
                 action: "CREATED".to_string(),
                 version: None,
+                ..Default::default()
             }];
             if let (Some(mtitle), Some(mbody)) = (
                 envelope.meeting_title.as_deref().map(str::trim).filter(|s| !s.is_empty()),
@@ -1232,6 +1420,7 @@ async fn cmd_run_file_assistant_turn(
                     file_path: None,
                     action: "CREATED".to_string(),
                     version: None,
+                    ..Default::default()
                 });
             }
             let written_artifacts =
@@ -1950,6 +2139,7 @@ async fn cmd_process_pending_queue_item(
                         file_path: new_kp,
                         action: "UPDATED".to_string(),
                         version: None,
+                        ..Default::default()
                     });
                 } else {
                     let _ = set_knowledge_doc_processing_status(

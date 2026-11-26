@@ -201,6 +201,21 @@ export function AntigravityChatPane({
           <span className="text-[12.5px] font-medium text-white/85 truncate" dir="auto">
             {activeSession?.title || "گفتگوی همیار"}
           </span>
+          {activeSession?.project_id === "GLOBAL" ? (
+            <span
+              dir="rtl"
+              className="px-2 py-0.5 rounded-md bg-cyan-500/15 border border-cyan-500/25 text-[10px] font-medium text-cyan-300 shrink-0"
+            >
+              آزاد • همه پروژه‌ها
+            </span>
+          ) : (
+            <span
+              dir="auto"
+              className="px-2 py-0.5 rounded-md bg-white/[0.05] border border-white/[0.08] text-[10px] text-white/60 shrink-0 truncate max-w-[130px]"
+            >
+              {dash.active_project.name}
+            </span>
+          )}
         </div>
 
         <div className="flex items-center gap-1.5 shrink-0">
@@ -454,9 +469,16 @@ export function AntigravityChatPane({
                             {art.title}
                           </span>
                         </div>
-                        <span className="px-2 py-0.5 rounded-md bg-white/[0.05] border border-white/[0.08] text-[10px] font-medium text-white/70 shrink-0">
-                          {getArtifactBadge(art)}
-                        </span>
+                        <div className="flex items-center gap-1.5 shrink-0">
+                          {(art.project_name || art.project_id) && (
+                            <span className="px-2 py-0.5 rounded-md bg-cyan-500/10 border border-cyan-500/20 text-[10px] font-medium text-cyan-300">
+                              {art.project_name ?? art.project_id}
+                            </span>
+                          )}
+                          <span className="px-2 py-0.5 rounded-md bg-white/[0.05] border border-white/[0.08] text-[10px] font-medium text-white/70">
+                            {getArtifactBadge(art)}
+                          </span>
+                        </div>
                       </div>
                       {art.summary && (
                         <p className="text-[12.5px] text-[#9CA3AF] leading-relaxed line-clamp-2">

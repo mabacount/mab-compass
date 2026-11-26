@@ -217,6 +217,84 @@ export function AntigravitySidebar({
 
           {/* Projects & Conversations Tree (exact Antigravity Projects section) */}
           <div className="flex-1 min-h-0 flex flex-col px-2 overflow-hidden">
+            {/* Cross-Project Global Chats Section */}
+            {(() => {
+              const globalSessions = dash.all_project_chat_sessions.filter(
+                (s) => s.project_id === "GLOBAL"
+              );
+              return (
+                <div className="mb-2 shrink-0">
+                  <div className="px-2 pb-1 flex items-center justify-between text-[11px] font-medium text-cyan-300/80">
+                    <span dir="rtl" className="truncate">
+                      گفتگوهای آزاد (همه پروژه‌ها)
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => onCreateChatSession("GLOBAL", "COPILOT")}
+                      title="گفتگوی آزاد جدید (بدون محدودیت پروژه)"
+                      className="p-1 rounded hover:bg-white/[0.07] text-cyan-300/70 hover:text-cyan-200 transition"
+                    >
+                      <MessageSquarePlus className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                  <div className="space-y-0.5 max-h-36 overflow-y-auto pr-0.5">
+                    {globalSessions.map((sess) => {
+                      const isCurrent =
+                        (sess.channel === "COPILOT" &&
+                          sess.id === dash.active_copilot_session_id) ||
+                        (sess.channel === "VAULT" &&
+                          sess.id === dash.active_vault_session_id);
+                      return (
+                        <div
+                          key={sess.id}
+                          className={`group flex items-center justify-between gap-1.5 px-2.5 py-1.5 rounded-lg text-[12px] transition ${
+                            isCurrent
+                              ? "bg-cyan-500/15 text-white font-medium border border-cyan-500/25"
+                              : "text-[#9CA3AF] hover:bg-white/[0.04] hover:text-white"
+                          }`}
+                        >
+                          <button
+                            type="button"
+                            onClick={() => {
+                              onSwitchChatSession(sess);
+                              if (isNarrowViewport && onCloseMobile) onCloseMobile();
+                            }}
+                            className="flex-1 min-w-0 text-left truncate"
+                            title={sess.title}
+                          >
+                            <span dir="auto" className="truncate block">
+                              {sess.title}
+                            </span>
+                          </button>
+                          <div className="flex items-center gap-1 shrink-0">
+                            <span className="font-mono text-[10.5px] text-white/35 group-hover:hidden">
+                              {formatCompactAge(sess.updated_at)}
+                            </span>
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                onDeleteChatSession(sess.id);
+                              }}
+                              title="حذف گفتگو"
+                              className="hidden group-hover:inline-flex p-0.5 text-white/45 hover:text-rose-400 transition"
+                            >
+                              <Trash2 className="w-3 h-3" />
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                    {globalSessions.length === 0 && (
+                      <div className="px-2.5 py-1 text-[11px] text-white/35" dir="rtl">
+                        برای چت هم‌زمان روی چند پروژه، + را بزنید
+                      </div>
+                    )}
+                  </div>
+                </div>
+              );
+            })()}
+
             <div className="px-2 pb-1.5 flex items-center justify-between text-[11px] font-medium text-white/45 shrink-0">
               <span>Projects</span>
               <button

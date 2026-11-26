@@ -347,12 +347,23 @@ pub fn get_dashboard_state_for_project(
         .filter_map(|r| r.ok())
         .collect();
 
-    let active_copilot_session_id = ensure_active_chat_session(conn, pid, "COPILOT")?;
-    let active_vault_session_id = ensure_active_chat_session(conn, pid, "VAULT")?;
+    let active_chat_scope: String = if project_id_override.is_some() {
+        "PROJECT".to_string()
+    } else {
+        get_active_chat_scope(conn)
+    };
+    let chat_pid = if active_chat_scope == "GLOBAL" {
+        GLOBAL_CHAT_PROJECT_ID
+    } else {
+        pid.as_str()
+    };
 
-    let chat_history = query_session_messages(conn, pid, &active_copilot_session_id, false)?;
-    let vault_chat_history = query_session_messages(conn, pid, &active_vault_session_id, true)?;
-    let chat_sessions = query_chat_sessions(conn, Some(pid))?;
+    let active_copilot_session_id = ensure_active_chat_session(conn, chat_pid, "COPILOT")?;
+    let active_vault_session_id = ensure_active_chat_session(conn, chat_pid, "VAULT")?;
+
+    let chat_history = query_session_messages(conn, chat_pid, &active_copilot_session_id, false)?;
+    let vault_chat_history = query_session_messages(conn, chat_pid, &active_vault_session_id, true)?;
+    let chat_sessions = query_chat_sessions(conn, Some(chat_pid))?;
     let all_project_chat_sessions = query_chat_sessions(conn, None)?;
 
     let raw_events_count: i32 = conn
@@ -674,6 +685,41 @@ fn derive_session_title(text: &str, fallback: &str) -> String {
     }
 }
 
+pub const GLOBAL_CHAT_PROJECT_ID: &str = "GLOBAL";
+
+pub fn get_active_chat_scope(conn: &Connection) -> String {
+    let _ = crate::db::schema::ensure_column_exists(
+        conn,
+        "app_settings",
+        "active_chat_scope",
+        "ALTER TABLE app_settings ADD COLUMN active_chat_scope TEXT NOT NULL DEFAULT 'PROJECT'",
+    );
+    conn.query_row(
+        "SELECT COALESCE(active_chat_scope, 'PROJECT') FROM app_settings WHERE id = 1",
+        [],
+        |r| r.get::<_, String>(0),
+    )
+    .unwrap_or_else(|_| "PROJECT".to_string())
+}
+
+pub fn set_active_chat_scope(conn: &Connection, scope: &str) {
+    let _ = crate::db::schema::ensure_column_exists(
+        conn,
+        "app_settings",
+        "active_chat_scope",
+        "ALTER TABLE app_settings ADD COLUMN active_chat_scope TEXT NOT NULL DEFAULT 'PROJECT'",
+    );
+    let norm = if scope.eq_ignore_ascii_case("GLOBAL") {
+        "GLOBAL"
+    } else {
+        "PROJECT"
+    };
+    let _ = conn.execute(
+        "UPDATE app_settings SET active_chat_scope = ?1 WHERE id = 1",
+        params![norm],
+    );
+}
+
 pub fn ensure_active_chat_session(
     conn: &Connection,
     project_id: &str,
@@ -726,17 +772,20 @@ pub fn create_chat_session(
     title: Option<&str>,
 ) -> Result<ChatSession> {
     let target_pid = if let Some(pid) = project_id.map(str::trim).filter(|s| !s.is_empty()) {
-        conn.execute(
-            "UPDATE projects SET is_active = CASE WHEN id = ?1 THEN 1 ELSE 0 END",
-            params![pid],
-        )?;
-        pid.to_string()
+        if pid.eq_ignore_ascii_case(GLOBAL_CHAT_PROJECT_ID) {
+            set_active_chat_scope(conn, "GLOBAL");
+            GLOBAL_CHAT_PROJECT_ID.to_string()
+        } else {
+            conn.execute(
+                "UPDATE projects SET is_active = CASE WHEN id = ?1 THEN 1 ELSE 0 END",
+                params![pid],
+            )?;
+            set_active_chat_scope(conn, "PROJECT");
+            pid.to_string()
+        }
     } else {
-        conn.query_row(
-            "SELECT id FROM projects WHERE is_active = 1 LIMIT 1",
-            [],
-            |r| r.get::<_, String>(0),
-        )?
+        set_active_chat_scope(conn, "GLOBAL");
+        GLOBAL_CHAT_PROJECT_ID.to_string()
     };
 
     let norm_ch = normalize_chat_channel(channel).to_string();
@@ -748,7 +797,13 @@ pub fn create_chat_session(
     let session_title = title
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| default_session_title(&norm_ch))
+        .unwrap_or_else(|| {
+            if target_pid == GLOBAL_CHAT_PROJECT_ID {
+                "گفتگوی آزاد (همه پروژه‌ها)"
+            } else {
+                default_session_title(&norm_ch)
+            }
+        })
         .to_string();
 
     conn.execute(
@@ -780,10 +835,15 @@ pub fn switch_chat_session(conn: &Connection, session_id: &str) -> Result<(Strin
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
 
-    conn.execute(
-        "UPDATE projects SET is_active = CASE WHEN id = ?1 THEN 1 ELSE 0 END",
-        params![pid],
-    )?;
+    if pid == GLOBAL_CHAT_PROJECT_ID {
+        set_active_chat_scope(conn, "GLOBAL");
+    } else {
+        conn.execute(
+            "UPDATE projects SET is_active = CASE WHEN id = ?1 THEN 1 ELSE 0 END",
+            params![pid],
+        )?;
+        set_active_chat_scope(conn, "PROJECT");
+    }
     conn.execute(
         "UPDATE chat_sessions
          SET is_active = CASE WHEN id = ?1 THEN 1 ELSE 0 END
@@ -814,7 +874,22 @@ pub fn delete_chat_session(conn: &Connection, session_id: &str) -> Result<()> {
             "DELETE FROM chat_sessions WHERE id = ?1",
             params![session_id],
         )?;
-        let _ = ensure_active_chat_session(conn, &pid, &ch);
+        if pid == GLOBAL_CHAT_PROJECT_ID {
+            let remaining: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM chat_sessions WHERE project_id = ?1 AND channel = ?2",
+                    params![GLOBAL_CHAT_PROJECT_ID, ch],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            if remaining == 0 {
+                set_active_chat_scope(conn, "PROJECT");
+            } else {
+                let _ = ensure_active_chat_session(conn, &pid, &ch);
+            }
+        } else {
+            let _ = ensure_active_chat_session(conn, &pid, &ch);
+        }
     }
     Ok(())
 }
@@ -1431,6 +1506,7 @@ pub fn apply_copilot_envelope_with_artifacts(
                         },
                         action: "CREATED".to_string(),
                         version: None,
+                        ..Default::default()
                     });
                 } else {
                     created += 1;
@@ -1795,6 +1871,7 @@ pub fn commit_user_chat_turn(
         || cur_title == "گفتگوی جدید"
         || cur_title == "گفتگوی اصلی پروژه"
         || cur_title == "گفتگوی آرشیو دانش"
+        || cur_title == "گفتگوی آزاد (همه پروژه‌ها)"
         || cur_title.trim().is_empty()
     {
         derive_session_title(user_text, default_session_title(norm_ch))
