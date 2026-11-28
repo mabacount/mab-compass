@@ -1,7 +1,9 @@
 import { useEffect, useState } from "react";
 import {
   Brain,
+  CalendarDays,
   ChevronDown,
+  ChevronLeft,
   ChevronRight,
   Compass,
   Database,
@@ -10,6 +12,7 @@ import {
   FolderOpen,
   FolderArchive,
   FolderPlus,
+  GripVertical,
   Layers,
   MessageSquarePlus,
   Plus,
@@ -27,6 +30,7 @@ export type BuiltinCanvasViewId =
   | "METHODS_BPMN"
   | "WBS"
   | "KNOWLEDGE_ARCHIVE"
+  | "CALENDAR"
   | "ECOSYSTEM_CARDS"
   | "SETTINGS"
   | "LOGS";
@@ -45,6 +49,11 @@ interface AntigravitySidebarProps {
   onCreateChatSession: (projectId: string, channel: "COPILOT" | "VAULT") => void;
   onSwitchChatSession: (session: ChatSession) => void;
   onDeleteChatSession: (sessionId: string) => void;
+  canMoveLeft?: boolean;
+  canMoveRight?: boolean;
+  onMoveLeft?: () => void;
+  onMoveRight?: () => void;
+  onDragStartPane?: () => void;
 }
 
 function formatCompactAge(iso: string): string {
@@ -76,6 +85,11 @@ export function AntigravitySidebar({
   onCreateChatSession,
   onSwitchChatSession,
   onDeleteChatSession,
+  canMoveLeft,
+  canMoveRight,
+  onMoveLeft,
+  onMoveRight,
+  onDragStartPane,
 }: AntigravitySidebarProps) {
   const [expandedProjects, setExpandedProjects] = useState<Record<string, boolean>>({});
 
@@ -144,8 +158,20 @@ export function AntigravitySidebar({
       accentClass: "text-amber-400",
     },
     {
+      id: "CALENDAR",
+      label: "تقویم و رویدادها",
+      icon: CalendarDays,
+      badge: (() => {
+        const upcomingCount = (dash.calendar_events ?? []).filter(
+          (e) => e.status === "UPCOMING"
+        ).length;
+        return upcomingCount > 0 ? upcomingCount : null;
+      })(),
+      accentClass: "text-indigo-400",
+    },
+    {
       id: "ECOSYSTEM_CARDS",
-      label: "اهداف، کارت‌ها و تقویم",
+      label: "اهداف و کارت‌ها",
       icon: Brain,
       badge:
         (dash.personal_vault_items?.length ?? 0) > 0
@@ -176,11 +202,46 @@ export function AntigravitySidebar({
         className={`${
           isNarrowViewport
             ? "fixed top-[38px] left-0 bottom-0 z-40 w-[260px] shadow-2xl"
-            : "shrink-0"
-        } bg-[#121317] border-r border-white/[0.07] flex flex-col justify-between min-h-0 select-none`}
+            : "shrink-0 h-full min-w-0"
+        } bg-[#121317] border-x border-white/[0.07] flex flex-col justify-between min-h-0 select-none`}
       >
         {/* Top Scrollable Area */}
         <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
+          {!isNarrowViewport && (onMoveLeft || onMoveRight) && (
+            <div
+              draggable={!!onDragStartPane}
+              onDragStart={onDragStartPane}
+              className="h-[26px] px-2 border-b border-white/[0.05] flex items-center justify-between text-[10px] text-white/40 cursor-grab active:cursor-grabbing shrink-0"
+              title="کشیدن یا کلیک برای جابجایی ستون"
+            >
+              <span className="inline-flex items-center gap-1">
+                <GripVertical className="w-3 h-3" />
+                <span>فهرست</span>
+              </span>
+              <div className="flex items-center gap-0.5">
+                {canMoveLeft && onMoveLeft && (
+                  <button
+                    type="button"
+                    onClick={onMoveLeft}
+                    title="انتقال ستون به چپ"
+                    className="p-0.5 rounded hover:bg-white/[0.08] hover:text-white"
+                  >
+                    <ChevronLeft className="w-3 h-3" />
+                  </button>
+                )}
+                {canMoveRight && onMoveRight && (
+                  <button
+                    type="button"
+                    onClick={onMoveRight}
+                    title="انتقال ستون به راست"
+                    className="p-0.5 rounded hover:bg-white/[0.08] hover:text-white"
+                  >
+                    <ChevronRight className="w-3 h-3" />
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
           {/* + New Conversation button (Antigravity signature top button) */}
           <div className="p-2.5 pb-1.5 shrink-0">
             <button

@@ -73,12 +73,17 @@ export function BpmnViewer({
   const [showRawXml, setShowRawXml] = useState(false);
   const [copiedXml, setCopiedXml] = useState(false);
 
-  // Pan & Zoom state
+  // Pan & Zoom state (full-bleed infinite canvas + cursor-anchored wheel zoom)
   const [zoom, setZoom] = useState(1);
-  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const [pan, setPan] = useState({ x: 24, y: 24 });
   const [isPanning, setIsPanning] = useState(false);
   const panStartRef = useRef<{ x: number; y: number; panX: number; panY: number } | null>(null);
   const svgContainerRef = useRef<HTMLDivElement | null>(null);
+  const zoomRef = useRef(zoom);
+  zoomRef.current = zoom;
+  const panRef = useRef(pan);
+  panRef.current = pan;
+  const userInteractedRef = useRef(false);
 
   // Preserve active drill-down SubProcess path when live dashboard updates refresh rootGraph
   useEffect(() => {
@@ -147,39 +152,112 @@ export function BpmnViewer({
     }
   };
 
-  const handleFitView = () => {
+  const fitDiagramToContainer = (forceResetInteraction = true) => {
     const el = svgContainerRef.current;
     if (!el || positioned.width <= 0 || positioned.height <= 0) {
       setZoom(1);
-      setPan({ x: 0, y: 0 });
+      setPan({ x: 24, y: 24 });
       return;
     }
     const rect = el.getBoundingClientRect();
     if (rect.width <= 40 || rect.height <= 40) return;
-    const scaleX = (rect.width - 28) / positioned.width;
-    const scaleY = (rect.height - 28) / positioned.height;
-    const nextZoom = Math.max(0.45, Math.min(1.05, Math.min(scaleX, scaleY)));
-    setZoom(Math.round(nextZoom * 100) / 100);
-    setPan({ x: 0, y: 0 });
+    const scaleX = (rect.width - 40) / positioned.width;
+    const scaleY = (rect.height - 40) / positioned.height;
+    const nextZoom = Math.max(0.25, Math.min(1.2, Math.round(Math.min(scaleX, scaleY) * 100) / 100));
+    const centeredX = Math.max(12, Math.round((rect.width - positioned.width * nextZoom) / 2));
+    const centeredY = Math.max(12, Math.round((rect.height - positioned.height * nextZoom) / 2));
+    setZoom(nextZoom);
+    setPan({ x: centeredX, y: centeredY });
+    if (forceResetInteraction) userInteractedRef.current = false;
   };
 
-  // Auto-fit diagram cleanly when switching graphs or drilling down so all nodes are visible immediately
-  useEffect(() => {
-    const id = window.requestAnimationFrame(() => {
-      const el = svgContainerRef.current;
-      if (!el || positioned.width <= 0 || positioned.height <= 0) return;
-      const rect = el.getBoundingClientRect();
-      if (rect.width <= 40 || rect.height <= 40) return;
-      if (positioned.width > rect.width - 24 || positioned.height > rect.height - 24) {
-        const scaleX = (rect.width - 28) / positioned.width;
-        const scaleY = (rect.height - 28) / positioned.height;
-        const nextZoom = Math.max(0.45, Math.min(1.0, Math.min(scaleX, scaleY)));
-        setZoom(Math.round(nextZoom * 100) / 100);
-        setPan({ x: 0, y: 0 });
-      }
+  const handleFitView = () => {
+    fitDiagramToContainer(true);
+  };
+
+  const handleResetOneToOne = () => {
+    const el = svgContainerRef.current;
+    userInteractedRef.current = true;
+    if (!el) {
+      setZoom(1);
+      setPan({ x: 24, y: 24 });
+      return;
+    }
+    const rect = el.getBoundingClientRect();
+    setZoom(1);
+    setPan({
+      x: Math.round((rect.width - positioned.width) / 2),
+      y: Math.round((rect.height - positioned.height) / 2),
     });
-    return () => window.cancelAnimationFrame(id);
+  };
+
+  const zoomAroundCenter = (delta: number) => {
+    userInteractedRef.current = true;
+    const el = svgContainerRef.current;
+    const oldZoom = zoomRef.current;
+    const oldPan = panRef.current;
+    const nextZoom = Math.max(0.2, Math.min(3.5, Math.round((oldZoom + delta) * 100) / 100));
+    if (!el || nextZoom === oldZoom) {
+      setZoom(nextZoom);
+      return;
+    }
+    const rect = el.getBoundingClientRect();
+    const cx = rect.width / 2;
+    const cy = rect.height / 2;
+    const ratio = nextZoom / oldZoom;
+    setZoom(nextZoom);
+    setPan({
+      x: cx - (cx - oldPan.x) * ratio,
+      y: cy - (cy - oldPan.y) * ratio,
+    });
+  };
+
+  // Auto-fit when switching graphs or when container resizes (unless user zoomed/panned manually)
+  useEffect(() => {
+    userInteractedRef.current = false;
+    const rafId = window.requestAnimationFrame(() => fitDiagramToContainer(false));
+    const el = svgContainerRef.current;
+    let ro: ResizeObserver | null = null;
+    if (el && typeof ResizeObserver !== "undefined") {
+      ro = new ResizeObserver(() => {
+        if (!userInteractedRef.current) {
+          fitDiagramToContainer(false);
+        }
+      });
+      ro.observe(el);
+    }
+    return () => {
+      window.cancelAnimationFrame(rafId);
+      ro?.disconnect();
+    };
   }, [activeGraph.id, positioned.width, positioned.height]);
+
+  // Native non-passive wheel zoom centered at mouse cursor (no Ctrl key required)
+  useEffect(() => {
+    const el = svgContainerRef.current;
+    if (!el || showRawXml) return;
+    const onNativeWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      userInteractedRef.current = true;
+      const rect = el.getBoundingClientRect();
+      const cursorX = e.clientX - rect.left;
+      const cursorY = e.clientY - rect.top;
+      const oldZoom = zoomRef.current;
+      const oldPan = panRef.current;
+      const factor = e.deltaY < 0 ? 1.12 : 1 / 1.12;
+      const nextZoom = Math.max(0.2, Math.min(3.5, Math.round(oldZoom * factor * 100) / 100));
+      if (nextZoom === oldZoom) return;
+      const ratio = nextZoom / oldZoom;
+      setZoom(nextZoom);
+      setPan({
+        x: cursorX - (cursorX - oldPan.x) * ratio,
+        y: cursorY - (cursorY - oldPan.y) * ratio,
+      });
+    };
+    el.addEventListener("wheel", onNativeWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onNativeWheel);
+  }, [showRawXml, activeGraph.id]);
 
   const handleCopyXml = async () => {
     try {
@@ -269,18 +347,23 @@ export function BpmnViewer({
             <>
               <button
                 type="button"
-                onClick={() => setZoom((z) => Math.max(0.4, Math.round((z - 0.15) * 100) / 100))}
+                onClick={() => zoomAroundCenter(-0.15)}
                 title="کوچک‌نمایی"
                 className="p-1.5 rounded-md bg-white/[0.03] hover:bg-white/[0.08] text-white/70 hover:text-white transition"
               >
                 <ZoomOut className="w-3.5 h-3.5" />
               </button>
-              <span className="font-mono text-[10.5px] text-white/60 w-10 text-center">
-                {Math.round(zoom * 100)}%
-              </span>
               <button
                 type="button"
-                onClick={() => setZoom((z) => Math.min(2.0, Math.round((z + 0.15) * 100) / 100))}
+                onClick={handleResetOneToOne}
+                title="بازگشت به مقیاس ۱۰۰٪"
+                className="font-mono text-[10.5px] text-white/70 hover:text-white px-1.5 py-0.5 rounded hover:bg-white/[0.07] min-w-[42px] text-center transition"
+              >
+                {Math.round(zoom * 100)}%
+              </button>
+              <button
+                type="button"
+                onClick={() => zoomAroundCenter(0.15)}
                 title="بزرگ‌نمایی"
                 className="p-1.5 rounded-md bg-white/[0.03] hover:bg-white/[0.08] text-white/70 hover:text-white transition"
               >
@@ -289,7 +372,7 @@ export function BpmnViewer({
               <button
                 type="button"
                 onClick={handleFitView}
-                title="تنظیم خودکار کادر"
+                title="تنظیم خودکار و مرکزچینی در کادر"
                 className="p-1.5 rounded-md bg-white/[0.03] hover:bg-white/[0.08] text-white/70 hover:text-white transition"
               >
                 <Maximize2 className="w-3.5 h-3.5" />
@@ -349,7 +432,10 @@ export function BpmnViewer({
           <div
             ref={svgContainerRef}
             onMouseDown={(e) => {
-              if ((e.target as HTMLElement).closest("[data-bpmn-node='true']")) return;
+              const isMiddle = e.button === 1;
+              if (!isMiddle && (e.target as HTMLElement).closest("[data-bpmn-node='true']")) return;
+              if (isMiddle) e.preventDefault();
+              userInteractedRef.current = true;
               setIsPanning(true);
               panStartRef.current = {
                 x: e.clientX,
@@ -375,20 +461,18 @@ export function BpmnViewer({
               setIsPanning(false);
               panStartRef.current = null;
             }}
-            onWheel={(e) => {
-              if (e.ctrlKey) {
-                e.preventDefault();
-                const delta = e.deltaY < 0 ? 0.1 : -0.1;
-                setZoom((z) => Math.max(0.4, Math.min(2.0, Math.round((z + delta) * 100) / 100)));
-              }
+            onDoubleClick={(e) => {
+              if ((e.target as HTMLElement).closest("[data-bpmn-node='true']")) return;
+              handleFitView();
             }}
-            className={`flex-1 min-h-[260px] overflow-auto relative select-none ${
+            className={`flex-1 min-h-[120px] overflow-hidden relative select-none ${
               isPanning ? "cursor-grabbing" : "cursor-grab"
             }`}
             style={{
               backgroundImage:
-                "radial-gradient(rgba(255,255,255,0.06) 1px, transparent 1px)",
-              backgroundSize: "20px 20px",
+                "radial-gradient(rgba(255,255,255,0.08) 1px, transparent 1px)",
+              backgroundSize: `${Math.max(10, Math.round(20 * zoom))}px ${Math.max(10, Math.round(20 * zoom))}px`,
+              backgroundPosition: `${Math.round(pan.x)}px ${Math.round(pan.y)}px`,
             }}
             dir="ltr"
           >
@@ -406,11 +490,7 @@ export function BpmnViewer({
                 )}
               </div>
             ) : (
-              <svg
-                width={Math.max(positioned.width * zoom + Math.max(0, pan.x) + 120, 680)}
-                height={Math.max(positioned.height * zoom + Math.max(0, pan.y) + 90, 340)}
-                className="block"
-              >
+              <svg className="w-full h-full block">
                 <defs>
                   <marker
                     id={arrowId}
@@ -734,9 +814,9 @@ export function BpmnViewer({
             {/* Floating helper tip */}
             <div
               dir="rtl"
-              className="absolute bottom-2.5 right-3 px-2.5 py-1 rounded-lg bg-[#121317]/90 border border-white/[0.08] text-[10.5px] text-mab-text-muted pointer-events-none"
+              className="hidden sm:block absolute bottom-2 right-3 px-2.5 py-1 rounded-lg bg-[#121317]/90 border border-white/[0.08] text-[10px] text-mab-text-muted pointer-events-none"
             >
-              کلیک روی هر بخش: مشاهده جزئیات • دوبارکلیک روی مجموعه کارهای بنفش (+): ورود به ورک‌فلوی داخلی
+              اسکرول موس: زوم روی مکان‌نما • کشیدن موس: جابجایی • دوبارکلیک روی پس‌زمینه: تنظیم کادر • کلیک روی گره: جزئیات
             </div>
           </div>
 

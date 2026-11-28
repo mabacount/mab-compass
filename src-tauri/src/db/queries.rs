@@ -432,7 +432,7 @@ pub fn get_dashboard_state_for_project(
         }
     }
 
-    let next_step_task = unblocked_tasks
+    let mut next_step_task = unblocked_tasks
         .iter()
         .find(|t| t.status == "IN_PROGRESS" && t.is_on_critical_path)
         .or_else(|| unblocked_tasks.iter().find(|t| t.status == "IN_PROGRESS"))
@@ -440,7 +440,7 @@ pub fn get_dashboard_state_for_project(
         .or_else(|| unblocked_tasks.first())
         .cloned();
 
-    let horizon_tasks: Vec<WorkEntity> = unblocked_tasks
+    let mut horizon_tasks: Vec<WorkEntity> = unblocked_tasks
         .into_iter()
         .filter(|t| next_step_task.as_ref().map(|ns| ns.id != t.id).unwrap_or(true))
         .take(3)
@@ -607,15 +607,31 @@ pub fn get_dashboard_state_for_project(
     let pending_queue = query_pending_ai_queue(conn).unwrap_or_default();
 
     let calendar_days = query_all_calendar_days(conn).unwrap_or_default();
+    let calendar_events = query_all_calendar_events(conn, &projects).unwrap_or_default();
+    let calendar_scheduled_tasks =
+        query_all_calendar_scheduled_tasks(conn, &projects).unwrap_or_default();
+    let _ = enrich_work_entities_calendar_events(conn, &mut open_tasks);
+    let _ = enrich_work_entities_calendar_events(conn, &mut horizon_tasks);
+    let _ = enrich_work_entities_calendar_events(conn, &mut top_priority_steps);
+    if let Some(ref mut ns) = next_step_task {
+        let _ = enrich_work_entities_calendar_events(conn, std::slice::from_mut(ns));
+    }
     let pending_proposals = query_all_pending_proposals(conn).unwrap_or_default();
     let personal_vault_items = query_all_personal_vault_items(conn).unwrap_or_default();
     let methods_playbooks =
         crate::method_engine::query_all_methods_playbooks(conn, pid).unwrap_or_default();
-    let (portfolio_projects, cross_project_priorities) = if project_id_override.is_none() {
+    let (mut portfolio_projects, mut cross_project_priorities) = if project_id_override.is_none() {
         query_portfolio_path_summary(conn, &projects).unwrap_or_default()
     } else {
         (Vec::new(), Vec::new())
     };
+    let _ = enrich_work_entities_calendar_events(conn, &mut cross_project_priorities);
+    for ps in &mut portfolio_projects {
+        if let Some(ref mut ns) = ps.next_step_task {
+            let _ = enrich_work_entities_calendar_events(conn, std::slice::from_mut(ns));
+        }
+        let _ = enrich_work_entities_calendar_events(conn, &mut ps.horizon_tasks);
+    }
 
     Ok(DashboardState {
         projects,
@@ -652,6 +668,8 @@ pub fn get_dashboard_state_for_project(
         active_chat_scope,
         portfolio_projects,
         cross_project_priorities,
+        calendar_events,
+        calendar_scheduled_tasks,
     })
 }
 
@@ -901,6 +919,383 @@ pub fn query_all_calendar_days(conn: &Connection) -> Result<Vec<CalendarDay>> {
         })
     })?;
     Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+pub fn ensure_calendar_events_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS calendar_events (
+            id TEXT PRIMARY KEY,
+            project_id TEXT,
+            title TEXT NOT NULL,
+            event_type TEXT NOT NULL DEFAULT 'MEETING',
+            event_date TEXT NOT NULL,
+            start_time TEXT NOT NULL DEFAULT '',
+            end_time TEXT NOT NULL DEFAULT '',
+            location_or_link TEXT NOT NULL DEFAULT '',
+            notes TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'UPCOMING',
+            color_hex TEXT NOT NULL DEFAULT '#3B82F6',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_calendar_events_date ON calendar_events(event_date);
+        CREATE INDEX IF NOT EXISTS idx_calendar_events_project ON calendar_events(project_id);
+        ",
+    )?;
+    let _ = crate::db::schema::ensure_column_exists(
+        conn,
+        "work_entities",
+        "calendar_event_id",
+        "ALTER TABLE work_entities ADD COLUMN calendar_event_id TEXT",
+    );
+    Ok(())
+}
+
+pub fn enrich_work_entities_calendar_events(
+    conn: &Connection,
+    entities: &mut [WorkEntity],
+) -> Result<()> {
+    if entities.is_empty() {
+        return Ok(());
+    }
+    let _ = ensure_calendar_events_schema(conn);
+    let mut event_titles: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    if let Ok(mut stmt) = conn.prepare("SELECT id, title FROM calendar_events") {
+        if let Ok(rows) =
+            stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        {
+            for (eid, title) in rows.filter_map(|r| r.ok()) {
+                event_titles.insert(eid, title);
+            }
+        }
+    }
+    for e in entities.iter_mut() {
+        let ev_id: Option<String> = conn
+            .query_row(
+                "SELECT calendar_event_id FROM work_entities WHERE id = ?1 LIMIT 1",
+                params![e.id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten()
+            .filter(|s| !s.trim().is_empty());
+        e.calendar_event_title = ev_id
+            .as_ref()
+            .and_then(|eid| event_titles.get(eid).cloned());
+        e.calendar_event_id = ev_id;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn upsert_calendar_event(
+    conn: &Connection,
+    event_id_opt: Option<&str>,
+    project_id_opt: Option<&str>,
+    title: &str,
+    event_type: &str,
+    event_date: &str,
+    start_time: &str,
+    end_time: &str,
+    location_or_link: &str,
+    notes: &str,
+    status: &str,
+    color_hex: &str,
+) -> Result<CalendarEvent> {
+    ensure_calendar_events_schema(conn)?;
+    let now = Local::now().to_rfc3339();
+    let eid = event_id_opt
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            format!("EVT-{}", &uuid::Uuid::new_v4().to_string()[..8].to_uppercase())
+        });
+    let norm_pid = project_id_opt
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("GLOBAL"))
+        .map(str::to_string);
+    let clean_title = if title.trim().is_empty() {
+        "رویداد جدید".to_string()
+    } else {
+        title.trim().to_string()
+    };
+    let norm_type = match event_type.trim().to_uppercase().as_str() {
+        "DEADLINE" => "DEADLINE",
+        "MILESTONE" => "MILESTONE",
+        "FOCUS_BLOCK" => "FOCUS_BLOCK",
+        "REMINDER" => "REMINDER",
+        _ => "MEETING",
+    };
+    let norm_status = match status.trim().to_uppercase().as_str() {
+        "DONE" | "COMPLETED" => "DONE",
+        "CANCELLED" => "CANCELLED",
+        _ => "UPCOMING",
+    };
+    let clean_color = if color_hex.trim().is_empty() {
+        "#3B82F6"
+    } else {
+        color_hex.trim()
+    };
+    let clean_date = event_date.trim();
+
+    let exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM calendar_events WHERE id = ?1",
+            params![eid],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0;
+
+    if exists {
+        conn.execute(
+            "UPDATE calendar_events
+             SET project_id = ?1, title = ?2, event_type = ?3, event_date = ?4,
+                 start_time = ?5, end_time = ?6, location_or_link = ?7, notes = ?8,
+                 status = ?9, color_hex = ?10, updated_at = ?11
+             WHERE id = ?12",
+            params![
+                norm_pid,
+                clean_title,
+                norm_type,
+                clean_date,
+                start_time.trim(),
+                end_time.trim(),
+                location_or_link.trim(),
+                notes.trim(),
+                norm_status,
+                clean_color,
+                now,
+                eid
+            ],
+        )?;
+    } else {
+        conn.execute(
+            "INSERT INTO calendar_events (
+                id, project_id, title, event_type, event_date, start_time, end_time,
+                location_or_link, notes, status, color_hex, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)",
+            params![
+                eid,
+                norm_pid,
+                clean_title,
+                norm_type,
+                clean_date,
+                start_time.trim(),
+                end_time.trim(),
+                location_or_link.trim(),
+                notes.trim(),
+                norm_status,
+                clean_color,
+                now
+            ],
+        )?;
+    }
+
+    if !clean_date.is_empty() {
+        let _ = conn.execute(
+            "INSERT OR IGNORE INTO calendar_days (date_key, total_capacity_minutes, deep_capacity_minutes, day_note, is_off_day, updated_at)
+             VALUES (?1, 300, 150, '', 0, ?2)",
+            params![clean_date, now],
+        );
+    }
+
+    let projects = crate::ecosystem_core::load_compass_projects(conn).unwrap_or_default();
+    let all = query_all_calendar_events(conn, &projects)?;
+    all.into_iter()
+        .find(|e| e.id == eid)
+        .ok_or(rusqlite::Error::QueryReturnedNoRows)
+}
+
+pub fn delete_calendar_event(conn: &Connection, event_id: &str) -> Result<()> {
+    ensure_calendar_events_schema(conn)?;
+    let now = Local::now().to_rfc3339();
+    conn.execute(
+        "UPDATE work_entities SET calendar_event_id = NULL, updated_at = ?1 WHERE calendar_event_id = ?2",
+        params![now, event_id],
+    )?;
+    conn.execute("DELETE FROM calendar_events WHERE id = ?1", params![event_id])?;
+    Ok(())
+}
+
+pub fn link_tasks_to_calendar_event(
+    conn: &Connection,
+    event_id: &str,
+    task_ids: &[String],
+    sync_date_to_event: bool,
+) -> Result<usize> {
+    ensure_calendar_events_schema(conn)?;
+    let event_date: String = conn.query_row(
+        "SELECT event_date FROM calendar_events WHERE id = ?1",
+        params![event_id],
+        |r| r.get(0),
+    )?;
+    let now = Local::now().to_rfc3339();
+    let mut linked = 0usize;
+    for raw_tid in task_ids {
+        let tid = raw_tid.trim();
+        if tid.is_empty() {
+            continue;
+        }
+        let changed = if sync_date_to_event {
+            conn.execute(
+                "UPDATE work_entities
+                 SET calendar_event_id = ?1,
+                     scheduled_date = COALESCE(NULLIF(scheduled_date, ''), ?2),
+                     updated_at = ?3
+                 WHERE id = ?4",
+                params![event_id, event_date, now, tid],
+            )?
+        } else {
+            conn.execute(
+                "UPDATE work_entities
+                 SET calendar_event_id = ?1, updated_at = ?2
+                 WHERE id = ?3",
+                params![event_id, now, tid],
+            )?
+        };
+        linked += changed;
+    }
+    Ok(linked)
+}
+
+pub fn unlink_task_from_calendar_event(conn: &Connection, task_id: &str) -> Result<()> {
+    ensure_calendar_events_schema(conn)?;
+    let now = Local::now().to_rfc3339();
+    conn.execute(
+        "UPDATE work_entities SET calendar_event_id = NULL, updated_at = ?1 WHERE id = ?2",
+        params![now, task_id.trim()],
+    )?;
+    Ok(())
+}
+
+pub fn query_all_calendar_events(
+    conn: &Connection,
+    projects: &[Project],
+) -> Result<Vec<CalendarEvent>> {
+    ensure_calendar_events_schema(conn)?;
+    let mut proj_names: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for p in projects {
+        proj_names.insert(p.id.clone(), p.name.clone());
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT id, project_id, title, event_type, event_date, start_time, end_time,
+                location_or_link, notes, status, color_hex, created_at, updated_at
+         FROM calendar_events
+         ORDER BY
+            CASE WHEN status = 'UPCOMING' THEN 0 WHEN status = 'DONE' THEN 1 ELSE 2 END ASC,
+            event_date ASC,
+            start_time ASC,
+            created_at DESC",
+    )?;
+    let mut events: Vec<CalendarEvent> = stmt
+        .query_map([], |r| {
+            let pid_opt: Option<String> = r.get(1).ok();
+            let pname_opt = pid_opt.as_ref().and_then(|pid| proj_names.get(pid).cloned());
+            let title: String = r.get(2)?;
+            Ok(CalendarEvent {
+                id: r.get(0)?,
+                project_id: pid_opt,
+                project_name: pname_opt,
+                title,
+                event_type: r.get(3).unwrap_or_else(|_| "MEETING".to_string()),
+                event_date: r.get(4).unwrap_or_default(),
+                start_time: r.get(5).unwrap_or_default(),
+                end_time: r.get(6).unwrap_or_default(),
+                location_or_link: r.get(7).unwrap_or_default(),
+                notes: r.get(8).unwrap_or_default(),
+                status: r.get(9).unwrap_or_else(|_| "UPCOMING".to_string()),
+                color_hex: r.get(10).unwrap_or_else(|_| "#3B82F6".to_string()),
+                linked_tasks_count: 0,
+                linked_completed_count: 0,
+                linked_tasks: Vec::new(),
+                created_at: r.get(11).unwrap_or_default(),
+                updated_at: r.get(12).unwrap_or_default(),
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    for ev in &mut events {
+        let mut t_stmt = conn.prepare(
+            "SELECT id, project_id, entity_type, category, title, definition_of_done, first_physical_action,
+                    status, is_on_critical_path, optimistic_pomos, most_likely_pomos, pessimistic_pomos,
+                    calibrated_pomos, superseded_by_id, stakeholder_tag, updated_at,
+                    work_line_id, outcome_id, sequence_order, depends_on_task_id, energy_tag, duration_minutes,
+                    device_tag, location_tags_json, scheduled_date, scheduled_slot, due_date, priority_score
+             FROM work_entities
+             WHERE calendar_event_id = ?1
+             ORDER BY
+                CASE WHEN status = 'IN_PROGRESS' THEN 0 WHEN status = 'OPEN' THEN 1 WHEN status = 'BLOCKED' THEN 2 WHEN status = 'CLOSED' THEN 3 ELSE 4 END ASC,
+                priority_score DESC,
+                updated_at DESC",
+        )?;
+        let mut linked: Vec<WorkEntity> = t_stmt
+            .query_map(params![ev.id], map_work_entity_from_row)?
+            .filter_map(|r| r.ok())
+            .collect();
+        for t in &mut linked {
+            t.project_name = proj_names
+                .get(&t.project_id)
+                .cloned()
+                .unwrap_or_else(|| t.project_id.clone());
+            t.calendar_event_id = Some(ev.id.clone());
+            t.calendar_event_title = Some(ev.title.clone());
+        }
+        ev.linked_tasks_count = linked.len() as i32;
+        ev.linked_completed_count = linked.iter().filter(|t| t.status == "CLOSED").count() as i32;
+        ev.linked_tasks = linked;
+    }
+
+    Ok(events)
+}
+
+pub fn query_all_calendar_scheduled_tasks(
+    conn: &Connection,
+    projects: &[Project],
+) -> Result<Vec<WorkEntity>> {
+    let _ = ensure_calendar_events_schema(conn);
+    let mut proj_names: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for p in projects {
+        proj_names.insert(p.id.clone(), p.name.clone());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT id, project_id, entity_type, category, title, definition_of_done, first_physical_action,
+                status, is_on_critical_path, optimistic_pomos, most_likely_pomos, pessimistic_pomos,
+                calibrated_pomos, superseded_by_id, stakeholder_tag, updated_at,
+                work_line_id, outcome_id, sequence_order, depends_on_task_id, energy_tag, duration_minutes,
+                device_tag, location_tags_json, scheduled_date, scheduled_slot, due_date, priority_score
+         FROM work_entities
+         WHERE entity_type = 'TASK'
+           AND (
+               COALESCE(scheduled_date, '') != ''
+               OR COALESCE(due_date, '') != ''
+               OR COALESCE(calendar_event_id, '') != ''
+           )
+           AND status != 'SUPERSEDED'
+         ORDER BY
+            CASE WHEN status = 'CLOSED' THEN 1 ELSE 0 END ASC,
+            COALESCE(NULLIF(scheduled_date, ''), due_date, '9999-99-99') ASC,
+            priority_score DESC",
+    )?;
+    let mut rows: Vec<WorkEntity> = stmt
+        .query_map([], map_work_entity_from_row)?
+        .filter_map(|r| r.ok())
+        .collect();
+    for t in &mut rows {
+        t.project_name = proj_names
+            .get(&t.project_id)
+            .cloned()
+            .unwrap_or_else(|| t.project_id.clone());
+    }
+    let _ = enrich_work_entities_calendar_events(conn, &mut rows);
+    Ok(rows)
 }
 
 pub fn query_all_pending_proposals(conn: &Connection) -> Result<Vec<PendingProposal>> {
@@ -1325,6 +1720,8 @@ fn map_work_entity_from_row(r: &rusqlite::Row) -> rusqlite::Result<WorkEntity> {
         scheduled_slot: r.get(25).ok(),
         due_date: r.get(26).ok(),
         priority_score: r.get(27).unwrap_or(50),
+        calendar_event_id: None,
+        calendar_event_title: None,
     })
 }
 
@@ -1794,8 +2191,8 @@ pub fn apply_copilot_envelope_with_artifacts(
                         first_physical_action, status, is_on_critical_path, optimistic_pomos,
                         most_likely_pomos, pessimistic_pomos, calibrated_pomos, stakeholder_tag,
                         duration_minutes, scheduled_date, scheduled_slot, due_date, priority_score,
-                        source_event_id, updated_at
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+                        calendar_event_id, source_event_id, updated_at
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
                     params![
                         new_id,
                         project_id,
@@ -1816,6 +2213,7 @@ pub fn apply_copilot_envelope_with_artifacts(
                         m.scheduled_slot,
                         m.due_date,
                         m.priority_score.unwrap_or(if m.is_on_critical_path.unwrap_or(true) { 75 } else { 50 }).clamp(0, 100),
+                        m.calendar_event_id.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string),
                         event_id,
                         now
                     ],
@@ -1935,6 +2333,13 @@ pub fn apply_copilot_envelope_with_artifacts(
                             .priority_score
                             .unwrap_or(cur.priority_score)
                             .clamp(0, 100);
+                        let next_calendar_event_id = m
+                            .calendar_event_id
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string)
+                            .or(cur.calendar_event_id);
 
                         tx.execute(
                             "UPDATE work_entities SET
@@ -1943,8 +2348,8 @@ pub fn apply_copilot_envelope_with_artifacts(
                                 optimistic_pomos = ?8, most_likely_pomos = ?9, pessimistic_pomos = ?10,
                                 calibrated_pomos = ?11, stakeholder_tag = ?12,
                                 duration_minutes = ?13, scheduled_date = ?14, scheduled_slot = ?15,
-                                due_date = ?16, priority_score = ?17, updated_at = ?18
-                             WHERE id = ?19 AND project_id = ?20",
+                                due_date = ?16, priority_score = ?17, calendar_event_id = ?18, updated_at = ?19
+                             WHERE id = ?20 AND project_id = ?21",
                             params![
                                 next_etype,
                                 next_cat,
@@ -1963,6 +2368,7 @@ pub fn apply_copilot_envelope_with_artifacts(
                                 next_scheduled_slot,
                                 next_due_date,
                                 next_priority,
+                                next_calendar_event_id,
                                 now,
                                 tid,
                                 project_id
@@ -3318,6 +3724,22 @@ pub fn sync_unprocessed_items_into_queue(conn: &Connection) -> Result<usize> {
     Ok(inserted)
 }
 
+pub fn classify_queue_kind(source_type: &str, user_message_id: Option<i64>) -> &'static str {
+    let st = source_type.trim().to_uppercase();
+    if st == "MAB_FOCUS_SYNC" || st.starts_with("LEGACY_REPROCESS") {
+        "BACKGROUND"
+    } else if user_message_id.is_some()
+        || matches!(
+            st.as_str(),
+            "USER_CHAT" | "VAULT_CHAT" | "COPILOT_FILE" | "DOC_ONBOARDING"
+        )
+    {
+        "USER_COMMAND"
+    } else {
+        "BACKGROUND"
+    }
+}
+
 pub fn query_pending_ai_queue(conn: &Connection) -> Result<Vec<PendingQueueItem>> {
     let mut stmt = conn.prepare(
         "SELECT q.id, q.project_id, COALESCE(p.name, q.project_id), q.session_id, q.channel,
@@ -3336,18 +3758,22 @@ pub fn query_pending_ai_queue(conn: &Connection) -> Result<Vec<PendingQueueItem>
     )?;
     let items: Vec<PendingQueueItem> = stmt
         .query_map([], |r| {
+            let user_msg_id: Option<i64> = r.get(5)?;
+            let src_type: String = r.get(10)?;
+            let qkind = classify_queue_kind(&src_type, user_msg_id).to_string();
             Ok(PendingQueueItem {
                 id: r.get(0)?,
                 project_id: r.get(1)?,
                 project_name: r.get(2)?,
                 session_id: r.get(3)?,
                 channel: r.get(4)?,
-                user_message_id: r.get(5)?,
+                user_message_id: user_msg_id,
                 system_message_id: r.get(6)?,
                 knowledge_doc_id: r.get(7)?,
                 raw_event_id: r.get(8)?,
                 title_preview: r.get(9)?,
-                source_type: r.get(10)?,
+                source_type: src_type,
+                queue_kind: qkind,
                 archived_path: r.get(11)?,
                 status: r.get(12)?,
                 attempts: r.get(13)?,
@@ -3373,18 +3799,22 @@ pub fn get_pending_queue_item(conn: &Connection, queue_id: i64) -> Result<Pendin
          WHERE q.id = ?1",
         params![queue_id],
         |r| {
+            let user_msg_id: Option<i64> = r.get(5)?;
+            let src_type: String = r.get(10)?;
+            let qkind = classify_queue_kind(&src_type, user_msg_id).to_string();
             Ok(PendingQueueItem {
                 id: r.get(0)?,
                 project_id: r.get(1)?,
                 project_name: r.get(2)?,
                 session_id: r.get(3)?,
                 channel: r.get(4)?,
-                user_message_id: r.get(5)?,
+                user_message_id: user_msg_id,
                 system_message_id: r.get(6)?,
                 knowledge_doc_id: r.get(7)?,
                 raw_event_id: r.get(8)?,
                 title_preview: r.get(9)?,
-                source_type: r.get(10)?,
+                source_type: src_type,
+                queue_kind: qkind,
                 archived_path: r.get(11)?,
                 status: r.get(12)?,
                 attempts: r.get(13)?,
@@ -4236,6 +4666,8 @@ pub fn create_work_line_with_chain(
             scheduled_slot: step.scheduled_slot,
             due_date: step.due_date,
             priority_score,
+            calendar_event_id: None,
+            calendar_event_title: None,
         };
 
         prev_task_id = Some(task_id);

@@ -126,14 +126,20 @@ fn legacy_tool_definitions() -> Value {
                     "optimistic_pomos": { "type": "number" },
                     "most_likely_pomos": { "type": "number" },
                     "pessimistic_pomos": { "type": "number" },
-                    "stakeholder_tag": { "type": "string" }
+                    "stakeholder_tag": { "type": "string" },
+                    "priority_score": { "type": "integer", "minimum": 0, "maximum": 100 },
+                    "scheduled_date": { "type": "string", "description": "Optional ISO date YYYY-MM-DD" },
+                    "scheduled_slot": { "type": "string", "enum": ["MORNING_DEEP", "MIDDAY_EXEC", "AFTERNOON_LIGHT", "COMMUTE_SLOT"] },
+                    "due_date": { "type": "string", "description": "Optional ISO due date YYYY-MM-DD" },
+                    "duration_minutes": { "type": "integer", "minimum": 5 },
+                    "calendar_event_id": { "type": "string", "description": "Optional calendar event ID (EVT-xxxx) to link this task/blocker to" }
                 },
                 "required": ["title"]
             }
         },
         {
             "name": "update_work_entity",
-            "description": "Update an existing TASK, DECISION, or BLOCKER by target_id (e.g. TSK-xxxx, ADR-xxxx, BLK-xxxx). Supports priority_score, critical path, status, and scheduling.",
+            "description": "Update an existing TASK, DECISION, or BLOCKER by target_id (e.g. TSK-xxxx, ADR-xxxx, BLK-xxxx). Supports priority_score, critical path, status, scheduling, and calendar event linking.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -151,6 +157,7 @@ fn legacy_tool_definitions() -> Value {
                     "scheduled_slot": { "type": "string", "enum": ["MORNING_DEEP", "MIDDAY_EXEC", "AFTERNOON_LIGHT", "COMMUTE_SLOT"] },
                     "due_date": { "type": "string", "description": "Optional ISO due date YYYY-MM-DD" },
                     "duration_minutes": { "type": "integer", "minimum": 5 },
+                    "calendar_event_id": { "type": "string", "description": "Optional calendar event ID (EVT-xxxx) to link this task to" },
                     "optimistic_pomos": { "type": "number" },
                     "most_likely_pomos": { "type": "number" },
                     "pessimistic_pomos": { "type": "number" },
@@ -367,7 +374,7 @@ fn v3_tool_definitions() -> Value {
         },
         {
             "name": "schedule_task_on_calendar",
-            "description": "Schedule a task on the daily calendar planner with date, slot, and duration, ensuring day capacity record exists.",
+            "description": "Schedule a task on the daily calendar planner with date, slot, duration, and optional calendar_event_id link, ensuring day capacity record exists.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -375,12 +382,92 @@ fn v3_tool_definitions() -> Value {
                     "scheduled_date": { "type": "string", "description": "ISO date string (YYYY-MM-DD)" },
                     "scheduled_slot": {
                         "type": "string",
-                        "enum": ["MORNING_DEEP", "MIDDAY_EXEC", "EVENING_WRAP", "NIGHT_REVIEW"]
+                        "enum": ["MORNING_DEEP", "MIDDAY_EXEC", "EVENING_WRAP", "NIGHT_REVIEW", "AFTERNOON_LIGHT", "COMMUTE_SLOT"]
                     },
                     "due_date": { "type": "string", "description": "Optional due date (YYYY-MM-DD)" },
-                    "duration_minutes": { "type": "integer", "description": "Optional duration in minutes" }
+                    "duration_minutes": { "type": "integer", "description": "Optional duration in minutes" },
+                    "calendar_event_id": { "type": "string", "description": "Optional calendar event ID (EVT-xxxx) to link this task to" }
                 },
                 "required": ["task_id", "scheduled_date"]
+            }
+        },
+        {
+            "name": "list_calendar_events",
+            "description": "List calendar events (meetings, deadlines, milestones, focus blocks) across projects along with their linked tasks.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "from_date": { "type": "string", "description": "Optional start ISO date YYYY-MM-DD" },
+                    "to_date": { "type": "string", "description": "Optional end ISO date YYYY-MM-DD" },
+                    "project_id": { "type": "string", "description": "Optional project_id filter or ALL" },
+                    "status": { "type": "string", "enum": ["ALL", "UPCOMING", "COMPLETED", "CANCELLED"] }
+                }
+            }
+        },
+        {
+            "name": "upsert_calendar_event",
+            "description": "Create or update a calendar event (e.g. a Sunday meeting or milestone) and optionally link existing tasks (task_ids) or create new linked tasks (new_tasks) directly on that event.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "event_id": { "type": "string", "description": "Existing EVT-xxxx to update; omit to create a new event" },
+                    "title": { "type": "string", "description": "Persian or clear event title (e.g. جلسه یکشنبه با تیم)" },
+                    "event_type": { "type": "string", "enum": ["MEETING", "DEADLINE", "MILESTONE", "FOCUS_BLOCK", "REMINDER"] },
+                    "event_date": { "type": "string", "description": "ISO date YYYY-MM-DD" },
+                    "start_time": { "type": "string", "description": "Optional HH:MM (24h)" },
+                    "end_time": { "type": "string", "description": "Optional HH:MM (24h)" },
+                    "project_id": { "type": "string", "description": "Optional project_id or ALL for cross-project events" },
+                    "location_or_link": { "type": "string" },
+                    "notes": { "type": "string" },
+                    "status": { "type": "string", "enum": ["UPCOMING", "COMPLETED", "CANCELLED"] },
+                    "color_hex": { "type": "string" },
+                    "task_ids": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Existing TSK-xxxx IDs to link to this event"
+                    },
+                    "new_tasks": {
+                        "type": "array",
+                        "description": "New tasks to create and immediately link to this event",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "title": { "type": "string" },
+                                "project_id": { "type": "string" },
+                                "category": { "type": "string" },
+                                "definition_of_done": { "type": "string" },
+                                "first_physical_action": { "type": "string" },
+                                "duration_minutes": { "type": "integer" },
+                                "priority_score": { "type": "integer" }
+                            },
+                            "required": ["title"]
+                        }
+                    },
+                    "sync_task_dates": { "type": "boolean", "description": "When true (default), also set due_date / scheduled_date if empty on linked tasks to event_date" }
+                },
+                "required": ["title", "event_date"]
+            }
+        },
+        {
+            "name": "link_tasks_to_calendar_event",
+            "description": "Link or unlink multiple existing tasks (even across different projects) to/from a calendar event (EVT-xxxx).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "event_id": { "type": "string", "description": "Calendar event ID (EVT-xxxx)" },
+                    "task_ids": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Task IDs (TSK-xxxx) to attach to this event"
+                    },
+                    "unlink_task_ids": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional task IDs to detach from their calendar event"
+                    },
+                    "sync_date_to_event": { "type": "boolean", "description": "Default true: align task due_date/scheduled_date when missing" }
+                },
+                "required": ["event_id"]
             }
         },
         {
@@ -440,7 +527,7 @@ fn v3_tool_definitions() -> Value {
     ])
 }
 
-fn v4_method_tool_definition() -> Value {
+fn method_diagram_input_schema() -> Value {
     let sub_step_schema = json!({
         "type": "object",
         "properties": {
@@ -479,32 +566,44 @@ fn v4_method_tool_definition() -> Value {
         "required": ["title"]
     });
     json!({
-        "name": "upsert_method_playbook",
-        "description": "Create or automatically enrich/version-bump a repeatable step-by-step Method / Playbook (دستورالعمل انجام کار) with a visual BPMN 2.0 workflow (supporting nested subProcess composite steps for drill-down). Persists to SQLite and writes Markdown + BPMN 2.0 XML into 04_methods_playbooks/.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "project_id": { "type": "string", "description": "Optional project ID (defaults to active project)" },
-                "method_id": { "type": "string", "description": "Optional existing MTH-xxxx ID to enrich/update" },
-                "title": { "type": "string", "description": "Clear Persian title of the method/playbook" },
-                "category": { "type": "string", "enum": ["BACKEND", "UI_UX", "DEPLOY", "VIDEO", "ARCHITECTURE", "GENERAL"] },
-                "summary": { "type": "string", "description": "Concise 1-2 sentence Persian summary shown on chat artifact card" },
-                "objective": { "type": "string", "description": "Goal/objective of this method (هدف)" },
-                "prerequisites": { "type": "array", "items": { "type": "string" } },
-                "steps": {
-                    "type": "array",
-                    "description": "Ordered workflow steps; composite steps can use element_type='subProcess' with sub_steps[] for internal drill-down BPMN workflows",
-                    "items": step_schema
-                },
-                "checklist": { "type": "array", "items": { "type": "string" } },
-                "notes_markdown": { "type": "string" },
-                "bpmn_xml": { "type": "string", "description": "Optional complete valid BPMN 2.0 XML (<bpmn:definitions>...); auto-generated from steps if omitted" },
-                "parent_method_id": { "type": "string" },
-                "parent_element_id": { "type": "string" }
+        "type": "object",
+        "properties": {
+            "project_id": { "type": "string", "description": "Optional project ID (defaults to active project)" },
+            "method_id": { "type": "string", "description": "Optional existing MTH-xxxx ID to enrich/update" },
+            "title": { "type": "string", "description": "Clear Persian title of the instruction / diagram / BPMN" },
+            "category": { "type": "string", "enum": ["BACKEND", "UI_UX", "DEPLOY", "VIDEO", "ARCHITECTURE", "GENERAL"] },
+            "summary": { "type": "string", "description": "Concise 1-2 sentence Persian summary shown on chat artifact card" },
+            "objective": { "type": "string", "description": "Goal/objective of this instruction/process (هدف)" },
+            "prerequisites": { "type": "array", "items": { "type": "string" } },
+            "steps": {
+                "type": "array",
+                "description": "Ordered workflow steps; composite steps can use element_type='subProcess' with sub_steps[], decisions can use 'exclusiveGateway', parallel branches 'parallelGateway'",
+                "items": step_schema
             },
-            "required": ["title", "steps"]
-        }
+            "checklist": { "type": "array", "items": { "type": "string" } },
+            "notes_markdown": { "type": "string" },
+            "bpmn_xml": { "type": "string", "description": "Optional complete valid BPMN 2.0 XML (<bpmn:definitions>...); auto-generated from steps if omitted" },
+            "parent_method_id": { "type": "string" },
+            "parent_element_id": { "type": "string" }
+        },
+        "required": ["title", "steps"]
     })
+}
+
+fn v4_method_tool_definitions() -> Vec<Value> {
+    let schema = method_diagram_input_schema();
+    vec![
+        json!({
+            "name": "upsert_method_playbook",
+            "description": "Create or automatically enrich/version-bump a repeatable step-by-step Method / Playbook (دستورالعمل انجام کار) with a visual BPMN 2.0 workflow (supporting nested subProcess composite steps for drill-down). Persists to SQLite and writes Markdown + BPMN 2.0 XML into 04_methods_playbooks/.",
+            "inputSchema": schema
+        }),
+        json!({
+            "name": "draw_instruction_diagram_or_bpmn",
+            "description": "Draw or update a visual Process Diagram / BPMN 2.0 workflow for an instruction or work procedure (ترسیم دیاگرام و فرآیند دستورالعمل انجام کار). Call this tool BOTH when the user asks to draw a diagram/process/BPMN AND whenever you judge on your own that an instruction or procedure has steps/roles/decisions that are clearer visually.",
+            "inputSchema": method_diagram_input_schema()
+        }),
+    ]
 }
 
 pub fn tool_definitions() -> Value {
@@ -513,7 +612,7 @@ pub fn tool_definitions() -> Value {
         .cloned()
         .unwrap_or_default();
     all.extend(v3_tool_definitions().as_array().cloned().unwrap_or_default());
-    all.push(v4_method_tool_definition());
+    all.extend(v4_method_tool_definitions());
     Value::Array(all)
 }
 
@@ -569,6 +668,7 @@ pub fn copilot_envelope_json_schema() -> Value {
             "scheduled_slot": { "type": ["string", "null"] },
             "due_date": { "type": ["string", "null"] },
             "duration_minutes": { "type": ["integer", "null"] },
+            "calendar_event_id": { "type": ["string", "null"] },
             "op": {
                 "type": "string",
                 "enum": [
@@ -1125,6 +1225,12 @@ pub fn execute_tool_with_context(
             m.most_likely_pomos = opt_f64(args, "most_likely_pomos");
             m.pessimistic_pomos = opt_f64(args, "pessimistic_pomos");
             m.stakeholder_tag = opt_str(args, "stakeholder_tag");
+            m.priority_score = opt_i32(args, "priority_score");
+            m.scheduled_date = opt_str(args, "scheduled_date");
+            m.scheduled_slot = opt_str(args, "scheduled_slot");
+            m.due_date = opt_str(args, "due_date");
+            m.duration_minutes = opt_i32(args, "duration_minutes");
+            m.calendar_event_id = opt_str(args, "calendar_event_id");
 
             let env = CopilotEnvelope {
                 conversational_reply: format!("MCP CREATE_ENTITY: {}", title),
@@ -1185,10 +1291,17 @@ pub fn execute_tool_with_context(
             m.scheduled_slot = opt_str(args, "scheduled_slot");
             m.due_date = opt_str(args, "due_date");
             m.duration_minutes = opt_i32(args, "duration_minutes");
+            m.calendar_event_id = opt_str(args, "calendar_event_id");
             m.optimistic_pomos = opt_f64(args, "optimistic_pomos");
             m.most_likely_pomos = opt_f64(args, "most_likely_pomos");
             m.pessimistic_pomos = opt_f64(args, "pessimistic_pomos");
             m.stakeholder_tag = opt_str(args, "stakeholder_tag");
+            m.priority_score = opt_i32(args, "priority_score");
+            m.scheduled_date = opt_str(args, "scheduled_date");
+            m.scheduled_slot = opt_str(args, "scheduled_slot");
+            m.due_date = opt_str(args, "due_date");
+            m.duration_minutes = opt_i32(args, "duration_minutes");
+            m.calendar_event_id = opt_str(args, "calendar_event_id");
 
             let env = CopilotEnvelope {
                 conversational_reply: format!("MCP UPDATE_ENTITY: {}", target_id),
@@ -1807,6 +1920,7 @@ pub fn execute_tool_with_context(
             }))
         }
         "schedule_task_on_calendar" => {
+            let _ = crate::db::queries::ensure_calendar_events_schema(conn);
             let task_id = opt_str(args, "task_id")
                 .ok_or_else(|| "Missing task_id".to_string())?;
             let scheduled_date = opt_str(args, "scheduled_date")
@@ -1826,16 +1940,17 @@ pub fn execute_tool_with_context(
 
             let slot = opt_str(args, "scheduled_slot").unwrap_or_else(|| "MORNING_DEEP".to_string());
             let due_date = opt_str(args, "due_date");
+            let calendar_event_id = opt_str(args, "calendar_event_id");
 
             if let Some(dur) = opt_i32(args, "duration_minutes") {
                 conn.execute(
-                    "UPDATE work_entities SET scheduled_date = ?1, scheduled_slot = ?2, due_date = ?3, duration_minutes = ?4, updated_at = ?5 WHERE id = ?6",
-                    params![scheduled_date, slot, due_date, dur, now, task_id],
+                    "UPDATE work_entities SET scheduled_date = ?1, scheduled_slot = ?2, due_date = ?3, duration_minutes = ?4, calendar_event_id = COALESCE(?5, calendar_event_id), updated_at = ?6 WHERE id = ?7",
+                    params![scheduled_date, slot, due_date, dur, calendar_event_id, now, task_id],
                 ).map_err(|e| e.to_string())?;
             } else {
                 conn.execute(
-                    "UPDATE work_entities SET scheduled_date = ?1, scheduled_slot = ?2, due_date = ?3, updated_at = ?4 WHERE id = ?5",
-                    params![scheduled_date, slot, due_date, now, task_id],
+                    "UPDATE work_entities SET scheduled_date = ?1, scheduled_slot = ?2, due_date = ?3, calendar_event_id = COALESCE(?4, calendar_event_id), updated_at = ?5 WHERE id = ?6",
+                    params![scheduled_date, slot, due_date, calendar_event_id, now, task_id],
                 ).map_err(|e| e.to_string())?;
             }
 
@@ -1850,7 +1965,234 @@ pub fn execute_tool_with_context(
                 "task_id": task_id,
                 "scheduled_date": scheduled_date,
                 "scheduled_slot": slot,
+                "calendar_event_id": calendar_event_id,
                 "status": "scheduled"
+            }))
+        }
+        "list_calendar_events" => {
+            let from_date = opt_str(args, "from_date");
+            let to_date = opt_str(args, "to_date");
+            let project_filter = opt_str(args, "project_id");
+            let status_filter = opt_str(args, "status").unwrap_or_else(|| "ALL".to_string());
+            let all_projects = crate::ecosystem_core::load_compass_projects(conn).map_err(|e| e.to_string())?;
+            let events = crate::db::queries::query_all_calendar_events(conn, &all_projects)
+                .map_err(|e| e.to_string())?;
+            let filtered: Vec<_> = events
+                .into_iter()
+                .filter(|ev| {
+                    if let Some(ref f) = from_date {
+                        if ev.event_date.as_str() < f.as_str() {
+                            return false;
+                        }
+                    }
+                    if let Some(ref t) = to_date {
+                        if ev.event_date.as_str() > t.as_str() {
+                            return false;
+                        }
+                    }
+                    if let Some(ref p) = project_filter {
+                        let ev_pid = ev.project_id.as_deref().unwrap_or("ALL");
+                        if !p.eq_ignore_ascii_case("ALL")
+                            && !ev_pid.eq_ignore_ascii_case(p)
+                            && !ev_pid.eq_ignore_ascii_case("ALL")
+                        {
+                            return false;
+                        }
+                    }
+                    if !status_filter.eq_ignore_ascii_case("ALL") && !ev.status.eq_ignore_ascii_case(&status_filter) {
+                        return false;
+                    }
+                    true
+                })
+                .collect();
+            Ok(json!({
+                "count": filtered.len(),
+                "events": filtered
+            }))
+        }
+        "upsert_calendar_event" => {
+            let event_id_opt = opt_str(args, "event_id");
+            let title = opt_str(args, "title")
+                .ok_or_else(|| "فیلد title برای رویداد تقویم الزامی است.".to_string())?;
+            let event_date = opt_str(args, "event_date")
+                .ok_or_else(|| "فیلد event_date (YYYY-MM-DD) الزامی است.".to_string())?;
+            if event_date.len() != 10
+                || event_date.chars().nth(4) != Some('-')
+                || event_date.chars().nth(7) != Some('-')
+            {
+                return Err(format!(
+                    "فرمت تاریخ رویداد نامعتبر است '{}'; فرمت مورد انتظار YYYY-MM-DD است.",
+                    event_date
+                ));
+            }
+            let event_type = opt_str(args, "event_type").unwrap_or_else(|| "MEETING".to_string());
+            let start_time = opt_str(args, "start_time");
+            let end_time = opt_str(args, "end_time");
+            let project_id_opt = opt_str(args, "project_id");
+            let location_or_link = opt_str(args, "location_or_link");
+            let notes = opt_str(args, "notes");
+            let status = opt_str(args, "status").unwrap_or_else(|| "UPCOMING".to_string());
+            let color_hex = opt_str(args, "color_hex");
+            let sync_task_dates = args
+                .get("sync_task_dates")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+
+            let ev = crate::db::queries::upsert_calendar_event(
+                conn,
+                event_id_opt.as_deref(),
+                project_id_opt.as_deref(),
+                &title,
+                &event_type,
+                &event_date,
+                start_time.as_deref().unwrap_or(""),
+                end_time.as_deref().unwrap_or(""),
+                location_or_link.as_deref().unwrap_or(""),
+                notes.as_deref().unwrap_or(""),
+                &status,
+                color_hex.as_deref().unwrap_or("#6366f1"),
+            )
+            .map_err(|e| e.to_string())?;
+
+            let mut linked_existing = 0usize;
+            if let Some(arr) = args.get("task_ids").and_then(|v| v.as_array()) {
+                let ids: Vec<String> = arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::trim))
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                if !ids.is_empty() {
+                    linked_existing = crate::db::queries::link_tasks_to_calendar_event(
+                        conn,
+                        &ev.id,
+                        &ids,
+                        sync_task_dates,
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+            }
+
+            let mut created_linked = 0usize;
+            if let Some(new_tasks) = args.get("new_tasks").and_then(|v| v.as_array()) {
+                let fallback_pid = match ev.project_id.as_deref() {
+                    Some(p) if !p.trim().is_empty() && !p.eq_ignore_ascii_case("ALL") => p.to_string(),
+                    _ => get_dashboard_state_for_project(conn, None)
+                        .map(|d| d.active_project.id)
+                        .unwrap_or_else(|_| "GERDALO".to_string()),
+                };
+                for nt in new_tasks {
+                    let Some(task_title) = nt.get("title").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) else {
+                        continue;
+                    };
+                    let task_pid = nt
+                        .get("project_id")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("ALL"))
+                        .map(str::to_string)
+                        .unwrap_or_else(|| fallback_pid.clone());
+                    let mut m = empty_mutation("CREATE_ENTITY");
+                    m.project_id = Some(task_pid.clone());
+                    m.entity_type = Some("TASK".to_string());
+                    m.category = Some(
+                        nt.get("category")
+                            .and_then(|v| v.as_str())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or("GENERAL")
+                            .to_string(),
+                    );
+                    m.title = Some(task_title.to_string());
+                    m.definition_of_done = nt.get("definition_of_done").and_then(|v| v.as_str()).map(str::to_string);
+                    m.first_physical_action = nt.get("first_physical_action").and_then(|v| v.as_str()).map(str::to_string);
+                    m.duration_minutes = nt.get("duration_minutes").and_then(|v| v.as_i64()).map(|n| n as i32);
+                    m.priority_score = nt.get("priority_score").and_then(|v| v.as_i64()).map(|n| n as i32);
+                    m.calendar_event_id = Some(ev.id.clone());
+                    if sync_task_dates {
+                        m.scheduled_date = Some(ev.event_date.clone());
+                        m.due_date = Some(ev.event_date.clone());
+                    }
+                    let env = CopilotEnvelope {
+                        conversational_reply: format!("Calendar linked task: {}", task_title),
+                        mutations: vec![m],
+                        ..Default::default()
+                    };
+                    apply_copilot_envelope_with_artifacts(
+                        conn,
+                        &task_pid,
+                        &format!("[MCP] upsert_calendar_event -> create task: {}", task_title),
+                        None,
+                        source_origin,
+                        &env,
+                        existing_event_id,
+                    )
+                    .map_err(|e| e.to_string())?;
+                    created_linked += 1;
+                }
+            }
+
+            let all_projects = crate::ecosystem_core::load_compass_projects(conn).map_err(|e| e.to_string())?;
+            let enriched = crate::db::queries::query_all_calendar_events(conn, &all_projects)
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .find(|x| x.id == ev.id)
+                .unwrap_or(ev);
+            let dash = get_dashboard_state_for_project(conn, None).map_err(|e| e.to_string())?;
+            let _ = sync_all_project_projections(&dash, None, None);
+
+            Ok(json!({
+                "event": enriched,
+                "linked_existing_count": linked_existing,
+                "created_and_linked_count": created_linked
+            }))
+        }
+        "link_tasks_to_calendar_event" => {
+            let event_id = opt_str(args, "event_id")
+                .ok_or_else(|| "فیلد event_id الزامی است.".to_string())?;
+            let sync_date_to_event = args
+                .get("sync_date_to_event")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+
+            let mut unlinked = 0usize;
+            if let Some(arr) = args.get("unlink_task_ids").and_then(|v| v.as_array()) {
+                for tid in arr.iter().filter_map(|v| v.as_str().map(str::trim)).filter(|s| !s.is_empty()) {
+                    crate::db::queries::unlink_task_from_calendar_event(conn, tid)
+                        .map_err(|e| e.to_string())?;
+                    unlinked += 1;
+                }
+            }
+
+            let mut linked = 0usize;
+            if let Some(arr) = args.get("task_ids").and_then(|v| v.as_array()) {
+                let ids: Vec<String> = arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::trim))
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                if !ids.is_empty() {
+                    linked = crate::db::queries::link_tasks_to_calendar_event(
+                        conn,
+                        &event_id,
+                        &ids,
+                        sync_date_to_event,
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+            }
+
+            let all_projects = crate::ecosystem_core::load_compass_projects(conn).map_err(|e| e.to_string())?;
+            let ev = crate::db::queries::query_all_calendar_events(conn, &all_projects)
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .find(|x| x.id == event_id);
+            Ok(json!({
+                "event_id": event_id,
+                "linked_count": linked,
+                "unlinked_count": unlinked,
+                "event": ev
             }))
         }
         "propose_project_lifecycle" => {
@@ -1939,7 +2281,7 @@ pub fn execute_tool_with_context(
                 }
             }))
         }
-        "upsert_method_playbook" => {
+        "upsert_method_playbook" | "draw_instruction_diagram_or_bpmn" => {
             let req_pid = resolve_pid(args);
             let dash = get_dashboard_state_for_project(conn, req_pid.as_deref())
                 .map_err(|e| e.to_string())?;

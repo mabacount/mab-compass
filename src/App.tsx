@@ -44,6 +44,7 @@ const BUILTIN_TAB_TITLES: Record<BuiltinCanvasViewId, string> = {
   METHODS_BPMN: "متدها و BPMN 2.0",
   WBS: "ساختار WBS و لاین‌ها",
   KNOWLEDGE_ARCHIVE: "اسناد و بازپردازش",
+  CALENDAR: "تقویم و رویدادها",
   ECOSYSTEM_CARDS: "اهداف و کارت‌ها",
   PROJECTS_STUDIO: "استودیو و ساماندهی پروژه‌ها",
   SETTINGS: "تنظیمات",
@@ -53,32 +54,112 @@ const BUILTIN_TAB_TITLES: Record<BuiltinCanvasViewId, string> = {
 export default function App() {
   const [dash, setDash] = useState<DashboardState | null>(null);
 
-  // Antigravity 3-Column Layout State (LTR: Left Sidebar | Center Chat | Right Tabbed Canvas)
+  // Flexible 3-Pane Reorderable, Resizable & Floating Workbench Layout
+  type PaneKind = "SIDEBAR" | "CHAT" | "CANVAS";
+  const [paneOrder, setPaneOrder] = useState<PaneKind[]>(() => {
+    if (typeof window === "undefined") return ["SIDEBAR", "CHAT", "CANVAS"];
+    try {
+      const raw = window.localStorage.getItem("mab_ag_pane_order");
+      if (raw) {
+        const parsed = JSON.parse(raw) as unknown;
+        if (
+          Array.isArray(parsed) &&
+          parsed.length === 3 &&
+          (["SIDEBAR", "CHAT", "CANVAS"] as const).every((k) => parsed.includes(k))
+        ) {
+          return parsed as PaneKind[];
+        }
+      }
+    } catch {
+      // ignore
+    }
+    return ["SIDEBAR", "CHAT", "CANVAS"];
+  });
+  const [draggedPane, setDraggedPane] = useState<PaneKind | null>(null);
+
   const [isNarrowViewport, setIsNarrowViewport] = useState<boolean>(() =>
-    typeof window !== "undefined" ? window.innerWidth < 860 : false
+    typeof window !== "undefined" ? window.innerWidth < 780 : false
   );
   const [isSidebarOpen, setIsSidebarOpen] = useState<boolean>(() =>
-    typeof window !== "undefined" ? window.innerWidth >= 960 : true
+    typeof window !== "undefined" ? window.innerWidth >= 880 : true
   );
   const [sidebarWidth, setSidebarWidth] = useState<number>(() => {
     if (typeof window === "undefined") return 244;
     const saved = Number(window.localStorage.getItem("mab_ag_sidebar_width"));
-    return Number.isFinite(saved) && saved >= 190 && saved <= 380 ? saved : 244;
+    return Number.isFinite(saved) && saved >= 160 && saved <= 520 ? saved : 244;
   });
-  const [isDraggingSidebar, setIsDraggingSidebar] = useState(false);
-  const sidebarDragRef = useRef<{ startX: number; startWidth: number } | null>(null);
 
   const [isRightCanvasOpen, setIsRightCanvasOpen] = useState<boolean>(() =>
-    typeof window !== "undefined" ? window.innerWidth >= 900 : true
+    typeof window !== "undefined" ? window.innerWidth >= 820 : true
   );
   const [isRightCanvasMaximized, setIsRightCanvasMaximized] = useState(false);
   const [rightCanvasPct, setRightCanvasPct] = useState<number>(() => {
     if (typeof window === "undefined") return 48;
     const saved = Number(window.localStorage.getItem("mab_ag_canvas_pct"));
-    return Number.isFinite(saved) && saved >= 26 && saved <= 72 ? saved : 48;
+    return Number.isFinite(saved) && saved >= 18 && saved <= 82 ? saved : 48;
   });
-  const [isDraggingCanvas, setIsDraggingCanvas] = useState(false);
-  const workspaceBodyRef = useRef<HTMLDivElement | null>(null);
+
+  // Undocked / Floating movable + resizable window for Canvas
+  const [isCanvasFloating, setIsCanvasFloating] = useState<boolean>(() => {
+    if (typeof window === "undefined") return false;
+    try {
+      return window.localStorage.getItem("mab_ag_canvas_float") === "1";
+    } catch {
+      return false;
+    }
+  });
+  const [floatingRect, setFloatingRect] = useState<{
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  }>(() => {
+    const defW = typeof window !== "undefined" ? Math.min(720, Math.max(360, window.innerWidth * 0.54)) : 640;
+    const defH = typeof window !== "undefined" ? Math.min(680, Math.max(340, window.innerHeight * 0.78)) : 560;
+    const defX = typeof window !== "undefined" ? Math.max(24, window.innerWidth - defW - 28) : 120;
+    const defY = 58;
+    if (typeof window === "undefined") return { x: defX, y: defY, width: defW, height: defH };
+    try {
+      const raw = window.localStorage.getItem("mab_ag_canvas_rect");
+      if (raw) {
+        const r = JSON.parse(raw);
+        if (
+          typeof r?.x === "number" &&
+          typeof r?.y === "number" &&
+          typeof r?.width === "number" &&
+          typeof r?.height === "number"
+        ) {
+          return {
+            x: Math.max(8, Math.min(window.innerWidth - 280, r.x)),
+            y: Math.max(40, Math.min(window.innerHeight - 200, r.y)),
+            width: Math.max(300, Math.min(window.innerWidth - 24, r.width)),
+            height: Math.max(240, Math.min(window.innerHeight - 52, r.height)),
+          };
+        }
+      }
+    } catch {
+      // ignore
+    }
+    return { x: defX, y: defY, width: defW, height: defH };
+  });
+
+  const [activeSplitterIdx, setActiveSplitterIdx] = useState<number | null>(null);
+  const splitterDragRef = useRef<{
+    leftPane: PaneKind;
+    rightPane: PaneKind;
+    startX: number;
+    startSidebarWidth: number;
+    startCanvasPct: number;
+    containerWidth: number;
+  } | null>(null);
+  const floatInteractRef = useRef<{
+    mode: "MOVE" | "RESIZE_BR" | "RESIZE_BL" | "RESIZE_R" | "RESIZE_L" | "RESIZE_B";
+    startX: number;
+    startY: number;
+    startRect: { x: number; y: number; width: number; height: number };
+  } | null>(null);
+  const [isFloatInteracting, setIsFloatInteracting] = useState(false);
+  const workbenchContainerRef = useRef<HTMLDivElement | null>(null);
 
   // Right Tabbed Canvas State + Back/Forward Tab History
   const [canvasTabs, setCanvasTabs] = useState<CanvasTab[]>([
@@ -280,35 +361,87 @@ export default function App() {
     }
   }, []);
 
-  // Responsive viewport listener
+  // Responsive viewport listener + keep floating window inside viewport
   useEffect(() => {
+    let wasNarrow = window.innerWidth < 780;
     const onResize = () => {
       const w = window.innerWidth;
-      setIsNarrowViewport(w < 860);
-      if (w < 960) {
+      const h = window.innerHeight;
+      const nowNarrow = w < 780;
+      setIsNarrowViewport(nowNarrow);
+      if (nowNarrow && !wasNarrow) {
         setIsSidebarOpen(false);
       }
+      wasNarrow = nowNarrow;
+      setFloatingRect((prev) => ({
+        x: Math.max(8, Math.min(Math.max(8, w - 260), prev.x)),
+        y: Math.max(40, Math.min(Math.max(40, h - 180), prev.y)),
+        width: Math.max(280, Math.min(w - 16, prev.width)),
+        height: Math.max(220, Math.min(h - 48, prev.height)),
+      }));
     };
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
   }, []);
 
-  // Left Sidebar LTR drag resizer
+  // Persist pane order
   useEffect(() => {
-    if (!isDraggingSidebar) return;
+    try {
+      window.localStorage.setItem("mab_ag_pane_order", JSON.stringify(paneOrder));
+    } catch {
+      // ignore
+    }
+  }, [paneOrder]);
+
+  const movePane = useCallback((pane: PaneKind, dir: -1 | 1) => {
+    setPaneOrder((prev) => {
+      const idx = prev.indexOf(pane);
+      if (idx < 0) return prev;
+      const target = idx + dir;
+      if (target < 0 || target >= prev.length) return prev;
+      const next = [...prev];
+      const tmp = next[target];
+      next[target] = next[idx];
+      next[idx] = tmp;
+      return next;
+    });
+  }, []);
+
+  const swapPanes = useCallback((a: PaneKind, b: PaneKind) => {
+    if (a === b) return;
+    setPaneOrder((prev) => {
+      const ia = prev.indexOf(a);
+      const ib = prev.indexOf(b);
+      if (ia < 0 || ib < 0) return prev;
+      const next = [...prev];
+      next[ia] = b;
+      next[ib] = a;
+      return next;
+    });
+  }, []);
+
+  // Unified multi-pane splitter dragging (works for ANY column order)
+  useEffect(() => {
+    if (activeSplitterIdx === null) return;
     const handleMouseMove = (e: MouseEvent) => {
-      const ref = sidebarDragRef.current;
+      const ref = splitterDragRef.current;
       if (!ref) return;
-      // LTR: sidebar is on the left, dragging right increases width
-      const nextWidth = Math.max(
-        190,
-        Math.min(380, ref.startWidth + (e.clientX - ref.startX))
-      );
-      setSidebarWidth(nextWidth);
+      const dx = e.clientX - ref.startX;
+      if (ref.leftPane === "SIDEBAR") {
+        setSidebarWidth(Math.max(160, Math.min(520, ref.startSidebarWidth + dx)));
+      } else if (ref.rightPane === "SIDEBAR") {
+        setSidebarWidth(Math.max(160, Math.min(520, ref.startSidebarWidth - dx)));
+      } else if (ref.leftPane === "CANVAS" && ref.containerWidth > 0) {
+        const deltaPct = (dx / ref.containerWidth) * 100;
+        setRightCanvasPct(Math.max(18, Math.min(82, ref.startCanvasPct + deltaPct)));
+      } else if (ref.rightPane === "CANVAS" && ref.containerWidth > 0) {
+        const deltaPct = (dx / ref.containerWidth) * 100;
+        setRightCanvasPct(Math.max(18, Math.min(82, ref.startCanvasPct - deltaPct)));
+      }
     };
     const handleMouseUp = () => {
-      setIsDraggingSidebar(false);
-      sidebarDragRef.current = null;
+      setActiveSplitterIdx(null);
+      splitterDragRef.current = null;
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
     };
@@ -322,60 +455,84 @@ export default function App() {
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
     };
-  }, [isDraggingSidebar]);
+  }, [activeSplitterIdx]);
 
   useEffect(() => {
-    if (!isDraggingSidebar) {
+    if (activeSplitterIdx === null) {
       try {
         window.localStorage.setItem("mab_ag_sidebar_width", String(Math.round(sidebarWidth)));
+        window.localStorage.setItem("mab_ag_canvas_pct", String(Math.round(rightCanvasPct * 10) / 10));
       } catch {
         // ignore
       }
     }
-  }, [isDraggingSidebar, sidebarWidth]);
+  }, [activeSplitterIdx, sidebarWidth, rightCanvasPct]);
 
-  // Right Tabbed Canvas LTR drag resizer (between Center Chat & Right Canvas)
+  // Floating Canvas Window Move & Edge/Corner Resize handlers
   useEffect(() => {
-    if (!isDraggingCanvas) return;
-    const handleMouseMove = (e: MouseEvent) => {
-      const el = workspaceBodyRef.current;
-      if (!el) return;
-      const rect = el.getBoundingClientRect();
-      if (rect.width <= 0) return;
-      // LTR: right canvas width is measured from right edge
-      const rawPct = ((rect.right - e.clientX) / rect.width) * 100;
-      const clamped = Math.max(26, Math.min(72, rawPct));
-      setRightCanvasPct(clamped);
+    if (!isFloatInteracting) return;
+    const onMove = (e: MouseEvent) => {
+      const ref = floatInteractRef.current;
+      if (!ref) return;
+      const dx = e.clientX - ref.startX;
+      const dy = e.clientY - ref.startY;
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      const s = ref.startRect;
+
+      if (ref.mode === "MOVE") {
+        setFloatingRect({
+          x: Math.max(6, Math.min(vw - s.width - 6, s.x + dx)),
+          y: Math.max(40, Math.min(vh - 80, s.y + dy)),
+          width: s.width,
+          height: s.height,
+        });
+      } else {
+        let nextX = s.x;
+        let nextW = s.width;
+        let nextH = s.height;
+        if (ref.mode === "RESIZE_BR" || ref.mode === "RESIZE_R") {
+          nextW = Math.max(300, Math.min(vw - s.x - 8, s.width + dx));
+        }
+        if (ref.mode === "RESIZE_BL" || ref.mode === "RESIZE_L") {
+          const maxLeftDelta = s.width - 300;
+          const clampedDx = Math.max(-s.x + 8, Math.min(maxLeftDelta, dx));
+          nextX = s.x + clampedDx;
+          nextW = s.width - clampedDx;
+        }
+        if (ref.mode === "RESIZE_BR" || ref.mode === "RESIZE_BL" || ref.mode === "RESIZE_B") {
+          nextH = Math.max(240, Math.min(vh - s.y - 8, s.height + dy));
+        }
+        setFloatingRect({ x: nextX, y: s.y, width: nextW, height: nextH });
+      }
     };
-    const handleMouseUp = () => {
-      setIsDraggingCanvas(false);
+    const onUp = () => {
+      setIsFloatInteracting(false);
+      floatInteractRef.current = null;
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
     };
-    document.body.style.cursor = "col-resize";
     document.body.style.userSelect = "none";
-    window.addEventListener("mousemove", handleMouseMove);
-    window.addEventListener("mouseup", handleMouseUp);
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
     return () => {
-      window.removeEventListener("mousemove", handleMouseMove);
-      window.removeEventListener("mouseup", handleMouseUp);
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
     };
-  }, [isDraggingCanvas]);
+  }, [isFloatInteracting]);
 
   useEffect(() => {
-    if (!isDraggingCanvas) {
-      try {
-        window.localStorage.setItem(
-          "mab_ag_canvas_pct",
-          String(Math.round(rightCanvasPct * 10) / 10)
-        );
-      } catch {
-        // ignore
+    try {
+      window.localStorage.setItem("mab_ag_canvas_float", isCanvasFloating ? "1" : "0");
+      if (!isFloatInteracting) {
+        window.localStorage.setItem("mab_ag_canvas_rect", JSON.stringify(floatingRect));
       }
+    } catch {
+      // ignore
     }
-  }, [isDraggingCanvas, rightCanvasPct]);
+  }, [isCanvasFloating, isFloatInteracting, floatingRect]);
 
   // Initial load + queue scan + LLM check
   useEffect(() => {
@@ -413,7 +570,7 @@ export default function App() {
     return () => window.clearInterval(id);
   }, [cooldownUntil]);
 
-  // Chronological Pending Queue Drain
+  // Two-Track Queue Drain: User commands execute independently first; background items pack up to 20 per LLM turn
   const runQueueDrain = useCallback(
     async (manualTrigger: boolean) => {
       if (queueRunningRef.current || isUserBusyRef.current) return;
@@ -430,41 +587,88 @@ export default function App() {
 
           const latestDash = await CompassApi.getDashboard();
           setDash(latestDash);
-          const nextItem = latestDash.pending_queue[0];
-          if (!nextItem) break;
+
+          // Priority Track 1: Independent direct user commands
+          const nextUserCmd = latestDash.pending_queue.find(
+            (q) => q.queue_kind === "USER_COMMAND"
+          );
+          if (nextUserCmd) {
+            addAppLog(
+              "INFO",
+              "QUEUE",
+              `آغاز پردازش مستقل دستور ${nextUserCmd.id}: «${nextUserCmd.title_preview}»`
+            );
+            setProcessingQueueId(nextUserCmd.id);
+            const outcome = await CompassApi.processPendingQueueItem(nextUserCmd.id);
+            setDash(outcome.dashboard);
+            setProcessingQueueId(null);
+
+            if (outcome.error) {
+              addAppLog(
+                "ERROR",
+                "QUEUE",
+                `توقف پردازش دستور «${nextUserCmd.title_preview}»`,
+                outcome.error
+              );
+              setCooldownUntil(Date.now() + 45_000);
+              void refreshConnection();
+              showToast(
+                `ارسال دستور «${nextUserCmd.title_preview}» متوقف شد (${outcome.error}). تلاش مجدد تا ۴۵ ثانیه دیگر.`
+              );
+              break;
+            }
+
+            if (outcome.processed) {
+              processedCount += 1;
+              continue;
+            } else {
+              break;
+            }
+          }
+
+          // Priority Track 2: Pack up to 20 background items with metadata into ONE batch turn
+          const hasBg = latestDash.pending_queue.some(
+            (q) => q.queue_kind !== "USER_COMMAND" && q.status === "PENDING"
+          );
+          if (!hasBg) break;
+
+          const bgIds = latestDash.pending_queue
+            .filter((q) => q.queue_kind !== "USER_COMMAND" && q.status === "PENDING")
+            .slice(0, 20)
+            .map((q) => q.id);
 
           addAppLog(
             "INFO",
             "QUEUE",
-            `آغاز پردازش نوبتی مورد ${nextItem.id} از صف: «${nextItem.title_preview}»`
+            `آغاز پردازش پک‌شده ${bgIds.length} مورد زمینه همراه با متادیتا در یک درخواست مدل`
           );
-          setProcessingQueueId(nextItem.id);
-          const outcome = await CompassApi.processPendingQueueItem(nextItem.id);
-          setDash(outcome.dashboard);
+          if (bgIds[0]) setProcessingQueueId(bgIds[0]);
+          const batchOutcome = await CompassApi.processPendingBackgroundBatch(20);
+          setDash(batchOutcome.dashboard);
           setProcessingQueueId(null);
 
-          if (outcome.error) {
+          if (batchOutcome.error) {
             addAppLog(
               "ERROR",
               "QUEUE",
-              `توقف پردازش مورد «${nextItem.title_preview}»`,
-              outcome.error
+              `توقف پردازش بسته‌ای زمینه`,
+              batchOutcome.error
             );
             setCooldownUntil(Date.now() + 45_000);
             void refreshConnection();
             showToast(
-              `ارسال مورد «${nextItem.title_preview}» متوقف شد (${outcome.error}). تلاش مجدد تا ۴۵ ثانیه دیگر.`
+              `پردازش بسته زمینه متوقف شد (${batchOutcome.error}). تلاش مجدد تا ۴۵ ثانیه دیگر.`
             );
             break;
           }
 
-          if (outcome.processed) {
+          if (batchOutcome.processed_count > 0) {
             addAppLog(
               "SUCCESS",
               "QUEUE",
-              `مورد «${nextItem.title_preview}» با موفقیت توسط مدل پردازش و ثبت شد.`
+              `بسته ${batchOutcome.processed_count} موردی زمینه در یک پردازش مدل ثبت و یکپارچه شد.`
             );
-            processedCount += 1;
+            processedCount += batchOutcome.processed_count;
           } else {
             break;
           }
@@ -697,6 +901,28 @@ export default function App() {
       }
     } catch (e: unknown) {
       showToast(`خطا در پردازش آیتم صف: ${String(e)}`);
+    } finally {
+      setProcessingQueueId(null);
+      setIsProcessingQueue(false);
+    }
+  };
+
+  const handleProcessBackgroundBatch = async () => {
+    if (isProcessingQueue || queueRunningRef.current || isUserBusyRef.current) return;
+    setIsProcessingQueue(true);
+    try {
+      const outcome = await CompassApi.processPendingBackgroundBatch(20);
+      setDash(outcome.dashboard);
+      if (outcome.error) {
+        setCooldownUntil(Date.now() + 45_000);
+        showToast(`خطا در پردازش بسته زمینه: ${outcome.error}`);
+      } else if (outcome.processed_count > 0) {
+        showToast(`بسته ${outcome.processed_count} موردی زمینه در یک نوبت پردازش و ثبت شد.`);
+      } else {
+        showToast("مورد زمینه‌ای منتظر برای بسته‌بندی وجود ندارد.");
+      }
+    } catch (e: unknown) {
+      showToast(`خطا در پردازش بسته زمینه: ${String(e)}`);
     } finally {
       setProcessingQueueId(null);
       setIsProcessingQueue(false);
@@ -1206,6 +1432,79 @@ export default function App() {
     }
   };
 
+  const handleUpsertCalendarEvent = async (params: {
+    eventId?: string;
+    projectId?: string;
+    title: string;
+    eventType: string;
+    eventDate: string;
+    startTime?: string;
+    endTime?: string;
+    locationOrLink?: string;
+    notes?: string;
+    status?: string;
+    colorHex?: string;
+  }) => {
+    try {
+      const updated = await CompassApi.upsertCalendarEvent(params);
+      setDash(updated);
+      showToast(`رویداد «${params.title}» ذخیره شد.`);
+    } catch (e: unknown) {
+      showToast(`خطا در ذخیره رویداد تقویم: ${String(e)}`);
+    }
+  };
+
+  const handleDeleteCalendarEvent = async (eventId: string) => {
+    try {
+      const updated = await CompassApi.deleteCalendarEvent(eventId);
+      setDash(updated);
+      showToast("رویداد از تقویم حذف شد.");
+    } catch (e: unknown) {
+      showToast(`خطا در حذف رویداد: ${String(e)}`);
+    }
+  };
+
+  const handleLinkTasksToCalendarEvent = async (params: {
+    eventId: string;
+    taskIds: string[];
+    syncDateToEvent?: boolean;
+  }) => {
+    try {
+      const updated = await CompassApi.linkTasksToCalendarEvent(params);
+      setDash(updated);
+      showToast(`${params.taskIds.length} کار به رویداد متصل شد.`);
+    } catch (e: unknown) {
+      showToast(`خطا در اتصال کارها به رویداد: ${String(e)}`);
+    }
+  };
+
+  const handleUnlinkTaskFromCalendarEvent = async (taskId: string) => {
+    try {
+      const updated = await CompassApi.unlinkTaskFromCalendarEvent(taskId);
+      setDash(updated);
+      showToast("اتصال کار از رویداد برداشته شد.");
+    } catch (e: unknown) {
+      showToast(`خطا در قطع اتصال کار: ${String(e)}`);
+    }
+  };
+
+  const handleCreateTaskForEvent = async (params: {
+    projectId: string;
+    title: string;
+    category: string;
+    durationMinutes: number;
+    scheduledDate: string;
+    calendarEventId: string;
+  }) => {
+    try {
+      const updated = await CompassApi.createTaskForCalendarEvent(params);
+      setDash(updated);
+      showToast(`کار جدید ساخته شد و به رویداد متصل گردید.`);
+    } catch (e: unknown) {
+      showToast(`خطا در ساخت کار متصل به رویداد: ${String(e)}`);
+    }
+  };
+
   return (
     <div
       dir="ltr"
@@ -1238,236 +1537,421 @@ export default function App() {
         onOpenLogs={() => openBuiltinView("LOGS")}
       />
 
-      {/* Antigravity 3-Column LTR Workbench Body: Left Sidebar | Center Chat | Right Tabbed Canvas */}
-      <div className="flex-1 flex min-h-0 overflow-hidden relative">
-        {/* Column 1: Left Sidebar */}
-        {isSidebarOpen && (
-          <AntigravitySidebar
-            dash={dash}
-            width={sidebarWidth}
-            activeCanvasTabId={isRightCanvasOpen ? activeCanvasTabId : null}
-            isNarrowViewport={isNarrowViewport}
-            onCloseMobile={() => setIsSidebarOpen(false)}
-            onNewConversation={() =>
-              void handleCreateChatSession("GLOBAL", activeChatChannel)
-            }
-            onOpenBuiltinView={openBuiltinView}
-            onSwitchProject={(pid) => void handleSwitchProject(pid)}
-            onOpenNewProject={(parentId) => {
-              setNewProjParentId(parentId ?? null);
-              setShowNewProjModal(true);
-            }}
-            onManageProject={(proj) => setManagingProject(proj)}
-            onCreateChatSession={(pid, ch) => void handleCreateChatSession(pid, ch)}
-            onSwitchChatSession={(s) => void handleSwitchChatSession(s)}
-            onDeleteChatSession={(sid) => void handleDeleteChatSession(sid)}
-          />
-        )}
+      {/* Dynamic Responsive, Resizable & Reorderable Workbench Body */}
+      <div
+        ref={workbenchContainerRef}
+        onDragEnd={() => setDraggedPane(null)}
+        className="flex-1 flex min-h-0 overflow-hidden relative"
+      >
+        {(() => {
+          const visibleDockedPanes: PaneKind[] = isNarrowViewport
+            ? [
+                ...(isRightCanvasOpen && !isCanvasFloating ? (["CANVAS"] as PaneKind[]) : (["CHAT"] as PaneKind[])),
+              ]
+            : paneOrder.filter((p) => {
+                if (p === "SIDEBAR") return isSidebarOpen;
+                if (p === "CANVAS") return isRightCanvasOpen && !isCanvasFloating;
+                // CHAT is visible unless Canvas is docked & maximized
+                return !isRightCanvasOpen || isCanvasFloating || !isRightCanvasMaximized;
+              });
 
-        {/* Draggable Splitter 1: Sidebar <-> Main Workspace */}
-        {isSidebarOpen && !isNarrowViewport && (
-          <div
-            role="separator"
-            aria-orientation="vertical"
-            title="Drag to resize sidebar (double-click to reset)"
-            onMouseDown={(e) => {
-              e.preventDefault();
-              sidebarDragRef.current = {
-                startX: e.clientX,
-                startWidth: sidebarWidth,
-              };
-              setIsDraggingSidebar(true);
-            }}
-            onDoubleClick={() => setSidebarWidth(244)}
-            className="w-[5px] -ml-[2px] -mr-[2px] z-20 shrink-0 cursor-col-resize flex items-center justify-center group"
-          >
-            <div
-              className={`w-[2px] h-full transition-colors ${
-                isDraggingSidebar
-                  ? "bg-blue-500"
-                  : "bg-transparent group-hover:bg-blue-500/70"
-              }`}
-            />
-          </div>
-        )}
+          const effectiveSidebarW =
+            typeof window !== "undefined"
+              ? Math.min(sidebarWidth, Math.max(160, Math.floor(window.innerWidth * 0.42)))
+              : sidebarWidth;
 
-        {/* Columns 2 & 3 Container: Center Chat + Right Tabbed Canvas */}
-        <div
-          ref={workspaceBodyRef}
-          className="flex-1 flex min-w-0 min-h-0 overflow-hidden"
-        >
-          {/* Column 2: Center Chat Stream (Hidden when Right Canvas is Maximized or on narrow screens when Right Canvas is open) */}
-          {(!isRightCanvasOpen || (!isRightCanvasMaximized && !isNarrowViewport)) && (
-            <AntigravityChatPane
+          const renderCanvasElement = (floatingMode: boolean) => (
+            <AntigravityRightCanvas
               dash={dash}
-              activeChannel={activeChatChannel}
-              onChangeChannel={setActiveChatChannel}
-              activeSession={activeSession}
-              chatHistory={activeChatHistory}
-              chatInput={chatInput}
-              onChangeChatInput={setChatInput}
-              isSendingChat={isSendingChat}
-              onSendChat={() => void handleSendChat()}
-              onSendFiles={(files) => void handleSendChatFiles(files)}
-              retryingMessageId={retryingMessageId}
-              onRetrySystemMessage={(id) => void handleRetrySystemMessage(id)}
+              settingsForm={settingsForm}
+              tabs={canvasTabs}
+              activeTabId={activeCanvasTabId}
+              isMaximized={!floatingMode && isRightCanvasMaximized}
+              onSelectTab={activateTab}
+              onCloseTab={closeCanvasTab}
+              onOpenBuiltinView={openBuiltinView}
               onOpenArtifactTab={openArtifactTab}
-              onOpenSettingsTab={() => openBuiltinView("SETTINGS")}
-              onQuickChangeModel={(prov, mid, lbl) => void handleQuickChangeModel(prov, mid, lbl)}
-              onOpenReviewTab={() => openBuiltinView("WBS")}
-              connectionStatus={connectionStatus}
-              isCheckingConnection={isCheckingConnection}
-              isProcessingQueue={isProcessingQueue}
-              processingQueueId={processingQueueId}
-              autoQueueEnabled={autoQueueEnabled}
-              cooldownSecondsLeft={cooldownSecondsLeft}
-              onToggleAutoQueue={(enabled) => {
-                setAutoQueueEnabled(enabled);
-                if (enabled) setCooldownUntil(0);
+              onOpenMethodTab={openMethodTab}
+              onToggleMaximize={() => {
+                if (floatingMode) setIsCanvasFloating(false);
+                setIsRightCanvasMaximized((v) => !v);
               }}
-              onRecheckConnection={() => void refreshConnection()}
-              onProcessNowAll={() => {
-                setCooldownUntil(0);
-                void runQueueDrain(true);
+              onCloseCanvas={() => {
+                setIsRightCanvasOpen(false);
+                setIsRightCanvasMaximized(false);
               }}
-              onProcessSingleQueueItem={(id) => void handleProcessSingleQueueItem(id)}
-              onReorderQueueItem={(id, dir) => void handleReorderQueueItem(id, dir)}
-              onResetQueueOrder={() => void handleResetQueueOrder()}
-              onDismissQueueItem={(id) => void handleDismissQueueItem(id)}
-            />
-          )}
-
-          {/* Draggable Splitter 2: Center Chat <-> Right Tabbed Canvas */}
-          {isRightCanvasOpen && !isRightCanvasMaximized && !isNarrowViewport && (
-            <div
-              role="separator"
-              aria-orientation="vertical"
-              title="Drag to resize chat & right canvas (double-click to reset)"
-              onMouseDown={(e) => {
-                e.preventDefault();
-                setIsDraggingCanvas(true);
+              isFloating={floatingMode}
+              onToggleFloating={() => {
+                setIsRightCanvasMaximized(false);
+                setIsCanvasFloating((v) => !v);
               }}
-              onDoubleClick={() => setRightCanvasPct(48)}
-              className="w-[5px] -ml-[2px] -mr-[2px] z-20 shrink-0 cursor-col-resize flex items-center justify-center group border-l border-white/[0.07]"
-            >
-              <div
-                className={`w-[2px] h-full transition-colors ${
-                  isDraggingCanvas
-                    ? "bg-blue-500"
-                    : "bg-transparent group-hover:bg-blue-500/70"
-                }`}
-              />
-            </div>
-          )}
-
-          {/* Column 3: Right Tabbed Canvas */}
-          {isRightCanvasOpen && (
-            <div
-              style={
-                isRightCanvasMaximized || isNarrowViewport
-                  ? { flex: 1 }
-                  : { width: `${rightCanvasPct}%` }
+              canMoveLeft={!floatingMode && !isNarrowViewport && paneOrder.indexOf("CANVAS") > 0}
+              canMoveRight={
+                !floatingMode &&
+                !isNarrowViewport &&
+                paneOrder.indexOf("CANVAS") < paneOrder.length - 1
               }
-              className={`min-w-0 min-h-0 flex flex-col overflow-hidden ${
-                isRightCanvasMaximized || isNarrowViewport ? "flex-1 w-full" : "min-w-[280px] shrink-0"
-              }`}
-            >
-              <AntigravityRightCanvas
-                dash={dash}
-                settingsForm={settingsForm}
-                tabs={canvasTabs}
-                activeTabId={activeCanvasTabId}
-                isMaximized={isRightCanvasMaximized}
-                onSelectTab={activateTab}
-                onCloseTab={closeCanvasTab}
-                onOpenBuiltinView={openBuiltinView}
-                onOpenArtifactTab={openArtifactTab}
-                onOpenMethodTab={openMethodTab}
-                onToggleMaximize={() => setIsRightCanvasMaximized((v) => !v)}
-                onCloseCanvas={() => {
-                  setIsRightCanvasOpen(false);
-                  setIsRightCanvasMaximized(false);
-                }}
-                checkedGates={checkedGates}
-                onToggleGate={(id, checked) =>
-                  setCheckedGates({ ...checkedGates, [id]: checked })
+              onMoveLeft={() => movePane("CANVAS", -1)}
+              onMoveRight={() => movePane("CANVAS", 1)}
+              onDragStartPane={() => setDraggedPane("CANVAS")}
+              onStartFloatingDrag={
+                floatingMode
+                  ? (e) => {
+                      e.preventDefault();
+                      floatInteractRef.current = {
+                        mode: "MOVE",
+                        startX: e.clientX,
+                        startY: e.clientY,
+                        startRect: { ...floatingRect },
+                      };
+                      setIsFloatInteracting(true);
+                    }
+                  : undefined
+              }
+              checkedGates={checkedGates}
+              onToggleGate={(id, checked) =>
+                setCheckedGates({ ...checkedGates, [id]: checked })
+              }
+              allGatesPassed={allGatesPassed}
+              onQuickComplete={(tid, p) => void handleQuickComplete(tid, p)}
+              onStartTask={(tid) => void handleStartTask(tid)}
+              onInsertChatPrompt={(text) => {
+                setChatInput((prev) =>
+                  prev.trim() ? `${prev.trimEnd()}\n${text}` : text
+                );
+                if (isRightCanvasMaximized) setIsRightCanvasMaximized(false);
+              }}
+              onUpsertMethod={handleUpsertMethod}
+              onDeleteMethod={handleDeleteMethod}
+              onOpenNewOutcome={() => {
+                setEditingOutcome(null);
+                setShowOutcomeModal(true);
+              }}
+              onEditOutcome={(o) => {
+                setEditingOutcome(o);
+                setShowOutcomeModal(true);
+              }}
+              onDeleteOutcome={(id) => void handleDeleteOutcome(id)}
+              onOpenNewWorkLine={() => {
+                setEditingWorkLine(null);
+                setShowWorkLineModal(true);
+              }}
+              onEditWorkLine={(wl) => {
+                setEditingWorkLine(wl);
+                setShowWorkLineModal(true);
+              }}
+              onOpenNewTask={() => {
+                setEditingTask(null);
+                setShowTaskModal(true);
+              }}
+              onOpenAssignTask={(t) => {
+                setEditingTask(t);
+                setShowTaskModal(true);
+              }}
+              docQueueStatus={docQueueStatus}
+              onBatchFilesSelected={handleBatchFilesSelected}
+              onBatchFilesDropped={(files) => void processBatchVaultFiles(files)}
+              onManualDocIngest={handleManualDocIngest}
+              onRequeueDoc={(docId) => void handleRequeueDoc(docId)}
+              onDashboardUpdated={setDash}
+              onToast={showToast}
+              onCreateVaultCard={handleCreateVaultCard}
+              onDeleteVaultCard={(id) => void handleDeleteVaultCard(id)}
+              onResolveProposal={(id, ok) => void handleResolveProposal(id, ok)}
+              onUpsertCalendarDay={handleUpsertCalendarDay}
+              onUpsertCalendarEvent={handleUpsertCalendarEvent}
+              onDeleteCalendarEvent={handleDeleteCalendarEvent}
+              onLinkTasksToCalendarEvent={handleLinkTasksToCalendarEvent}
+              onUnlinkTaskFromCalendarEvent={handleUnlinkTaskFromCalendarEvent}
+              onCreateTaskForEvent={handleCreateTaskForEvent}
+              onSwitchProject={(pid) => void handleSwitchProject(pid)}
+              onCreateProject={(parentId) => {
+                setNewProjParentId(parentId ?? null);
+                setShowNewProjModal(true);
+              }}
+              onUpdateProject={async (payload) => {
+                const current = dash?.projects.find((p) => p.id === payload.projectId);
+                await handleUpdateProject({
+                  projectId: payload.projectId,
+                  name: payload.name ?? current?.name ?? "",
+                  parentId: payload.parentId !== undefined ? payload.parentId : (current?.parent_id ?? null),
+                  clearParent: payload.clearParent ?? (payload.parentId === null),
+                  realm: payload.realm ?? current?.realm ?? "WORK",
+                  lifecycleStatus: payload.lifecycleStatus ?? current?.lifecycle_status ?? "ACTIVE",
+                  color: payload.color ?? current?.color ?? "#6366f1",
+                  dailyQuotaMinutes: payload.dailyQuotaMinutes ?? current?.daily_quota_minutes ?? 0,
+                  weeklyQuotaMinutes: payload.weeklyQuotaMinutes ?? current?.weekly_quota_minutes ?? 0,
+                  monthlyQuotaMinutes: payload.monthlyQuotaMinutes ?? current?.monthly_quota_minutes ?? 0,
+                  hourlyRate: payload.hourlyRate ?? current?.hourly_rate ?? 0,
+                });
+              }}
+              onMergeProjects={handleMergeProjects}
+              onDeleteProject={handleDeleteProject}
+              onChangeSettings={setSettingsForm}
+              onSaveSettings={(override) => void handleSaveSettings(override)}
+            />
+          );
+
+          const renderPaneContent = (pane: PaneKind) => {
+            if (pane === "SIDEBAR") {
+              return (
+                <AntigravitySidebar
+                  dash={dash}
+                  width={effectiveSidebarW}
+                  activeCanvasTabId={isRightCanvasOpen ? activeCanvasTabId : null}
+                  isNarrowViewport={isNarrowViewport}
+                  onCloseMobile={() => setIsSidebarOpen(false)}
+                  onNewConversation={() =>
+                    void handleCreateChatSession("GLOBAL", activeChatChannel)
+                  }
+                  onOpenBuiltinView={openBuiltinView}
+                  onSwitchProject={(pid) => void handleSwitchProject(pid)}
+                  onOpenNewProject={(parentId) => {
+                    setNewProjParentId(parentId ?? null);
+                    setShowNewProjModal(true);
+                  }}
+                  onManageProject={(proj) => setManagingProject(proj)}
+                  onCreateChatSession={(pid, ch) => void handleCreateChatSession(pid, ch)}
+                  onSwitchChatSession={(s) => void handleSwitchChatSession(s)}
+                  onDeleteChatSession={(sid) => void handleDeleteChatSession(sid)}
+                  canMoveLeft={!isNarrowViewport && paneOrder.indexOf("SIDEBAR") > 0}
+                  canMoveRight={!isNarrowViewport && paneOrder.indexOf("SIDEBAR") < paneOrder.length - 1}
+                  onMoveLeft={() => movePane("SIDEBAR", -1)}
+                  onMoveRight={() => movePane("SIDEBAR", 1)}
+                  onDragStartPane={() => setDraggedPane("SIDEBAR")}
+                />
+              );
+            }
+            if (pane === "CHAT") {
+              return (
+                <AntigravityChatPane
+                  dash={dash}
+                  activeChannel={activeChatChannel}
+                  onChangeChannel={setActiveChatChannel}
+                  activeSession={activeSession}
+                  chatHistory={activeChatHistory}
+                  chatInput={chatInput}
+                  onChangeChatInput={setChatInput}
+                  isSendingChat={isSendingChat}
+                  onSendChat={() => void handleSendChat()}
+                  onSendFiles={(files) => void handleSendChatFiles(files)}
+                  retryingMessageId={retryingMessageId}
+                  onRetrySystemMessage={(id) => void handleRetrySystemMessage(id)}
+                  onOpenArtifactTab={openArtifactTab}
+                  onOpenSettingsTab={() => openBuiltinView("SETTINGS")}
+                  onQuickChangeModel={(prov, mid, lbl) => void handleQuickChangeModel(prov, mid, lbl)}
+                  onOpenReviewTab={() => openBuiltinView("WBS")}
+                  connectionStatus={connectionStatus}
+                  isCheckingConnection={isCheckingConnection}
+                  isProcessingQueue={isProcessingQueue}
+                  processingQueueId={processingQueueId}
+                  autoQueueEnabled={autoQueueEnabled}
+                  cooldownSecondsLeft={cooldownSecondsLeft}
+                  onToggleAutoQueue={(enabled) => {
+                    setAutoQueueEnabled(enabled);
+                    if (enabled) setCooldownUntil(0);
+                  }}
+                  onRecheckConnection={() => void refreshConnection()}
+                  onProcessNowAll={() => {
+                    setCooldownUntil(0);
+                    void runQueueDrain(true);
+                  }}
+                  onProcessBackgroundBatch={() => void handleProcessBackgroundBatch()}
+                  onProcessSingleQueueItem={(id) => void handleProcessSingleQueueItem(id)}
+                  onReorderQueueItem={(id, dir) => void handleReorderQueueItem(id, dir)}
+                  onResetQueueOrder={() => void handleResetQueueOrder()}
+                  onDismissQueueItem={(id) => void handleDismissQueueItem(id)}
+                  canMoveLeft={!isNarrowViewport && paneOrder.indexOf("CHAT") > 0}
+                  canMoveRight={!isNarrowViewport && paneOrder.indexOf("CHAT") < paneOrder.length - 1}
+                  onMoveLeft={() => movePane("CHAT", -1)}
+                  onMoveRight={() => movePane("CHAT", 1)}
+                  onDragStartPane={() => setDraggedPane("CHAT")}
+                />
+              );
+            }
+            return renderCanvasElement(false);
+          };
+
+          const hasChatDocked = visibleDockedPanes.includes("CHAT");
+
+          return (
+            <>
+              {/* Narrow Viewport Mobile Drawer Sidebar */}
+              {isNarrowViewport && isSidebarOpen && renderPaneContent("SIDEBAR")}
+
+              {visibleDockedPanes.map((pane, idx) => {
+                const nextPane = visibleDockedPanes[idx + 1];
+                let containerClass = "flex flex-col min-w-0 min-h-0 overflow-hidden";
+                let containerStyle: Record<string, string | number> | undefined;
+
+                if (pane === "SIDEBAR") {
+                  containerClass += " shrink-0";
+                } else if (pane === "CHAT") {
+                  containerClass += " flex-1 min-w-0";
+                } else if (pane === "CANVAS") {
+                  if (isRightCanvasMaximized || isNarrowViewport || !hasChatDocked) {
+                    containerClass += " flex-1 w-full";
+                  } else {
+                    containerClass += " shrink-0";
+                    containerStyle = { width: `${rightCanvasPct}%` };
+                  }
                 }
-                allGatesPassed={allGatesPassed}
-                onQuickComplete={(tid, p) => void handleQuickComplete(tid, p)}
-                onStartTask={(tid) => void handleStartTask(tid)}
-                onInsertChatPrompt={(text) => {
-                  setChatInput((prev) =>
-                    prev.trim() ? `${prev.trimEnd()}\n${text}` : text
-                  );
-                  if (isRightCanvasMaximized) setIsRightCanvasMaximized(false);
-                }}
-                onUpsertMethod={handleUpsertMethod}
-                onDeleteMethod={handleDeleteMethod}
-                onOpenNewOutcome={() => {
-                  setEditingOutcome(null);
-                  setShowOutcomeModal(true);
-                }}
-                onEditOutcome={(o) => {
-                  setEditingOutcome(o);
-                  setShowOutcomeModal(true);
-                }}
-                onDeleteOutcome={(id) => void handleDeleteOutcome(id)}
-                onOpenNewWorkLine={() => {
-                  setEditingWorkLine(null);
-                  setShowWorkLineModal(true);
-                }}
-                onEditWorkLine={(wl) => {
-                  setEditingWorkLine(wl);
-                  setShowWorkLineModal(true);
-                }}
-                onOpenNewTask={() => {
-                  setEditingTask(null);
-                  setShowTaskModal(true);
-                }}
-                onOpenAssignTask={(t) => {
-                  setEditingTask(t);
-                  setShowTaskModal(true);
-                }}
-                docQueueStatus={docQueueStatus}
-                onBatchFilesSelected={handleBatchFilesSelected}
-                onBatchFilesDropped={(files) => void processBatchVaultFiles(files)}
-                onManualDocIngest={handleManualDocIngest}
-                onRequeueDoc={(docId) => void handleRequeueDoc(docId)}
-                onDashboardUpdated={setDash}
-                onToast={showToast}
-                onCreateVaultCard={handleCreateVaultCard}
-                onDeleteVaultCard={(id) => void handleDeleteVaultCard(id)}
-                onResolveProposal={(id, ok) => void handleResolveProposal(id, ok)}
-                onUpsertCalendarDay={handleUpsertCalendarDay}
-                onSwitchProject={(pid) => void handleSwitchProject(pid)}
-                onCreateProject={(parentId) => {
-                  setNewProjParentId(parentId ?? null);
-                  setShowNewProjModal(true);
-                }}
-                onUpdateProject={async (payload) => {
-                  const current = dash?.projects.find((p) => p.id === payload.projectId);
-                  await handleUpdateProject({
-                    projectId: payload.projectId,
-                    name: payload.name ?? current?.name ?? "",
-                    parentId: payload.parentId !== undefined ? payload.parentId : (current?.parent_id ?? null),
-                    clearParent: payload.clearParent ?? (payload.parentId === null),
-                    realm: payload.realm ?? current?.realm ?? "WORK",
-                    lifecycleStatus: payload.lifecycleStatus ?? current?.lifecycle_status ?? "ACTIVE",
-                    color: payload.color ?? current?.color ?? "#6366f1",
-                    dailyQuotaMinutes: payload.dailyQuotaMinutes ?? current?.daily_quota_minutes ?? 0,
-                    weeklyQuotaMinutes: payload.weeklyQuotaMinutes ?? current?.weekly_quota_minutes ?? 0,
-                    monthlyQuotaMinutes: payload.monthlyQuotaMinutes ?? current?.monthly_quota_minutes ?? 0,
-                    hourlyRate: payload.hourlyRate ?? current?.hourly_rate ?? 0,
-                  });
-                }}
-                onMergeProjects={handleMergeProjects}
-                onDeleteProject={handleDeleteProject}
-                onChangeSettings={setSettingsForm}
-                onSaveSettings={(override) => void handleSaveSettings(override)}
-              />
-            </div>
-          )}
-        </div>
+
+                return (
+                  <div key={pane} className="contents">
+                    <div
+                      style={containerStyle}
+                      onDragOver={(e) => {
+                        if (draggedPane && draggedPane !== pane) e.preventDefault();
+                      }}
+                      onDrop={() => {
+                        if (draggedPane && draggedPane !== pane) {
+                          swapPanes(draggedPane, pane);
+                          setDraggedPane(null);
+                        }
+                      }}
+                      className={`${containerClass} ${
+                        draggedPane && draggedPane !== pane ? "ring-1 ring-inset ring-blue-500/35" : ""
+                      }`}
+                    >
+                      {renderPaneContent(pane)}
+                    </div>
+
+                    {nextPane && !isNarrowViewport && !(isRightCanvasMaximized && !isCanvasFloating) && (
+                      <div
+                        role="separator"
+                        aria-orientation="vertical"
+                        title="بکشید برای تغییر اندازه پنجره‌ها (دوبارکلیک: بازنشانی)"
+                        onMouseDown={(e) => {
+                          e.preventDefault();
+                          const totalW = workbenchContainerRef.current?.getBoundingClientRect().width ?? window.innerWidth;
+                          const nonSidebarW = Math.max(
+                            320,
+                            totalW - (visibleDockedPanes.includes("SIDEBAR") ? effectiveSidebarW : 0)
+                          );
+                          splitterDragRef.current = {
+                            leftPane: pane,
+                            rightPane: nextPane,
+                            startX: e.clientX,
+                            startSidebarWidth: effectiveSidebarW,
+                            startCanvasPct: rightCanvasPct,
+                            containerWidth: nonSidebarW,
+                          };
+                          setActiveSplitterIdx(idx);
+                        }}
+                        onDoubleClick={() => {
+                          if (pane === "SIDEBAR" || nextPane === "SIDEBAR") {
+                            setSidebarWidth(244);
+                          } else {
+                            setRightCanvasPct(48);
+                          }
+                        }}
+                        className="w-[5px] -ml-[2px] -mr-[2px] z-20 shrink-0 cursor-col-resize flex items-center justify-center group"
+                      >
+                        <div
+                          className={`w-[2px] h-full transition-colors ${
+                            activeSplitterIdx === idx
+                              ? "bg-blue-500"
+                              : "bg-white/[0.04] group-hover:bg-blue-500/75"
+                          }`}
+                        />
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+
+              {/* Floating Undocked Window for Right Canvas (Drag to move + resize from edges/corners) */}
+              {isRightCanvasOpen && isCanvasFloating && (
+                <div
+                  style={{
+                    left: `${floatingRect.x}px`,
+                    top: `${floatingRect.y}px`,
+                    width: `${floatingRect.width}px`,
+                    height: `${floatingRect.height}px`,
+                  }}
+                  className="fixed z-40 rounded-2xl border border-white/[0.14] bg-[#0E0F12] shadow-[0_24px_70px_rgba(0,0,0,0.75)] flex flex-col overflow-hidden"
+                >
+                  {renderCanvasElement(true)}
+
+                  {/* Edge & Corner Resize Handles */}
+                  <div
+                    onMouseDown={(e) => {
+                      e.preventDefault();
+                      document.body.style.cursor = "ew-resize";
+                      floatInteractRef.current = {
+                        mode: "RESIZE_R",
+                        startX: e.clientX,
+                        startY: e.clientY,
+                        startRect: { ...floatingRect },
+                      };
+                      setIsFloatInteracting(true);
+                    }}
+                    className="absolute top-10 bottom-3 right-0 w-1.5 cursor-ew-resize hover:bg-blue-500/40"
+                  />
+                  <div
+                    onMouseDown={(e) => {
+                      e.preventDefault();
+                      document.body.style.cursor = "ew-resize";
+                      floatInteractRef.current = {
+                        mode: "RESIZE_L",
+                        startX: e.clientX,
+                        startY: e.clientY,
+                        startRect: { ...floatingRect },
+                      };
+                      setIsFloatInteracting(true);
+                    }}
+                    className="absolute top-10 bottom-3 left-0 w-1.5 cursor-ew-resize hover:bg-blue-500/40"
+                  />
+                  <div
+                    onMouseDown={(e) => {
+                      e.preventDefault();
+                      document.body.style.cursor = "ns-resize";
+                      floatInteractRef.current = {
+                        mode: "RESIZE_B",
+                        startX: e.clientX,
+                        startY: e.clientY,
+                        startRect: { ...floatingRect },
+                      };
+                      setIsFloatInteracting(true);
+                    }}
+                    className="absolute bottom-0 left-3 right-3 h-1.5 cursor-ns-resize hover:bg-blue-500/40"
+                  />
+                  <div
+                    onMouseDown={(e) => {
+                      e.preventDefault();
+                      document.body.style.cursor = "nwse-resize";
+                      floatInteractRef.current = {
+                        mode: "RESIZE_BR",
+                        startX: e.clientX,
+                        startY: e.clientY,
+                        startRect: { ...floatingRect },
+                      };
+                      setIsFloatInteracting(true);
+                    }}
+                    title="تغییر اندازه پنجره"
+                    className="absolute bottom-0 right-0 w-3.5 h-3.5 cursor-nwse-resize"
+                  />
+                  <div
+                    onMouseDown={(e) => {
+                      e.preventDefault();
+                      document.body.style.cursor = "nesw-resize";
+                      floatInteractRef.current = {
+                        mode: "RESIZE_BL",
+                        startX: e.clientX,
+                        startY: e.clientY,
+                        startRect: { ...floatingRect },
+                      };
+                      setIsFloatInteracting(true);
+                    }}
+                    title="تغییر اندازه پنجره"
+                    className="absolute bottom-0 left-0 w-3.5 h-3.5 cursor-nesw-resize"
+                  />
+                </div>
+              )}
+            </>
+          );
+        })()}
       </div>
 
       {/* Modals (RTL inside modals) */}

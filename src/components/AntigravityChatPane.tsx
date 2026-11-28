@@ -3,10 +3,13 @@ import {
   ArrowUp,
   BookOpen,
   ChevronDown,
+  ChevronLeft,
+  ChevronRight,
   Database,
   Expand,
   FileText,
   GitBranch,
+  GripVertical,
   HelpCircle,
   Paperclip,
   Plus,
@@ -55,10 +58,16 @@ interface AntigravityChatPaneProps {
   onToggleAutoQueue: (enabled: boolean) => void;
   onRecheckConnection: () => void;
   onProcessNowAll: () => void;
+  onProcessBackgroundBatch: () => void;
   onProcessSingleQueueItem: (queueId: number) => void;
   onReorderQueueItem: (queueId: number, direction: "TOP" | "UP" | "DOWN") => void;
   onResetQueueOrder: () => void;
   onDismissQueueItem: (queueId: number) => void;
+  canMoveLeft?: boolean;
+  canMoveRight?: boolean;
+  onMoveLeft?: () => void;
+  onMoveRight?: () => void;
+  onDragStartPane?: () => void;
 }
 
 function getArtifactIcon(artifactType: string) {
@@ -115,10 +124,16 @@ export function AntigravityChatPane({
   onToggleAutoQueue,
   onRecheckConnection,
   onProcessNowAll,
+  onProcessBackgroundBatch,
   onProcessSingleQueueItem,
   onReorderQueueItem,
   onResetQueueOrder,
   onDismissQueueItem,
+  canMoveLeft,
+  canMoveRight,
+  onMoveLeft,
+  onMoveRight,
+  onDragStartPane,
 }: AntigravityChatPaneProps) {
   const chatEndRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
@@ -175,7 +190,7 @@ export function AntigravityChatPane({
       }}
       onDragLeave={() => setIsDraggingFile(false)}
       onDrop={handleDrop}
-      className={`flex-1 min-w-[300px] bg-[#0D0E11] flex flex-col min-h-0 relative overflow-hidden ${
+      className={`flex-1 min-w-0 h-full bg-[#0D0E11] flex flex-col min-h-0 relative overflow-hidden ${
         isDraggingFile ? "ring-2 ring-inset ring-blue-500/60" : ""
       }`}
     >
@@ -195,24 +210,34 @@ export function AntigravityChatPane({
       {/* Slim Conversation Header (Antigravity Style) */}
       <div
         dir="ltr"
-        className="h-[38px] px-3.5 border-b border-white/[0.06] bg-[#0E0F12] flex items-center justify-between gap-2 shrink-0"
+        className="min-h-[38px] px-3 py-1 border-b border-white/[0.06] bg-[#0E0F12] flex items-center justify-between gap-2 flex-wrap shrink-0"
       >
-        <div className="flex items-center gap-2 min-w-0">
-          <span className="text-[12.5px] font-medium text-white/85 truncate" dir="auto">
+        <div className="flex items-center gap-1.5 min-w-0 flex-1">
+          {onDragStartPane && (
+            <span
+              draggable
+              onDragStart={onDragStartPane}
+              title="بکشید برای جابجایی پنجره چت"
+              className="p-0.5 rounded text-white/30 hover:text-white/75 cursor-grab active:cursor-grabbing shrink-0 hidden sm:inline-flex"
+            >
+              <GripVertical className="w-3.5 h-3.5" />
+            </span>
+          )}
+          <span className="text-[12.5px] font-medium text-white/85 truncate min-w-[60px]" dir="auto">
             {activeSession?.title || "گفتگوی همیار"}
           </span>
           {activeSession?.project_id === "GLOBAL" ? (
-            <div className="flex items-center gap-1.5 shrink-0">
+            <div className="flex items-center gap-1 min-w-0 shrink">
               <span
                 dir="rtl"
-                className="px-2 py-0.5 rounded-md bg-cyan-500/15 border border-cyan-500/25 text-[10px] font-medium text-cyan-300 shrink-0"
+                className="px-2 py-0.5 rounded-md bg-cyan-500/15 border border-cyan-500/25 text-[10px] font-medium text-cyan-300 truncate max-w-[140px]"
               >
-                لایه راهبردی • همه پروژه‌ها
+                همه پروژه‌ها
               </span>
               <span
                 dir="auto"
-                title="پروژه نمایش‌داده‌شده در بوم راست"
-                className="hidden sm:inline-block px-2 py-0.5 rounded-md bg-white/[0.04] border border-white/[0.07] text-[10px] text-white/50 truncate max-w-[115px]"
+                title="پروژه نمایش‌داده‌شده در بوم"
+                className="hidden md:inline-block px-2 py-0.5 rounded-md bg-white/[0.04] border border-white/[0.07] text-[10px] text-white/50 truncate max-w-[100px]"
               >
                 بوم: {dash.active_project.name}
               </span>
@@ -220,14 +245,38 @@ export function AntigravityChatPane({
           ) : (
             <span
               dir="auto"
-              className="px-2 py-0.5 rounded-md bg-white/[0.05] border border-white/[0.08] text-[10px] text-white/60 shrink-0 truncate max-w-[130px]"
+              className="px-2 py-0.5 rounded-md bg-white/[0.05] border border-white/[0.08] text-[10px] text-white/60 truncate max-w-[115px]"
             >
               {dash.active_project.name}
             </span>
           )}
         </div>
 
-        <div className="flex items-center gap-1.5 shrink-0">
+        <div className="flex items-center gap-1 shrink-0">
+          {(canMoveLeft || canMoveRight) && (
+            <div className="hidden sm:flex items-center gap-0.5 mr-1">
+              {canMoveLeft && onMoveLeft && (
+                <button
+                  type="button"
+                  onClick={onMoveLeft}
+                  title="انتقال پنجره چت به چپ"
+                  className="p-1 rounded hover:bg-white/[0.07] text-white/45 hover:text-white"
+                >
+                  <ChevronLeft className="w-3 h-3" />
+                </button>
+              )}
+              {canMoveRight && onMoveRight && (
+                <button
+                  type="button"
+                  onClick={onMoveRight}
+                  title="انتقال پنجره چت به راست"
+                  className="p-1 rounded hover:bg-white/[0.07] text-white/45 hover:text-white"
+                >
+                  <ChevronRight className="w-3 h-3" />
+                </button>
+              )}
+            </div>
+          )}
           {/* Copilot / Vault Channel Switcher */}
           <div
             dir="rtl"
@@ -287,6 +336,7 @@ export function AntigravityChatPane({
             onToggleAutoQueue={onToggleAutoQueue}
             onRecheckConnection={onRecheckConnection}
             onProcessNowAll={onProcessNowAll}
+            onProcessBackgroundBatch={onProcessBackgroundBatch}
             onProcessSingleItem={onProcessSingleQueueItem}
             onReorderItem={onReorderQueueItem}
             onResetQueueOrder={onResetQueueOrder}

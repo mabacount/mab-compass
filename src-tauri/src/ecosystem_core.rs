@@ -508,6 +508,7 @@ pub fn merge_compass_projects_atomic(
         "mutation_audit_logs",
         "pending_proposals",
         "legacy_reprocess_history",
+        "calendar_events",
     ];
 
     for table in tables {
