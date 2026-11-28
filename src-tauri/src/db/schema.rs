@@ -455,6 +455,23 @@ pub fn init_database(db_path: &Path, default_vault_root: &Path) -> Result<Connec
             merge_id TEXT PRIMARY KEY,
             applied_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS calendar_events (
+            id TEXT PRIMARY KEY,
+            project_id TEXT,
+            title TEXT NOT NULL,
+            event_type TEXT NOT NULL DEFAULT 'MEETING',
+            event_date TEXT NOT NULL,
+            start_time TEXT NOT NULL DEFAULT '',
+            end_time TEXT NOT NULL DEFAULT '',
+            location_or_link TEXT NOT NULL DEFAULT '',
+            notes TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'UPCOMING',
+            color_hex TEXT NOT NULL DEFAULT '#3B82F6',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_calendar_events_date ON calendar_events(event_date);
+        CREATE INDEX IF NOT EXISTS idx_calendar_events_project ON calendar_events(project_id);
         ",
     )?;
 
@@ -530,6 +547,12 @@ pub fn init_database(db_path: &Path, default_vault_root: &Path) -> Result<Connec
         "work_entities",
         "priority_score",
         "ALTER TABLE work_entities ADD COLUMN priority_score INTEGER NOT NULL DEFAULT 50",
+    )?;
+    ensure_column_exists(
+        &conn,
+        "work_entities",
+        "calendar_event_id",
+        "ALTER TABLE work_entities ADD COLUMN calendar_event_id TEXT",
     )?;
 
     // Knowledge documents alterations

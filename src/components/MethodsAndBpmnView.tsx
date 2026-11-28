@@ -1,6 +1,10 @@
 import { useMemo, useState } from "react";
 import {
+  ArrowDown,
+  ArrowUp,
   BookOpen,
+  Edit3,
+  Eye,
   FileCode2,
   GitBranch,
   Layers,
@@ -16,7 +20,7 @@ import {
   MethodPlaybook,
   MethodPlaybookInput,
 } from "../lib/tauri_api";
-import { buildProjectWorkMapBpmn } from "../lib/bpmnEngine";
+import { buildMethodStepsBpmn, buildProjectWorkMapBpmn } from "../lib/bpmnEngine";
 import { BpmnViewer } from "./bpmn/BpmnViewer";
 import { formatShortDate } from "../lib/formatters";
 
@@ -33,10 +37,12 @@ interface MethodsAndBpmnViewProps {
 type StudioSubTab = "PROJECT_MAP" | "METHODS_LIST";
 
 interface DraftStep {
+  id?: string;
   title: string;
   description: string;
   element_type: string;
   role: string;
+  condition_label?: string;
   sub_steps_text: string;
 }
 
@@ -52,8 +58,10 @@ export function MethodsAndBpmnView({
   const [subTab, setSubTab] = useState<StudioSubTab>("PROJECT_MAP");
   const [searchQuery, setSearchQuery] = useState("");
   const [showCreateModal, setShowCreateModal] = useState(false);
+  const [showLivePreview, setShowLivePreview] = useState(true);
+  const [editingMethodId, setEditingMethodId] = useState<string | undefined>(undefined);
 
-  // Manual method creation state
+  // Manual method/diagram creation or edit state
   const [mTitle, setMTitle] = useState("");
   const [mCategory, setMCategory] = useState("GENERAL");
   const [mObjective, setMObjective] = useState("");
@@ -61,9 +69,82 @@ export function MethodsAndBpmnView({
   const [mChecklist, setMChecklist] = useState("");
   const [mNotes, setMNotes] = useState("");
   const [mSteps, setMSteps] = useState<DraftStep[]>([
-    { title: "", description: "", element_type: "userTask", role: "", sub_steps_text: "" },
+    { title: "", description: "", element_type: "userTask", role: "", condition_label: "", sub_steps_text: "" },
   ]);
   const [isSaving, setIsSaving] = useState(false);
+
+  const openCreateNew = () => {
+    setEditingMethodId(undefined);
+    setMTitle("");
+    setMCategory("GENERAL");
+    setMObjective("");
+    setMPrereqs("");
+    setMChecklist("");
+    setMNotes("");
+    setMSteps([
+      { title: "", description: "", element_type: "userTask", role: "", condition_label: "", sub_steps_text: "" },
+    ]);
+    setShowLivePreview(true);
+    setShowCreateModal(true);
+  };
+
+  const openEditMethod = (m: MethodPlaybook) => {
+    setEditingMethodId(m.id);
+    setMTitle(m.title);
+    setMCategory(m.category || "GENERAL");
+    setMObjective(m.objective || "");
+    setMPrereqs((m.prerequisites || []).join("\n"));
+    setMChecklist((m.checklist || []).join("\n"));
+    setMNotes(m.notes_markdown || "");
+    setMSteps(
+      m.steps && m.steps.length > 0
+        ? m.steps.map((s) => ({
+            id: s.id,
+            title: s.title,
+            description: s.description || "",
+            element_type: s.sub_steps && s.sub_steps.length > 0 ? "subProcess" : s.element_type || "userTask",
+            role: s.role || "",
+            condition_label: s.condition_label || "",
+            sub_steps_text: (s.sub_steps || []).map((ss) => ss.title).join("\n"),
+          }))
+        : [{ title: "", description: "", element_type: "userTask", role: "", condition_label: "", sub_steps_text: "" }]
+    );
+    setShowLivePreview(true);
+    setShowCreateModal(true);
+  };
+
+  const moveStep = (idx: number, dir: -1 | 1) => {
+    setMSteps((prev) => {
+      const target = idx + dir;
+      if (target < 0 || target >= prev.length) return prev;
+      const next = [...prev];
+      const [moved] = next.splice(idx, 1);
+      next.splice(target, 0, moved);
+      return next;
+    });
+  };
+
+  const livePreviewXml = useMemo(
+    () =>
+      buildMethodStepsBpmn(
+        mTitle,
+        mSteps.map((s, idx) => ({
+          id: s.id || `S${idx + 1}`,
+          title: s.title,
+          description: s.description,
+          element_type: s.element_type,
+          role: s.role,
+          condition_label: s.condition_label,
+          sub_steps: s.sub_steps_text
+            .split("\n")
+            .map((l) => l.trim())
+            .filter(Boolean)
+            .map((t, sidx) => ({ id: `S${idx + 1}_${sidx + 1}`, title: t })),
+        })),
+        mObjective
+      ),
+    [mTitle, mSteps, mObjective]
+  );
 
   const methods = dash.methods_playbooks ?? [];
   const projectWorkMapXml = useMemo(() => buildProjectWorkMapBpmn(dash), [dash]);
@@ -115,11 +196,13 @@ export function MethodsAndBpmnView({
             outputs: [],
             checklist: [],
             notes: "",
+            condition_label: s.condition_label?.trim() || undefined,
             sub_steps: subSteps,
           };
         });
 
       await onUpsertMethod({
+        method_id: editingMethodId,
         title: mTitle.trim(),
         category: mCategory,
         objective: mObjective.trim(),
@@ -135,13 +218,14 @@ export function MethodsAndBpmnView({
         notes_markdown: mNotes.trim(),
       });
 
+      setEditingMethodId(undefined);
       setMTitle("");
       setMObjective("");
       setMPrereqs("");
       setMChecklist("");
       setMNotes("");
       setMSteps([
-        { title: "", description: "", element_type: "userTask", role: "", sub_steps_text: "" },
+        { title: "", description: "", element_type: "userTask", role: "", condition_label: "", sub_steps_text: "" },
       ]);
       setShowCreateModal(false);
       setSubTab("METHODS_LIST");
@@ -178,7 +262,7 @@ export function MethodsAndBpmnView({
             }`}
           >
             <BookOpen className="w-3.5 h-3.5 text-emerald-400" />
-            <span>متدها و دستورالعمل‌ها</span>
+            <span>دیاگرام‌ها و دستورالعمل‌های فرآیند</span>
             <span className="font-mono text-[10px] px-1.5 py-[2px] rounded-full bg-white/[0.08]">
               {methods.length}
             </span>
@@ -192,7 +276,7 @@ export function MethodsAndBpmnView({
               <input
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder="جستجو در متدها..."
+                placeholder="جستجو در دستورالعمل‌ها..."
                 className="mab-input pr-8 pl-3 py-1 text-[12px] w-full select-text"
               />
             </div>
@@ -205,17 +289,17 @@ export function MethodsAndBpmnView({
               className="px-2.5 py-1.5 rounded-lg bg-purple-500/15 hover:bg-purple-500/25 border border-purple-500/30 text-purple-300 text-[11.5px] font-medium inline-flex items-center gap-1.5 transition"
             >
               <Sparkles className="w-3.5 h-3.5" />
-              <span>استخراج متد با همیار</span>
+              <span>ترسیم فرآیند با همیار</span>
             </button>
           )}
 
           <button
             type="button"
-            onClick={() => setShowCreateModal(true)}
+            onClick={openCreateNew}
             className="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-[11.5px] font-semibold inline-flex items-center gap-1.5 transition"
           >
             <Plus className="w-3.5 h-3.5" />
-            <span>متد / BPMN جدید</span>
+            <span>رسم دستورالعمل / BPMN</span>
           </button>
         </div>
       </div>
@@ -306,17 +390,30 @@ export function MethodsAndBpmnView({
                         </div>
                       </div>
 
-                      <button
-                        type="button"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          void onDeleteMethod(m.id);
-                        }}
-                        title="حذف متد"
-                        className="opacity-0 group-hover:opacity-100 p-1.5 rounded-lg bg-white/[0.03] hover:bg-rose-500/15 text-white/45 hover:text-rose-400 transition shrink-0"
-                      >
-                        <Trash2 className="w-3.5 h-3.5" />
-                      </button>
+                      <div className="flex items-center gap-1 shrink-0">
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            openEditMethod(m);
+                          }}
+                          title="ویرایش دیاگرام و گام‌ها"
+                          className="opacity-0 group-hover:opacity-100 p-1.5 rounded-lg bg-white/[0.04] hover:bg-blue-500/20 text-white/60 hover:text-blue-300 transition shrink-0"
+                        >
+                          <Edit3 className="w-3.5 h-3.5" />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            void onDeleteMethod(m.id);
+                          }}
+                          title="حذف متد"
+                          className="opacity-0 group-hover:opacity-100 p-1.5 rounded-lg bg-white/[0.03] hover:bg-rose-500/15 text-white/45 hover:text-rose-400 transition shrink-0"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
                     </div>
 
                     <p className="text-[12px] text-mab-text-secondary line-clamp-2 leading-relaxed">
@@ -353,7 +450,7 @@ export function MethodsAndBpmnView({
         </div>
       )}
 
-      {/* Manual Method Playbook Modal */}
+      {/* Manual Method Playbook & Visual Diagram Builder Modal */}
       {showCreateModal && (
         <div
           className="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4"
@@ -361,23 +458,50 @@ export function MethodsAndBpmnView({
         >
           <div
             onClick={(e) => e.stopPropagation()}
-            className="w-full max-w-2xl max-h-[88vh] bg-[#16171C] border border-white/[0.1] rounded-2xl shadow-2xl flex flex-col overflow-hidden"
+            className="w-full max-w-4xl max-h-[90vh] bg-[#16171C] border border-white/[0.1] rounded-2xl shadow-2xl flex flex-col overflow-hidden"
           >
-            <div className="px-5 py-3.5 border-b border-white/[0.08] flex items-center justify-between">
+            <div className="px-5 py-3.5 border-b border-white/[0.08] flex items-center justify-between gap-2">
               <div className="flex items-center gap-2 text-white font-bold text-[14px]">
                 <Workflow className="w-4 h-4 text-purple-400" />
-                <span>ایجاد دستورالعمل و نقشه BPMN 2.0 جدید</span>
+                <span>
+                  {editingMethodId
+                    ? `ویرایش دستورالعمل و دیاگرام (${editingMethodId})`
+                    : "رسم دستورالعمل و نقشه فرآیند BPMN 2.0 جدید"}
+                </span>
               </div>
-              <button
-                type="button"
-                onClick={() => setShowCreateModal(false)}
-                className="p-1 rounded-lg hover:bg-white/[0.08] text-white/60 hover:text-white"
-              >
-                <X className="w-4 h-4" />
-              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setShowLivePreview((v) => !v)}
+                  className={`px-2.5 py-1 rounded-lg text-[11px] font-medium border inline-flex items-center gap-1 transition ${
+                    showLivePreview
+                      ? "bg-purple-500/20 border-purple-400/40 text-purple-200"
+                      : "bg-white/[0.05] border-white/10 text-white/70"
+                  }`}
+                >
+                  <Eye className="w-3.5 h-3.5" />
+                  <span>{showLivePreview ? "مخفی‌سازی پیش‌نمایش دیاگرام" : "نمایش زنده دیاگرام"}</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setShowCreateModal(false)}
+                  className="p-1 rounded-lg hover:bg-white/[0.08] text-white/60 hover:text-white"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
             </div>
 
             <div className="p-5 overflow-y-auto space-y-3.5 text-[12.5px]">
+              {showLivePreview && (
+                <div className="h-56 rounded-xl border border-purple-500/25 bg-[#0E0F13] overflow-hidden">
+                  <BpmnViewer
+                    bpmnXml={livePreviewXml}
+                    title={mTitle || "پیش‌نمایش زنده فرآیند"}
+                    className="h-full"
+                  />
+                </div>
+              )}
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
                 <div className="sm:col-span-2 space-y-1">
                   <label className="text-white/80 font-medium block">عنوان متد / دستورالعمل *</label>
@@ -471,11 +595,32 @@ export function MethodsAndBpmnView({
                         }}
                         className="mab-input px-2 py-1.5 text-[11px] bg-[#0D0E11]"
                       >
-                        <option value="userTask">User Task</option>
-                        <option value="serviceTask">Service Task</option>
-                        <option value="subProcess">SubProcess (مجموعه کار)</option>
-                        <option value="exclusiveGateway">Gateway (تصمیم)</option>
+                        <option value="userTask">User Task (گام انسانی)</option>
+                        <option value="serviceTask">Service Task (گام سیستمی)</option>
+                        <option value="subProcess">SubProcess (زیرفرآیند قابل کلیک)</option>
+                        <option value="exclusiveGateway">Exclusive Gateway (دروازه تصمیم XOR)</option>
+                        <option value="parallelGateway">Parallel Gateway (اجرای موازی AND)</option>
                       </select>
+                      {idx > 0 && (
+                        <button
+                          type="button"
+                          onClick={() => moveStep(idx, -1)}
+                          title="بالا"
+                          className="p-1 text-white/45 hover:text-white"
+                        >
+                          <ArrowUp className="w-3.5 h-3.5" />
+                        </button>
+                      )}
+                      {idx < mSteps.length - 1 && (
+                        <button
+                          type="button"
+                          onClick={() => moveStep(idx, 1)}
+                          title="پایین"
+                          className="p-1 text-white/45 hover:text-white"
+                        >
+                          <ArrowDown className="w-3.5 h-3.5" />
+                        </button>
+                      )}
                       {mSteps.length > 1 && (
                         <button
                           type="button"
@@ -489,7 +634,7 @@ export function MethodsAndBpmnView({
                       )}
                     </div>
 
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
                       <input
                         value={st.description}
                         onChange={(e) => {
@@ -510,6 +655,17 @@ export function MethodsAndBpmnView({
                           );
                         }}
                         placeholder="نقش / مسئول (اختیاری)"
+                        className="mab-input px-2.5 py-1.5 text-[11.5px] select-text"
+                      />
+                      <input
+                        value={st.condition_label || ""}
+                        onChange={(e) => {
+                          const v = e.target.value;
+                          setMSteps((prev) =>
+                            prev.map((x, i) => (i === idx ? { ...x, condition_label: v } : x))
+                          );
+                        }}
+                        placeholder="برچسب یال / شرط انتقال (اختیاری)"
                         className="mab-input px-2.5 py-1.5 text-[11.5px] select-text"
                       />
                     </div>

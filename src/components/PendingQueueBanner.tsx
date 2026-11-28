@@ -1,22 +1,24 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import {
-  AlertCircle,
-  ArrowDown,
   ArrowUp,
   ArrowUpToLine,
+  ArrowDown,
   ChevronDown,
   ChevronUp,
-  Clock,
-  PauseCircle,
+  Clock3,
+  Layers,
+  Loader2,
+  Package,
   Play,
   RefreshCw,
   RotateCcw,
+  Sparkles,
   Trash2,
   Wifi,
   WifiOff,
+  Zap,
 } from "lucide-react";
 import { LlmConnectionStatus, PendingQueueItem } from "../lib/tauri_api";
-import { formatShortTime } from "../lib/formatters";
 
 interface PendingQueueBannerProps {
   queue: PendingQueueItem[];
@@ -29,11 +31,27 @@ interface PendingQueueBannerProps {
   onToggleAutoQueue: (enabled: boolean) => void;
   onRecheckConnection: () => void;
   onProcessNowAll: () => void;
+  onProcessBackgroundBatch: () => void;
   onProcessSingleItem: (queueId: number) => void;
   onReorderItem: (queueId: number, direction: "TOP" | "UP" | "DOWN") => void;
   onResetQueueOrder: () => void;
   onDismissItem: (queueId: number) => void;
   onOpenSettings: () => void;
+}
+
+function sourceTypeLabel(sourceType: string): string {
+  switch (sourceType) {
+    case "USER_CHAT":
+      return "دستور مستقیم";
+    case "MAB_FOCUS_SYNC":
+      return "یادداشت همگام‌سازی Mab-Focus";
+    case "LEGACY_REPROCESS_DOC":
+      return "بازپردازش سند آرشیو";
+    case "LEGACY_REPROCESS":
+      return "بازپردازش رویداد آرشیو";
+    default:
+      return sourceType;
+  }
 }
 
 export function PendingQueueBanner({
@@ -47,295 +65,307 @@ export function PendingQueueBanner({
   onToggleAutoQueue,
   onRecheckConnection,
   onProcessNowAll,
+  onProcessBackgroundBatch,
   onProcessSingleItem,
   onReorderItem,
   onResetQueueOrder,
   onDismissItem,
   onOpenSettings,
 }: PendingQueueBannerProps) {
-  const [isExpanded, setIsExpanded] = useState(false);
+  const [expanded, setExpanded] = useState(false);
+
+  const { userCommands, backgroundItems, failedCount } = useMemo(() => {
+    const cmds = queue.filter((q) => q.queue_kind === "USER_COMMAND");
+    const bgs = queue.filter((q) => q.queue_kind !== "USER_COMMAND");
+    const fails = queue.filter((q) => q.status === "FAILED").length;
+    return { userCommands: cmds, backgroundItems: bgs, failedCount: fails };
+  }, [queue]);
 
   if (queue.length === 0) return null;
 
-  const activeProcessingItem = queue.find((q) => q.id === processingQueueId);
-  const isConnected = connectionStatus?.connected ?? false;
-  const hasManualOrder = queue.some((q) => (q.priority_order ?? 0) > 0);
+  const isConnected = !!connectionStatus?.connected;
+  const activeItem = queue.find((q) => q.id === processingQueueId || q.status === "PROCESSING");
+
+  const renderQueueRow = (item: PendingQueueItem, idx: number, listLen: number, isUserCmd: boolean) => {
+    const isProcessingThis = processingQueueId === item.id || item.status === "PROCESSING";
+    const isFailed = item.status === "FAILED";
+    return (
+      <div
+        key={item.id}
+        className={`rounded-xl border px-3 py-2 flex items-start justify-between gap-2.5 text-[11.5px] transition ${
+          isProcessingThis
+            ? "bg-blue-500/15 border-blue-400/50"
+            : isFailed
+            ? "bg-rose-500/10 border-rose-500/35"
+            : isUserCmd
+            ? "bg-indigo-500/[0.08] border-indigo-400/25"
+            : "bg-white/[0.03] border-white/[0.07]"
+        }`}
+      >
+        <div className="min-w-0 flex-1 space-y-1">
+          <div className="flex items-center gap-1.5 flex-wrap">
+            <span
+              className={`px-1.5 py-0.5 rounded text-[9.5px] font-semibold ${
+                isUserCmd
+                  ? "bg-indigo-500/25 text-indigo-200 border border-indigo-400/35"
+                  : "bg-amber-500/15 text-amber-200 border border-amber-400/25"
+              }`}
+            >
+              {isUserCmd ? "مستقل • دستور کاربر" : `پکیج • ${sourceTypeLabel(item.source_type)}`}
+            </span>
+            <span className="px-1.5 py-0.5 rounded bg-white/[0.07] text-white/75 text-[9.5px]">
+              {item.project_name || item.project_id}
+            </span>
+            <span className="text-[9.5px] font-mono text-white/40">#{item.id}</span>
+            {item.knowledge_doc_id && (
+              <span className="text-[9.5px] font-mono text-cyan-300/80">
+                doc:{item.knowledge_doc_id}
+              </span>
+            )}
+            <span className="text-[9.5px] font-mono text-white/40">
+              {item.created_at.slice(0, 16).replace("T", " ")}
+            </span>
+          </div>
+
+          <div className="text-white/90 font-medium leading-snug break-words">
+            {item.title_preview}
+          </div>
+
+          {item.last_error && (
+            <div className="text-[10.5px] text-rose-300 bg-rose-950/40 rounded px-2 py-1">
+              خطا (تلاش {item.attempts}): {item.last_error}
+            </div>
+          )}
+        </div>
+
+        <div className="flex items-center gap-1 shrink-0 pt-0.5">
+          {idx > 0 && (
+            <>
+              <button
+                type="button"
+                disabled={isProcessingQueue}
+                onClick={() => onReorderItem(item.id, "TOP")}
+                title="انتقال به ابتدای صف"
+                className="p-1 rounded bg-white/[0.06] hover:bg-white/[0.14] text-white/65 disabled:opacity-40"
+              >
+                <ArrowUpToLine className="w-3 h-3" />
+              </button>
+              <button
+                type="button"
+                disabled={isProcessingQueue}
+                onClick={() => onReorderItem(item.id, "UP")}
+                title="اولویت بالاتر"
+                className="p-1 rounded bg-white/[0.06] hover:bg-white/[0.14] text-white/65 disabled:opacity-40"
+              >
+                <ArrowUp className="w-3 h-3" />
+              </button>
+            </>
+          )}
+          {idx < listLen - 1 && (
+            <button
+              type="button"
+              disabled={isProcessingQueue}
+              onClick={() => onReorderItem(item.id, "DOWN")}
+              title="اولویت پایین‌تر"
+              className="p-1 rounded bg-white/[0.06] hover:bg-white/[0.14] text-white/65 disabled:opacity-40"
+            >
+              <ArrowDown className="w-3 h-3" />
+            </button>
+          )}
+          <button
+            type="button"
+            disabled={isProcessingQueue}
+            onClick={() => onProcessSingleItem(item.id)}
+            title="پردازش تکی همین مورد"
+            className="px-2 py-1 rounded bg-blue-600/80 hover:bg-blue-500 text-white text-[10px] font-semibold flex items-center gap-1 disabled:opacity-40"
+          >
+            {isProcessingThis ? <Loader2 className="w-3 h-3 animate-spin" /> : <Play className="w-3 h-3" />}
+            <span>ارسال</span>
+          </button>
+          <button
+            type="button"
+            disabled={isProcessingThis}
+            onClick={() => onDismissItem(item.id)}
+            title="حذف از صف"
+            className="p-1 rounded bg-rose-500/15 hover:bg-rose-500/30 text-rose-300 disabled:opacity-40"
+          >
+            <Trash2 className="w-3 h-3" />
+          </button>
+        </div>
+      </div>
+    );
+  };
 
   return (
-    <div className="mab-card border-amber-500/30 bg-mab-surface p-3 sm:p-3.5 space-y-2.5 shrink-0 shadow-sm select-text">
-      <div className="flex items-center justify-between gap-2.5 flex-wrap">
-        <div className="flex items-center gap-2.5 min-w-0 flex-1">
-          <div className="w-8 h-8 rounded-lg bg-amber-500/15 border border-amber-500/30 text-amber-400 flex items-center justify-center shrink-0">
-            {isProcessingQueue ? (
-              <RefreshCw className="w-4 h-4 animate-spin" />
-            ) : (
-              <Clock className="w-4 h-4" />
+    <div className="rounded-2xl border border-white/[0.09] bg-[#151720] shadow-lg overflow-hidden">
+      {/* Summary Header Bar */}
+      <div className="px-3 py-2 flex items-center justify-between gap-2 flex-wrap">
+        <button
+          type="button"
+          onClick={() => setExpanded((v) => !v)}
+          className="flex items-center gap-2 text-right min-w-0 flex-1"
+        >
+          {isProcessingQueue ? (
+            <Loader2 className="w-4 h-4 text-blue-400 animate-spin shrink-0" />
+          ) : isConnected ? (
+            <Wifi className="w-4 h-4 text-emerald-400 shrink-0" />
+          ) : (
+            <WifiOff className="w-4 h-4 text-amber-400 shrink-0" />
+          )}
+
+          <div className="flex items-center gap-1.5 flex-wrap text-[11.5px]">
+            <span className="font-bold text-white">صف پردازش ({queue.length})</span>
+            {userCommands.length > 0 && (
+              <span className="px-2 py-0.5 rounded-full bg-indigo-500/20 border border-indigo-400/30 text-indigo-200 text-[10px] font-semibold">
+                دستور مستقل: {userCommands.length}
+              </span>
+            )}
+            {backgroundItems.length > 0 && (
+              <span className="px-2 py-0.5 rounded-full bg-amber-500/15 border border-amber-400/30 text-amber-200 text-[10px] font-semibold flex items-center gap-1">
+                <Package className="w-3 h-3" />
+                <span>زمینه (پک ۲۰تایی): {backgroundItems.length}</span>
+              </span>
+            )}
+            {failedCount > 0 && (
+              <span className="px-2 py-0.5 rounded-full bg-rose-500/20 text-rose-200 text-[10px]">
+                خطا: {failedCount}
+              </span>
+            )}
+            {activeItem && (
+              <span className="text-[10.5px] text-blue-300 truncate max-w-[200px]">
+                در حال پردازش: {activeItem.title_preview}
+              </span>
+            )}
+            {!isConnected && cooldownSecondsLeft > 0 && (
+              <span className="inline-flex items-center gap-1 text-[10px] text-amber-300 font-mono">
+                <Clock3 className="w-3 h-3" />
+                {cooldownSecondsLeft}s
+              </span>
             )}
           </div>
 
-          <div className="min-w-0">
-            <div className="flex items-center gap-2 flex-wrap">
-              <span className="text-[12.5px] font-bold text-white">
-                صف پردازش ورودی‌ها: {queue.length} مورد
-              </span>
+          {expanded ? (
+            <ChevronUp className="w-4 h-4 text-white/50 shrink-0" />
+          ) : (
+            <ChevronDown className="w-4 h-4 text-white/50 shrink-0" />
+          )}
+        </button>
 
-              <span
-                className={`px-2 py-0.5 rounded-full text-[10.5px] font-medium inline-flex items-center gap-1 border ${
-                  isCheckingConnection
-                    ? "bg-white/[0.04] border-mab-border text-white/50"
-                    : isConnected
-                    ? "bg-emerald-500/15 border-emerald-500/30 text-emerald-300"
-                    : "bg-rose-500/15 border-rose-500/30 text-rose-300"
-                }`}
-              >
-                {isCheckingConnection ? (
-                  <RefreshCw className="w-3 h-3 animate-spin" />
-                ) : isConnected ? (
-                  <Wifi className="w-3 h-3" />
-                ) : (
-                  <WifiOff className="w-3 h-3" />
-                )}
-                <span>
-                  {isCheckingConnection
-                    ? "تست اتصال..."
-                    : isConnected
-                    ? `متصل (${connectionStatus?.provider})`
-                    : "مدل آفلاین"}
-                </span>
-              </span>
-
-              {hasManualOrder && (
-                <span className="px-2 py-0.5 rounded-full bg-purple-500/15 border border-purple-500/30 text-purple-300 text-[10px] font-medium">
-                  اولویت دستی
-                </span>
-              )}
-            </div>
-
-            <p className="text-[11.5px] text-mab-text-muted truncate mt-0.5">
-              {activeProcessingItem
-                ? `در حال تحلیل توسط مدل: ${activeProcessingItem.title_preview}`
-                : cooldownSecondsLeft > 0
-                ? `تلاش مجدد تا ${cooldownSecondsLeft} ثانیه دیگر (یا دکمه ارسال فوری را بزنید)`
-                : isConnected
-                ? autoQueueEnabled
-                  ? "اتصال برقرار است؛ موارد یکی‌یکی به ترتیب زمان ایجاد (و اولویت دستی) ارسال می‌شوند."
-                  : "پردازش خودکار صف متوقف شده است (می‌توانید اولویت را تغییر دهید یا دستی اجرا کنید)."
-                : connectionStatus?.message ||
-                  "به محض برقراری اتصال، موارد ذخیره‌شده یکی‌یکی به ترتیب زمان ایجاد تحلیل خواهند شد."}
-            </p>
-          </div>
-        </div>
-
-        <div className="flex items-center gap-1.5 shrink-0 flex-wrap">
-          <button
-            type="button"
-            onClick={onRecheckConnection}
-            disabled={isCheckingConnection || isProcessingQueue}
-            className="px-2.5 py-1 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] border border-mab-border text-white/70 hover:text-white text-[11px] font-medium inline-flex items-center gap-1 transition disabled:opacity-50"
-          >
-            <RefreshCw
-              className={`w-3 h-3 ${isCheckingConnection ? "animate-spin" : ""}`}
-            />
-            <span className="hidden sm:inline">تست اتصال</span>
-          </button>
-
+        {/* Action Controls */}
+        <div className="flex items-center gap-1.5 flex-wrap shrink-0">
           <button
             type="button"
             onClick={() => onToggleAutoQueue(!autoQueueEnabled)}
-            className={`px-2.5 py-1 rounded-lg border text-[11px] font-semibold inline-flex items-center gap-1 transition ${
+            className={`px-2 py-1 rounded-lg text-[10.5px] border transition ${
               autoQueueEnabled
-                ? "bg-emerald-500/15 border-emerald-500/30 text-emerald-300 hover:bg-emerald-500/25"
-                : "bg-amber-500/15 border-amber-500/35 text-amber-300 hover:bg-amber-500/25"
+                ? "bg-emerald-500/15 border-emerald-400/35 text-emerald-200"
+                : "bg-white/[0.05] border-white/10 text-white/55"
             }`}
-            title={
-              autoQueueEnabled
-                ? "توقف موقت پردازش خودکار صف"
-                : "ادامه پردازش خودکار صف"
-            }
+            title="پردازش خودکار صف هنگام اتصال مدل"
           >
-            {autoQueueEnabled ? (
-              <PauseCircle className="w-3 h-3" />
-            ) : (
-              <Play className="w-3 h-3" />
-            )}
-            <span>{autoQueueEnabled ? "توقف صف" : "ادامه صف"}</span>
+            {autoQueueEnabled ? "خودکار: روشن" : "خودکار: خاموش"}
           </button>
+
+          {backgroundItems.length > 0 && (
+            <button
+              type="button"
+              disabled={isProcessingQueue}
+              onClick={onProcessBackgroundBatch}
+              title="بسته‌بندی تا ۲۰ مورد زمینه با متادیتا و پردازش همه در یک نوبت مدل"
+              className="px-2.5 py-1 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 border border-amber-400/35 text-amber-100 text-[10.5px] font-semibold flex items-center gap-1 disabled:opacity-40"
+            >
+              <Package className="w-3 h-3" />
+              <span>پک و پردازش زمینه ({Math.min(20, backgroundItems.length)})</span>
+            </button>
+          )}
 
           <button
             type="button"
-            onClick={onProcessNowAll}
             disabled={isProcessingQueue}
-            className="px-3 py-1 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-[11px] font-semibold inline-flex items-center gap-1.5 shadow-sm transition disabled:opacity-50"
+            onClick={onProcessNowAll}
+            className="px-2.5 py-1 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-[10.5px] font-semibold flex items-center gap-1 disabled:opacity-40"
           >
-            <Play className="w-3 h-3" />
-            <span>{isProcessingQueue ? "در حال ارسال..." : "پردازش صف الان"}</span>
+            {isProcessingQueue ? <Loader2 className="w-3 h-3 animate-spin" /> : <Zap className="w-3 h-3" />}
+            <span>اجرای کامل صف</span>
           </button>
 
           <button
             type="button"
-            onClick={() => setIsExpanded((v) => !v)}
-            className="px-2 py-1 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] border border-mab-border text-white/75 hover:text-white text-[11px] inline-flex items-center gap-1 transition"
-            title={isExpanded ? "بستن لیست صف" : "مشاهده و اولویت‌بندی صف"}
+            disabled={isCheckingConnection}
+            onClick={onRecheckConnection}
+            title="بررسی مجدد اتصال مدل"
+            className="p-1.5 rounded-lg bg-white/[0.06] hover:bg-white/[0.12] text-white/70"
           >
-            <span className="hidden md:inline">
-              {isExpanded ? "بستن لیست" : "اولویت‌بندی"}
-            </span>
-            {isExpanded ? (
-              <ChevronUp className="w-3.5 h-3.5" />
-            ) : (
-              <ChevronDown className="w-3.5 h-3.5" />
-            )}
+            <RefreshCw className={`w-3.5 h-3.5 ${isCheckingConnection ? "animate-spin" : ""}`} />
           </button>
         </div>
       </div>
 
-      {isExpanded && (
-        <div className="pt-2 border-t border-mab-border space-y-2 max-h-64 overflow-y-auto">
-          <div className="flex items-center justify-between gap-2 px-1 flex-wrap text-[11px] text-mab-text-muted">
-            <span>
-              ترتیب پیش‌فرض: <strong className="text-white/80">قدیمی‌ترین زمان ایجاد ← جدیدترین</strong> (با دکمه‌های فلش می‌توانید اولویت را تغییر دهید)
-            </span>
-            {hasManualOrder && (
-              <button
-                type="button"
-                disabled={isProcessingQueue}
-                onClick={onResetQueueOrder}
-                className="px-2 py-0.5 rounded-md bg-white/[0.04] hover:bg-white/[0.08] border border-mab-border text-white/75 hover:text-white inline-flex items-center gap-1 transition disabled:opacity-40"
-              >
-                <RotateCcw className="w-3 h-3" />
-                <span>بازنشانی به ترتیب زمانی</span>
-              </button>
-            )}
-          </div>
-
-          {queue.map((item, idx) => {
-            const isItemBusy = processingQueueId === item.id;
-            const isFirst = idx === 0;
-            const isLast = idx === queue.length - 1;
-
-            return (
-              <div
-                key={item.id}
-                className={`p-2.5 rounded-xl border flex items-center justify-between gap-2.5 flex-wrap sm:flex-nowrap transition ${
-                  isItemBusy
-                    ? "bg-blue-500/[0.08] border-blue-500/35"
-                    : "bg-white/[0.02] border-mab-border"
-                }`}
-              >
-                <div className="min-w-0 flex-1 space-y-0.5">
-                  <div className="flex items-center gap-1.5 flex-wrap text-[11.5px]">
-                    <span className="font-mono px-1.5 py-0.2 rounded bg-white/[0.06] text-blue-400 font-bold text-[10.5px]">
-                      #{idx + 1}
-                    </span>
-                    <span
-                      className={`px-1.5 py-0.2 rounded font-mono text-[10px] ${
-                        item.source_type === "MAB_FOCUS_SYNC"
-                          ? "bg-cyan-500/15 text-cyan-300"
-                          : item.channel === "VAULT"
-                          ? "bg-purple-500/15 text-purple-300"
-                          : "bg-blue-500/15 text-blue-300"
-                      }`}
-                    >
-                      {item.source_type === "MAB_FOCUS_SYNC"
-                        ? "Mab-Focus"
-                        : item.channel === "VAULT"
-                        ? "سند/دانش"
-                        : "همیار"}
-                    </span>
-                    <span className="font-medium text-white truncate max-w-[300px] sm:max-w-[380px]">
-                      {item.title_preview}
-                    </span>
-                  </div>
-
-                  <div className="flex items-center gap-2 text-[10.5px] text-mab-text-muted flex-wrap">
-                    <span className="font-timer">
-                      زمان ایجاد: {formatShortTime(item.created_at)}
-                    </span>
-                    {item.last_error && (
-                      <span className="text-rose-400 inline-flex items-center gap-1 truncate max-w-[320px]">
-                        <AlertCircle className="w-3 h-3 shrink-0" />
-                        <span className="truncate">{item.last_error}</span>
-                      </span>
-                    )}
-                  </div>
-                </div>
-
-                <div className="flex items-center gap-1 shrink-0 flex-wrap">
-                  {/* Reorder Buttons */}
-                  {queue.length > 1 && (
-                    <div className="flex items-center gap-0.5 bg-white/[0.03] border border-mab-border rounded-lg p-0.5 ml-1">
-                      <button
-                        type="button"
-                        disabled={isFirst || isProcessingQueue}
-                        onClick={() => onReorderItem(item.id, "TOP")}
-                        title="انتقال به اولویت اول صف"
-                        className="p-1 rounded hover:bg-white/[0.08] text-white/65 hover:text-amber-300 disabled:opacity-25 transition"
-                      >
-                        <ArrowUpToLine className="w-3 h-3" />
-                      </button>
-                      <button
-                        type="button"
-                        disabled={isFirst || isProcessingQueue}
-                        onClick={() => onReorderItem(item.id, "UP")}
-                        title="یک رتبه بالاتر"
-                        className="p-1 rounded hover:bg-white/[0.08] text-white/65 hover:text-white disabled:opacity-25 transition"
-                      >
-                        <ArrowUp className="w-3 h-3" />
-                      </button>
-                      <button
-                        type="button"
-                        disabled={isLast || isProcessingQueue}
-                        onClick={() => onReorderItem(item.id, "DOWN")}
-                        title="یک رتبه پایین‌تر"
-                        className="p-1 rounded hover:bg-white/[0.08] text-white/65 hover:text-white disabled:opacity-25 transition"
-                      >
-                        <ArrowDown className="w-3 h-3" />
-                      </button>
-                    </div>
-                  )}
-
-                  <button
-                    type="button"
-                    disabled={isProcessingQueue}
-                    onClick={() => onProcessSingleItem(item.id)}
-                    className="px-2.5 py-1 rounded-lg bg-blue-500/15 hover:bg-blue-500/25 border border-blue-500/30 text-blue-300 text-[11px] font-medium inline-flex items-center gap-1 transition disabled:opacity-50"
-                  >
-                    <RefreshCw
-                      className={`w-3 h-3 ${isItemBusy ? "animate-spin" : ""}`}
-                    />
-                    <span>{isItemBusy ? "در حال تحلیل..." : "تحلیل الان"}</span>
-                  </button>
-
-                  <button
-                    type="button"
-                    disabled={isItemBusy}
-                    onClick={() => onDismissItem(item.id)}
-                    title="حذف از صف انتظار"
-                    className="p-1 rounded-lg bg-white/[0.03] hover:bg-rose-500/15 text-white/50 hover:text-rose-400 transition disabled:opacity-50"
-                  >
-                    <Trash2 className="w-3.5 h-3.5" />
-                  </button>
-                </div>
-              </div>
-            );
-          })}
-
+      {/* Expanded Two-Track View */}
+      {expanded && (
+        <div className="px-3 pb-3 pt-2 border-t border-white/[0.07] space-y-3 max-h-80 overflow-y-auto">
           {!isConnected && (
-            <div className="flex items-center justify-between gap-2 px-1 pt-1 text-[11px] text-mab-text-muted flex-wrap">
-              <span>جهت استفاده از مدل دیگر، تنظیمات را باز کنید:</span>
+            <div className="px-3 py-2 rounded-xl bg-amber-500/10 border border-amber-500/30 flex items-center justify-between gap-2 text-[11px] text-amber-200">
+              <span>{connectionStatus?.message || "اتصال به مدل برقرار نیست."}</span>
               <button
                 type="button"
                 onClick={onOpenSettings}
-                className="text-blue-400 font-semibold hover:underline"
+                className="px-2 py-1 rounded bg-amber-500/20 hover:bg-amber-500/30 text-amber-100 font-semibold"
               >
-                تنظیمات مدل هوش مصنوعی
+                تنظیمات مدل
               </button>
             </div>
           )}
+
+          {/* Track 1: Independent User Commands */}
+          <div className="space-y-1.5">
+            <div className="flex items-center justify-between text-[11px]">
+              <span className="font-bold text-indigo-300 flex items-center gap-1.5">
+                <Sparkles className="w-3.5 h-3.5" />
+                <span>مسیر ۱: دستورات مستقیم من ({userCommands.length}) — پردازش مستقل و اولویت‌دار</span>
+              </span>
+              {userCommands.length > 1 && (
+                <button
+                  type="button"
+                  onClick={onResetQueueOrder}
+                  className="text-[10px] text-white/55 hover:text-white flex items-center gap-1"
+                >
+                  <RotateCcw className="w-3 h-3" />
+                  <span>ترتیب زمانی</span>
+                </button>
+              )}
+            </div>
+            {userCommands.length === 0 ? (
+              <div className="text-[11px] text-white/40 px-2">دستور مستقیم منتظری در صف نیست.</div>
+            ) : (
+              <div className="space-y-1.5">
+                {userCommands.map((item, idx) => renderQueueRow(item, idx, userCommands.length, true))}
+              </div>
+            )}
+          </div>
+
+          {/* Track 2: Packed Background Items */}
+          <div className="space-y-1.5 pt-2 border-t border-white/[0.06]">
+            <div className="flex items-center justify-between gap-2 flex-wrap text-[11px]">
+              <span className="font-bold text-amber-300 flex items-center gap-1.5">
+                <Layers className="w-3.5 h-3.5" />
+                <span>
+                  مسیر ۲: پردازش زمینه ({backgroundItems.length}) — پک‌بندی تا ۲۰ مورد همراه با متادیتا در یک درخواست
+                </span>
+              </span>
+            </div>
+            {backgroundItems.length === 0 ? (
+              <div className="text-[11px] text-white/40 px-2">مورد زمینه‌ای در صف نیست.</div>
+            ) : (
+              <div className="space-y-1.5">
+                {backgroundItems.map((item, idx) =>
+                  renderQueueRow(item, idx, backgroundItems.length, false)
+                )}
+              </div>
+            )}
+          </div>
         </div>
       )}
     </div>
   );
 }
-
-export default PendingQueueBanner;

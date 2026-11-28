@@ -54,6 +54,7 @@ pub fn create_test_db() -> Connection {
     // Apply base and v3 schema
     apply_base_schema(&conn).expect("Failed to apply base schema");
     ensure_v3_schema_and_seeds(&conn).expect("Failed to ensure v3 schema and seeds");
+    let _ = mab_compass_lib::db::queries::ensure_calendar_events_schema(&conn);
     seed_default_projects(&conn).expect("Failed to seed default projects");
 
     conn
@@ -90,6 +91,7 @@ impl TestContext {
         // Apply base and v3 schema
         apply_base_schema(&conn).expect("Failed to apply base schema");
         ensure_v3_schema_and_seeds(&conn).expect("Failed to ensure v3 schema and seeds");
+        let _ = mab_compass_lib::db::queries::ensure_calendar_events_schema(&conn);
         seed_default_projects(&conn).expect("Failed to seed default projects");
 
         Self {

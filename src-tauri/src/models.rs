@@ -351,6 +351,10 @@ pub struct WorkEntity {
     pub due_date: Option<String>,
     #[serde(default = "default_priority_score")]
     pub priority_score: i32,
+    #[serde(default)]
+    pub calendar_event_id: Option<String>,
+    #[serde(default)]
+    pub calendar_event_title: Option<String>,
 }
 
 impl Default for WorkEntity {
@@ -387,6 +391,8 @@ impl Default for WorkEntity {
             scheduled_slot: None,
             due_date: None,
             priority_score: 50,
+            calendar_event_id: None,
+            calendar_event_title: None,
         }
     }
 }
@@ -658,6 +664,10 @@ pub struct DashboardState {
     pub portfolio_projects: Vec<ProjectPathSummary>,
     #[serde(default)]
     pub cross_project_priorities: Vec<WorkEntity>,
+    #[serde(default)]
+    pub calendar_events: Vec<CalendarEvent>,
+    #[serde(default)]
+    pub calendar_scheduled_tasks: Vec<WorkEntity>,
 }
 
 fn default_bpmn_element_type() -> String {
@@ -898,7 +908,48 @@ pub struct CalendarDay {
     pub updated_at: String,
 }
 
-// 5. PendingProposal
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CalendarEvent {
+    pub id: String, // EVT-XXXX
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub project_name: Option<String>,
+    pub title: String,
+    #[serde(default = "default_event_type")]
+    pub event_type: String, // "MEETING" | "DEADLINE" | "MILESTONE" | "FOCUS_BLOCK" | "REMINDER"
+    pub event_date: String, // YYYY-MM-DD
+    #[serde(default)]
+    pub start_time: String, // HH:MM
+    #[serde(default)]
+    pub end_time: String, // HH:MM
+    #[serde(default)]
+    pub location_or_link: String,
+    #[serde(default)]
+    pub notes: String,
+    #[serde(default = "default_event_status")]
+    pub status: String, // "UPCOMING" | "DONE" | "CANCELLED"
+    #[serde(default = "default_color_hex")]
+    pub color_hex: String,
+    #[serde(default)]
+    pub linked_tasks_count: i32,
+    #[serde(default)]
+    pub linked_completed_count: i32,
+    #[serde(default)]
+    pub linked_tasks: Vec<WorkEntity>,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub updated_at: String,
+}
+
+fn default_event_type() -> String {
+    "MEETING".to_string()
+}
+
+fn default_event_status() -> String {
+    "UPCOMING".to_string()
+}
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PendingProposal {
     pub id: String, // PRP-XXXX
@@ -979,6 +1030,8 @@ pub struct PendingQueueItem {
     pub raw_event_id: Option<i64>,
     pub title_preview: String,
     pub source_type: String,
+    #[serde(default)]
+    pub queue_kind: String, // "USER_COMMAND" | "BACKGROUND"
     pub archived_path: Option<String>,
     pub status: String, // "PENDING" | "PROCESSING" | "DONE" | "DISMISSED"
     pub attempts: i32,
@@ -1001,6 +1054,14 @@ pub struct LlmConnectionStatus {
 pub struct PendingQueueProcessOutcome {
     pub dashboard: DashboardState,
     pub processed: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingBatchProcessOutcome {
+    pub dashboard: DashboardState,
+    pub processed_count: i32,
+    pub processed_ids: Vec<i64>,
     pub error: Option<String>,
 }
 
@@ -1170,6 +1231,8 @@ pub struct AtomicMutation {
     pub due_date: Option<String>,
     #[serde(default, deserialize_with = "deserialize_opt_i32_lenient")]
     pub priority_score: Option<i32>,
+    #[serde(default, deserialize_with = "deserialize_opt_string_lenient")]
+    pub calendar_event_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

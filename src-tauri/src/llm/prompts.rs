@@ -211,6 +211,76 @@ pub fn build_cross_project_portfolio_snapshot(conn: &Connection) -> String {
         }
     }
 
+    // Upcoming calendar events & linked tasks
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT id, project_id, title, event_type, event_date, COALESCE(start_time, ''), COALESCE(end_time, ''), status
+         FROM calendar_events
+         WHERE status = 'UPCOMING'
+         ORDER BY event_date ASC, start_time ASC, id ASC
+         LIMIT 12",
+    ) {
+        if let Ok(rows) = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, String>(6)?,
+                r.get::<_, String>(7)?,
+            ))
+        }) {
+            let events: Vec<_> = rows.filter_map(|r| r.ok()).collect();
+            if !events.is_empty() {
+                out.push_str("\n### UPCOMING CALENDAR EVENTS & LINKED TASKS:\n");
+                for (eid, pid, title, etype, edate, stime, etime, _st) in events {
+                    let time_str = match (stime.trim().is_empty(), etime.trim().is_empty()) {
+                        (false, false) => format!(" {}-{}", stime.trim(), etime.trim()),
+                        (false, true) => format!(" {}", stime.trim()),
+                        _ => String::new(),
+                    };
+                    let mut total_linked = 0usize;
+                    let mut closed_linked = 0usize;
+                    let mut task_notes: Vec<String> = Vec::new();
+                    if let Ok(mut tstmt) = conn.prepare(
+                        "SELECT id, title, status, project_id FROM work_entities
+                         WHERE calendar_event_id = ?1 AND entity_type = 'TASK'
+                         ORDER BY priority_score DESC, updated_at DESC LIMIT 20",
+                    ) {
+                        if let Ok(trows) = tstmt.query_map(params![&eid], |r| {
+                            Ok((
+                                r.get::<_, String>(0)?,
+                                r.get::<_, String>(1)?,
+                                r.get::<_, String>(2)?,
+                                r.get::<_, String>(3)?,
+                            ))
+                        }) {
+                            for (tid, ttitle, tstatus, tpid) in trows.filter_map(|x| x.ok()) {
+                                total_linked += 1;
+                                if tstatus == "CLOSED" {
+                                    closed_linked += 1;
+                                }
+                                if task_notes.len() < 12 {
+                                    task_notes.push(format!("[{} | {} | {}]: {}", tid, tpid, tstatus, ttitle));
+                                }
+                            }
+                        }
+                    }
+                    out.push_str(&format!(
+                        "- event_id=\"{}\" | date=\"{}{}\" | type=\"{}\" | project=\"{}\" | title=\"{}\" | linked={}/{} done\n",
+                        eid, edate, time_str, etype, pid, title, closed_linked, total_linked
+                    ));
+                    if !task_notes.is_empty() {
+                        out.push_str("  linked_tasks: ");
+                        out.push_str(&task_notes.join(" ; "));
+                        out.push('\n');
+                    }
+                }
+            }
+        }
+    }
+
     out.push_str("\n### PER-PROJECT PATH AHEAD:\n");
     for s in &summaries {
         let active_tag = if s.project.is_active { " *VIEWED*" } else { "" };
@@ -473,22 +543,26 @@ YOU HAVE NATIVE MCP TOOLS TO READ & UPDATE THE FULL ECOSYSTEM DIRECTLY:
 1. Cross-Project Portfolio & Path Ahead Prioritization (لایه فراپروژه‌ای):
    - `get_all_projects_path_ahead`: Inspect Path Ahead (`#1 next_step`, `horizon_tasks`, `blockers`, `work_lines`) across ALL active/paused projects + Outcomes + Today's Calendar capacity + global prioritized queue!
    - `prioritize_across_projects`: Batch-prioritize (`priority_score` 0..100, `is_on_critical_path`, `make_next_step`, `status`, `scheduled_date`, `scheduled_slot`) tasks across MULTIPLE projects atomically in one call!
-2. Methods, Playbooks & BPMN 2.0 Workflows (دستورالعمل و متد انجام کار):
-   - `upsert_method_playbook`: WHENEVER you detect a repeatable work pattern, procedure, workflow, or method in a work report, incremental messages, or document — OR whenever the user explicitly asks for a method/playbook/workflow — call `upsert_method_playbook`!
+2. Instructions, Methods, Playbooks & Process Diagrams / BPMN 2.0 (ترسیم دیاگرام و نقشه فرآیند دستورالعمل‌ها):
+   - Use **`draw_instruction_diagram_or_bpmn`** (or `upsert_method_playbook`) BOTH whenever the user asks to draw a diagram / flowchart / BPMN AND whenever you judge on your own (به صلاح‌دید مدل) that documenting an instruction or how-to-work procedure (`روش انجام کار` / `دستورالعمل`) has steps, roles, decisions, or stages that should be visualized as a process diagram!
    - If a similar method ALREADY exists in `EXISTING METHODS & PLAYBOOKS`, pass its `method_id` (or matching title) so it automatically enriches & bumps version (`v1 -> v2`) instead of duplicating!
-   - Include Persian `title`, `summary`, `objective` (هدف), `prerequisites` (پیش‌نیازها), ordered `steps` (with `element_type`: `task`/`userTask`/`serviceTask`/`subProcess`/`exclusiveGateway`/`parallelGateway`, `role`, `inputs`, `outputs`, `checklist`, `notes`), overall `checklist`, and `notes_markdown`.
+   - Include Persian `title`, `summary`, `objective` (هدف), `prerequisites` (پیش‌نیازها), ordered `steps` (with `element_type`: `task`/`userTask`/`serviceTask`/`subProcess`/`exclusiveGateway`/`parallelGateway`, optional `condition_label`, `role`, `inputs`, `outputs`, `checklist`, `notes`), overall `checklist`, and `notes_markdown`.
    - For composite stages/groups of tasks, set `element_type: "subProcess"` and populate `sub_steps` so the user can visually click and drill down into the internal BPMN 2.0 sub-workflow!
-   - Files are automatically written to `04_methods_playbooks/` (.md + .bpmn) and displayed as clickable Artifact Cards beneath your chat reply.
+   - Files are automatically written to `04_methods_playbooks/` (.md + .bpmn) and rendered visually inside the app & chat artifact cards.
 3. Strategic Domains & Outcomes:
    - `upsert_domain_or_outcome`: Create or update Outcomes (`OUT-xxxx`) linked to CADM life domains (`MIND_LEARNING`, `HEALTH_ENERGY`, `WEALTH_FINANCE`, `RELATIONS`, `RESILIENCE`, `PURPOSE`, `SPIRITUALITY`, `SANCTUARY`).
 4. WorkLines (Sequential Chains & Goal Clusters):
    - `create_work_line_chain` & `append_or_reorder_work_line`: Group multi-step work into `SEQUENTIAL_CHAIN` or `GOAL_CLUSTER` WorkLines (`WLN-xxxx`).
 5. Tasks, Decisions & Blockers:
-   - `create_work_entity`, `update_work_entity`, `set_next_step`, `complete_task`, `delete_work_entity`, `schedule_task_on_calendar`.
-6. Atomic Knowledge Cards, Lessons Learned, Instructions & Guardrails:
+   - `create_work_entity`, `update_work_entity`, `set_next_step`, `complete_task`, `delete_work_entity`, `schedule_task_on_calendar` (supports `calendar_event_id`).
+6. Calendar Events & Task-Time Linking (تقویم و اتصال کارها به رویدادها):
+   - `list_calendar_events`: Read upcoming/past events (meetings, deadlines, milestones, focus blocks) and see all tasks linked to each event.
+   - `upsert_calendar_event`: Create or update a calendar event (e.g. "جلسه یکشنبه"), and in the SAME call pass `task_ids` (to link existing tasks across projects) and/or `new_tasks` (to create new tasks already linked to the event)!
+   - `link_tasks_to_calendar_event`: Attach or detach batches of existing tasks (`task_ids`, `unlink_task_ids`) to/from an event (`EVT-xxxx`) and align dates.
+7. Atomic Knowledge Cards, Lessons Learned, Instructions & Guardrails:
    - `save_personal_or_lesson_item`: Use `item_type`: `"MEMORY_CARD"`, `"LESSON"`, `"INSTRUCTION"`, `"NOTE"`.
    - `log_work_and_knowledge`: Record `LOG_WORK`, `UPSERT_SOP`, `REGISTER_ANTIPATTERN`, or `INGEST_NOTE`.
-7. Project Lifecycle & Memory Search:
+8. Project Lifecycle & Memory Search:
    - `propose_project_lifecycle`, `get_path_ahead`, `search_memory`, `sync_mab_focus`, `undo_last_change`.
 
 DOCUMENT & INPUT PROCESSING RULES:
@@ -536,6 +610,119 @@ LATEST USER INPUT / DOCUMENT:
         sops = sops_summary.join("\n"),
         docs = docs_summary.join("\n"),
         fts = fts_context.join("\n---\n"),
+    );
+
+    (system_prompt, user_prompt)
+}
+
+#[derive(Debug, Clone)]
+pub struct PackedBackgroundItemInput {
+    pub queue_id: i64,
+    pub project_id: String,
+    pub project_name: String,
+    pub source_type: String,
+    pub created_at: String,
+    pub knowledge_doc_id: Option<i64>,
+    pub title_preview: String,
+    pub content: String,
+}
+
+pub fn build_packed_background_batch_prompts(
+    scope_project_id: &str,
+    items: &[PackedBackgroundItemInput],
+    open_tasks: &[WorkEntity],
+    active_decisions: &[WorkEntity],
+    active_sops: &[SopRule],
+    existing_methods: &[MethodPlaybook],
+    all_projects: &[Project],
+    portfolio_snapshot: &str,
+) -> (String, String) {
+    let projects_catalog = format_projects_catalog(all_projects);
+    let tasks_compact: Vec<String> = open_tasks
+        .iter()
+        .take(30)
+        .map(|t| format!("[{}] ({} | {}) {}", t.id, t.category, t.status, t.title))
+        .collect();
+    let adrs_compact: Vec<String> = active_decisions
+        .iter()
+        .take(12)
+        .map(|d| format!("[{}] {}", d.id, d.title))
+        .collect();
+    let sops_summary: Vec<String> = active_sops
+        .iter()
+        .take(12)
+        .map(|s| format!("- [{}]: {}", s.category, s.rule_statement))
+        .collect();
+    let methods_summary = format_existing_methods_summary(existing_methods);
+    let portfolio_section = if portfolio_snapshot.trim().is_empty() {
+        String::new()
+    } else {
+        format!("\n{portfolio_snapshot}\n")
+    };
+
+    let packed_items_block = items
+        .iter()
+        .enumerate()
+        .map(|(idx, item)| {
+            let doc_label = item
+                .knowledge_doc_id
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "none".to_string());
+            let bounded_content: String = item.content.chars().take(4000).collect();
+            format!(
+                "### PACKED_ITEM #{num} | queue_id={qid} | project_id=\"{pid}\" ({pname}) | source_type={stype} | created_at={ts} | knowledge_doc_id={doc}\npreview: {preview}\ncontent:\n\"\"\"\n{body}\n\"\"\"",
+                num = idx + 1,
+                qid = item.queue_id,
+                pid = item.project_id,
+                pname = item.project_name,
+                stype = item.source_type,
+                ts = item.created_at,
+                doc = doc_label,
+                preview = item.title_preview,
+                body = bounded_content,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n---\n\n");
+
+    let count = items.len();
+    let system_prompt = format!(
+        r#"You are Mab-Compass v4.5's Batched Background Knowledge & Task Consolidator running on scope "{scope_project_id}".
+You are processing a PACKED BATCH of {count} background items (one-line progress notes synced from Mab-Focus or legacy archive items) in a SINGLE turn!
+
+BATCHED PROCESSING & CONSOLIDATION RULES:
+1. Inspect ALL {count} `PACKED_ITEM` blocks together along with their metadata (`project_id`, `source_type`, `created_at`, `knowledge_doc_id`).
+2. CONSOLIDATE, DO NOT SPAM:
+   - Many one-line items describe incremental steps on the SAME workflow, task, or project. Group related notes instead of creating dozens of tiny duplicate tasks!
+   - Always pass the right `project_id` on every MCP tool call matching the item's `project_id` (or target project if the text clearly belongs elsewhere).
+   - Check `CURRENT OPEN TASKS` and `PER-PROJECT PATH AHEAD` before creating anything: if a task already matches, update/complete it (`update_work_entity`, `complete_task`) instead of duplicating.
+   - Extract repeatable patterns, instructions, and workflows into visual Process Diagrams / BPMN 2.0 via `draw_instruction_diagram_or_bpmn` (or `upsert_method_playbook`) whenever warranted at your discretion — enriching existing `MTH-xxxx` when similar.
+   - Store concise reusable facts, insights, and instructions as `save_personal_or_lesson_item` (`MEMORY_CARD`, `LESSON`, `INSTRUCTION`, `NOTE`) or `log_work_and_knowledge` (`LOG_WORK`, `UPSERT_SOP`, `REGISTER_ANTIPATTERN`).
+   - If any item mentions a meeting, deadline, milestone, or date-bound event + deliverables, use `upsert_calendar_event` / `link_tasks_to_calendar_event`!
+3. After completing MCP calls, write ONE clean **Persian Markdown** batch consolidation report summarizing by project/theme what was recorded, updated, or skipped as already covered (referencing `#1..#{count}` / `queue_id` briefly)."#
+    );
+
+    let user_prompt = format!(
+        r#"AVAILABLE PROJECTS IN WORKSPACE:
+{projects_catalog}
+{portfolio_section}
+EXISTING METHODS & PLAYBOOKS (UPDATE/ENRICH BY method_id IF SIMILAR):
+{methods_summary}
+
+CURRENT OPEN TASKS IN ACTIVE PROJECT:
+{tasks}
+
+ACTIVE DECISIONS (ADRs):
+{adrs}
+
+ACTIVE SOP RULES:
+{sops}
+
+PACKED BACKGROUND ITEMS ({count} items with metadata):
+{packed_items_block}"#,
+        tasks = tasks_compact.join("\n"),
+        adrs = adrs_compact.join("\n"),
+        sops = sops_summary.join("\n"),
     );
 
     (system_prompt, user_prompt)

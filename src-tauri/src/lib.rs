@@ -2564,6 +2564,297 @@ async fn cmd_process_pending_queue_item(
     }
 }
 
+#[tauri::command]
+async fn cmd_process_pending_background_batch(
+    state: State<'_, AppState>,
+    batch_limit: Option<usize>,
+    queue_ids: Option<Vec<i64>>,
+) -> Result<PendingBatchProcessOutcome, String> {
+    let max_items = batch_limit.unwrap_or(20).clamp(1, 40);
+    let max_total_chars: usize = 36_000;
+
+    let read_archived = |path_str: &str| -> Option<String> {
+        let raw = fs::read_to_string(path_str).ok()?;
+        let normalized = path_str.replace('\\', "/");
+        let cleaned = if normalized.contains("/01_knowledge_archive/") {
+            strip_knowledge_archive_header(&raw)
+        } else {
+            strip_raw_input_frontmatter(&raw)
+        };
+        if cleaned.trim().is_empty() {
+            None
+        } else {
+            Some(cleaned)
+        }
+    };
+
+    let prep = {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        let all_queue = query_pending_ai_queue(&conn).map_err(|e| e.to_string())?;
+
+        let requested_id_set: Option<std::collections::HashSet<i64>> = queue_ids.map(|ids| ids.into_iter().collect());
+        let candidates: Vec<PendingQueueItem> = all_queue
+            .into_iter()
+            .filter(|q| q.status != "DONE" && q.status != "DISMISSED")
+            .filter(|q| {
+                if let Some(ref set) = requested_id_set {
+                    set.contains(&q.id)
+                } else {
+                    q.status == "PENDING" && q.queue_kind == "BACKGROUND"
+                }
+            })
+            .collect();
+
+        let mut selected: Vec<PendingQueueItem> = Vec::new();
+        let mut packed_inputs: Vec<PackedBackgroundItemInput> = Vec::new();
+        let mut prev_doc_statuses: Vec<(i64, bool, bool)> = Vec::new();
+        let mut total_chars: usize = 0;
+
+        for q in candidates {
+            if selected.len() >= max_items {
+                break;
+            }
+            let raw_row = q.raw_event_id.and_then(|eid| get_raw_event_content_by_id(&conn, eid));
+            let user_row = q.user_message_id.and_then(|uid| get_user_chat_message_by_id(&conn, uid));
+            let doc_row = q.knowledge_doc_id.and_then(|did| get_knowledge_document_by_id(&conn, did));
+
+            let recovered_text = q
+                .archived_path
+                .as_deref()
+                .and_then(read_archived)
+                .or_else(|| {
+                    user_row
+                        .as_ref()
+                        .and_then(|(_, arch)| arch.as_deref())
+                        .and_then(read_archived)
+                })
+                .or_else(|| raw_row.as_ref().map(|(_, c)| c.clone()).filter(|s| !s.trim().is_empty()))
+                .or_else(|| doc_row.as_ref().and_then(|d| read_archived(&d.archived_path)))
+                .or_else(|| {
+                    user_row
+                        .as_ref()
+                        .map(|(txt, _)| txt.clone())
+                        .filter(|s| !s.trim().is_empty())
+                })
+                .unwrap_or_else(|| q.title_preview.clone());
+
+            let item_len = recovered_text.chars().count().min(4000);
+            if !selected.is_empty() && total_chars + item_len > max_total_chars {
+                break;
+            }
+            total_chars += item_len;
+
+            let was_doc_processed = doc_row
+                .as_ref()
+                .map(|d| d.processing_status.eq_ignore_ascii_case("PROCESSED"))
+                .unwrap_or(false);
+            let is_legacy = q.source_type.starts_with("LEGACY_REPROCESS");
+            if let Some(doc_id) = q.knowledge_doc_id {
+                prev_doc_statuses.push((doc_id, was_doc_processed, is_legacy));
+                let _ = set_knowledge_doc_processing_status(&conn, doc_id, "PROCESSING", None, None, None);
+            }
+            let _ = set_pending_item_processing(&conn, q.id);
+
+            packed_inputs.push(PackedBackgroundItemInput {
+                queue_id: q.id,
+                project_id: q.project_id.clone(),
+                project_name: q.project_name.clone(),
+                source_type: q.source_type.clone(),
+                created_at: q.created_at.clone(),
+                knowledge_doc_id: q.knowledge_doc_id,
+                title_preview: q.title_preview.clone(),
+                content: recovered_text,
+            });
+            selected.push(q);
+        }
+
+        if selected.is_empty() {
+            let dash = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
+            return Ok(PendingBatchProcessOutcome {
+                dashboard: dash,
+                processed_count: 0,
+                processed_ids: Vec::new(),
+                error: None,
+            });
+        }
+
+        let dash = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
+        let portfolio_snapshot = build_cross_project_portfolio_snapshot(&conn);
+        (selected, packed_inputs, prev_doc_statuses, dash, portfolio_snapshot)
+    };
+
+    let (selected, packed_inputs, prev_doc_statuses, dash, portfolio_snapshot) = prep;
+    let selected_ids: Vec<i64> = selected.iter().map(|q| q.id).collect();
+    let batch_count = selected.len();
+
+    let (mcp_sys_prompt, mcp_user_prompt) = build_packed_background_batch_prompts(
+        &dash.active_project.id,
+        &packed_inputs,
+        &dash.open_tasks,
+        &dash.active_decisions,
+        &dash.active_sops,
+        &dash.methods_playbooks,
+        &dash.projects,
+        &portfolio_snapshot,
+    );
+
+    let primary_project_id = selected
+        .iter()
+        .find(|q| q.project_id != GLOBAL_CHAT_PROJECT_ID)
+        .map(|q| q.project_id.clone())
+        .unwrap_or_else(|| dash.active_project.id.clone());
+    let first_raw_event_id = selected.iter().find_map(|q| q.raw_event_id);
+    let llm_cfg = LlmConfig::from(&dash.settings);
+
+    match run_copilot_turn(
+        &state.db,
+        state.app_data_dir.clone(),
+        &llm_cfg,
+        &primary_project_id,
+        first_raw_event_id,
+        "BACKGROUND_BATCH",
+        &mcp_sys_prompt,
+        &mcp_user_prompt,
+        &mcp_user_prompt,
+    )
+    .await
+    {
+        Ok(turn) => {
+            let envelope = turn.envelope;
+            let mut conn = state.db.lock().map_err(|e| e.to_string())?;
+            let combined_text = packed_inputs
+                .iter()
+                .map(|p| format!("[{}] {}", p.project_name, p.title_preview))
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            let (env_badge, env_artifacts) = if !envelope.mutations.is_empty()
+                || !envelope.method_playbooks.is_empty()
+                || turn.mcp_ops_executed.is_empty()
+            {
+                apply_envelope_cross_project(
+                    &mut conn,
+                    &dash.projects,
+                    &primary_project_id,
+                    &dash.active_project.name,
+                    &combined_text,
+                    None,
+                    "BACKGROUND_BATCH",
+                    &envelope,
+                    first_raw_event_id,
+                )?
+            } else {
+                ("بدون تغییر گراف".to_string(), Vec::new())
+            };
+
+            let badge = format!(
+                "بسته {} موردی زمینه • {}",
+                batch_count,
+                format_turn_badge(&turn.mcp_ops_executed, &env_badge, &turn.transport_label)
+            );
+            let items_count = (envelope.mutations.len() + envelope.method_playbooks.len() + turn.mcp_ops_executed.len()) as i32;
+
+            for item in &selected {
+                let is_legacy = item.source_type.starts_with("LEGACY_REPROCESS");
+                if let Some(doc_id) = item.knowledge_doc_id {
+                    if is_legacy {
+                        let _ = set_knowledge_doc_processing_status(&conn, doc_id, "PROCESSED", None, None, None);
+                        let _ = method_engine::mark_legacy_reprocessed(
+                            &conn,
+                            "KNOWLEDGE_DOC",
+                            doc_id,
+                            &item.project_id,
+                            &badge,
+                        );
+                    } else {
+                        let summary = envelope
+                            .executive_doc_summary
+                            .clone()
+                            .filter(|s| !s.trim().is_empty())
+                            .unwrap_or_else(|| format!("پردازش تجمیعی در بسته {} موردی", batch_count));
+                        let _ = update_knowledge_doc_analysis(&conn, doc_id, &summary, items_count, None);
+                    }
+                } else if is_legacy {
+                    if let Some(eid) = item.raw_event_id {
+                        let _ = method_engine::mark_legacy_reprocessed(
+                            &conn,
+                            "RAW_EVENT",
+                            eid,
+                            &item.project_id,
+                            &badge,
+                        );
+                    }
+                }
+                if let Some(sys_id) = item.system_message_id {
+                    let _ = delete_system_chat_message(&conn, sys_id);
+                }
+                let _ = mark_pending_item_done(&conn, item.id);
+                if let Some(uid) = item.user_message_id {
+                    let _ = complete_pending_items_for_user_msg(&conn, uid, item.knowledge_doc_id);
+                }
+            }
+
+            let written_artifacts =
+                merge_written_artifacts(&turn.mcp_written_artifacts, &env_artifacts, Vec::new());
+
+            let chat_pid = if dash.active_chat_scope == "GLOBAL" {
+                GLOBAL_CHAT_PROJECT_ID.to_string()
+            } else {
+                dash.active_project.id.clone()
+            };
+            let _ = append_assistant_chat_message_with_artifacts(
+                &conn,
+                &chat_pid,
+                &dash.active_copilot_session_id,
+                "COPILOT",
+                "ASSISTANT",
+                &format!("📦 **گزارش پردازش بسته‌ای ({} مورد زمینه):**\n\n{}", batch_count, envelope.conversational_reply),
+                None,
+                &badge,
+                &envelope.clarifying_questions,
+                &written_artifacts,
+            );
+
+            let _ = sync_touched_project_projections(
+                &conn,
+                &dash,
+                &written_artifacts,
+                envelope.meeting_title.as_deref(),
+                envelope.meeting_summary_markdown.as_deref(),
+            );
+
+            let updated_dash = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
+            Ok(PendingBatchProcessOutcome {
+                dashboard: updated_dash,
+                processed_count: batch_count as i32,
+                processed_ids: selected_ids,
+                error: None,
+            })
+        }
+        Err(err) => {
+            let conn = state.db.lock().map_err(|e| e.to_string())?;
+            for item in &selected {
+                let _ = record_pending_item_failure(&conn, item.id, &err);
+            }
+            for (doc_id, was_processed, is_legacy) in prev_doc_statuses {
+                let restore_status = if is_legacy && was_processed {
+                    "PROCESSED"
+                } else {
+                    "FAILED"
+                };
+                let _ = set_knowledge_doc_processing_status(&conn, doc_id, restore_status, None, None, None);
+            }
+            let updated_dash = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
+            Ok(PendingBatchProcessOutcome {
+                dashboard: updated_dash,
+                processed_count: 0,
+                processed_ids: Vec::new(),
+                error: Some(err),
+            })
+        }
+    }
+}
+
 // ==============================================================================
 // TAURI IPC COMMANDS — SEQUENTIAL CHAIN & CONTEXT EXECUTION (v3.0 MILESTONE 2)
 // ==============================================================================
@@ -2898,6 +3189,107 @@ fn cmd_upsert_calendar_day(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn cmd_upsert_calendar_event(
+    state: State<'_, AppState>,
+    event_id: Option<String>,
+    project_id: Option<String>,
+    title: String,
+    event_type: String,
+    event_date: String,
+    start_time: Option<String>,
+    end_time: Option<String>,
+    location_or_link: Option<String>,
+    notes: Option<String>,
+    status: String,
+    color_hex: Option<String>,
+) -> Result<DashboardState, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    upsert_calendar_event(
+        &conn,
+        event_id.as_deref(),
+        project_id.as_deref(),
+        &title,
+        &event_type,
+        &event_date,
+        start_time.as_deref().unwrap_or(""),
+        end_time.as_deref().unwrap_or(""),
+        location_or_link.as_deref().unwrap_or(""),
+        notes.as_deref().unwrap_or(""),
+        &status,
+        color_hex.as_deref().unwrap_or("#6366f1"),
+    )
+    .map_err(|e| e.to_string())?;
+    get_dashboard_state(&conn).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn cmd_delete_calendar_event(
+    state: State<'_, AppState>,
+    event_id: String,
+) -> Result<DashboardState, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    delete_calendar_event(&conn, &event_id).map_err(|e| e.to_string())?;
+    get_dashboard_state(&conn).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn cmd_link_tasks_to_calendar_event(
+    state: State<'_, AppState>,
+    event_id: String,
+    task_ids: Vec<String>,
+    sync_date_to_event: bool,
+) -> Result<DashboardState, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    link_tasks_to_calendar_event(&conn, &event_id, &task_ids, sync_date_to_event)
+        .map_err(|e| e.to_string())?;
+    get_dashboard_state(&conn).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn cmd_unlink_task_from_calendar_event(
+    state: State<'_, AppState>,
+    task_id: String,
+) -> Result<DashboardState, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    unlink_task_from_calendar_event(&conn, &task_id).map_err(|e| e.to_string())?;
+    get_dashboard_state(&conn).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn cmd_create_task_for_calendar_event(
+    state: State<'_, AppState>,
+    project_id: String,
+    title: String,
+    category: String,
+    duration_minutes: i32,
+    scheduled_date: String,
+    calendar_event_id: String,
+) -> Result<DashboardState, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let task_id = create_task_manual(
+        &conn,
+        &project_id,
+        &title,
+        &category,
+        "",
+        "",
+        None,
+        None,
+        "MEDIUM_NORMAL",
+        "LAPTOP_ONLY",
+        duration_minutes,
+        Some(&scheduled_date),
+    )
+    .map_err(|e| e.to_string())?;
+    link_tasks_to_calendar_event(&conn, &calendar_event_id, &[task_id], true)
+        .map_err(|e| e.to_string())?;
+    let updated = get_dashboard_state(&conn).map_err(|e| e.to_string())?;
+    let _ = sync_all_project_projections(&updated, None, None);
+    Ok(updated)
+}
+
+#[tauri::command]
 fn cmd_advance_chain_step(
     state: State<'_, AppState>,
     project_id: String,
@@ -3010,6 +3402,123 @@ fn cmd_read_workspace_file(
     }
 
     fs::read_to_string(&canonical_req).map_err(|e| format!("خطا در خواندن فایل: {}", e))
+}
+
+#[tauri::command]
+fn cmd_read_knowledge_document_content(
+    state: State<'_, AppState>,
+    doc_id: i64,
+) -> Result<String, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let row: (String, String, String, String, String, String, String) = conn
+        .query_row(
+            "SELECT project_id, title, doc_type, original_filename, archived_path, executive_summary, processing_status
+             FROM knowledge_documents WHERE id = ?1",
+            rusqlite::params![doc_id],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                ))
+            },
+        )
+        .map_err(|e| format!("سند در دیتابیس یافت نشد: {}", e))?;
+
+    let (pid, title, doc_type, original_filename, archived_path, executive_summary, processing_status) = row;
+    let trimmed_arch = archived_path.trim();
+    if !trimmed_arch.is_empty() {
+        if let Ok(content) = fs::read_to_string(trimmed_arch) {
+            if !content.trim().is_empty() {
+                return Ok(content);
+            }
+        }
+    }
+
+    // Fallback to raw_events if archived file wasn't on disk or was relocated
+    let raw_fallback: Option<String> = if !trimmed_arch.is_empty() {
+        conn.query_row(
+            "SELECT raw_content FROM raw_events WHERE project_id = ?1 AND archived_path = ?2 ORDER BY id DESC LIMIT 1",
+            rusqlite::params![&pid, trimmed_arch],
+            |r| r.get(0),
+        )
+        .ok()
+    } else {
+        None
+    };
+
+    let mut md = format!(
+        "# {}\n\n> **دسته:** `{}` | **فایل اصلی:** `{}` | **وضعیت:** `{}`\n\n## خلاصه مدیریتی\n{}\n",
+        title,
+        doc_type,
+        original_filename,
+        processing_status,
+        if executive_summary.trim().is_empty() {
+            "*(خلاصه ثبت نشده است)*"
+        } else {
+            executive_summary.trim()
+        }
+    );
+    if let Some(raw_txt) = raw_fallback.filter(|s| !s.trim().is_empty()) {
+        md.push_str("\n---\n\n## محتوای کامل ورودی ثبت‌شده\n\n");
+        md.push_str(&raw_txt);
+    }
+    Ok(md)
+}
+
+#[tauri::command]
+fn cmd_read_raw_event_content(
+    state: State<'_, AppState>,
+    event_id: i64,
+) -> Result<String, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let (project_id, raw_content, archived_path, source_type, created_at): (
+        String,
+        String,
+        Option<String>,
+        String,
+        String,
+    ) = conn
+        .query_row(
+            "SELECT project_id, raw_content, archived_path, source_type, created_at
+             FROM raw_events WHERE id = ?1",
+            rusqlite::params![event_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2).ok(), r.get(3)?, r.get(4)?)),
+        )
+        .map_err(|e| format!("ورودی خام یافت نشد: {}", e))?;
+
+    let body = if !raw_content.trim().is_empty() {
+        raw_content
+    } else if let Some(ref ap) = archived_path {
+        fs::read_to_string(ap).unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    let proj_name: String = conn
+        .query_row(
+            "SELECT name FROM projects WHERE id = ?1",
+            rusqlite::params![&project_id],
+            |r| r.get(0),
+        )
+        .unwrap_or_else(|_| project_id.clone());
+
+    Ok(format!(
+        "# ورودی ثبت‌شده #{id}\n\n> **پروژه:** `{pname}` | **منبع:** `{src}` | **زمان:** `{ts}`\n\n{body}",
+        id = event_id,
+        pname = proj_name,
+        src = source_type,
+        ts = created_at,
+        body = if body.trim().is_empty() {
+            "*(متنی ثبت نشده است)*"
+        } else {
+            body.trim()
+        }
+    ))
 }
 
 #[tauri::command]
@@ -3135,6 +3644,7 @@ pub fn run() {
             cmd_scan_unprocessed_queue,
             cmd_dismiss_pending_queue_item,
             cmd_process_pending_queue_item,
+            cmd_process_pending_background_batch,
             cmd_reorder_pending_queue_item,
             cmd_reset_pending_queue_order,
             cmd_requeue_knowledge_doc,
@@ -3147,9 +3657,16 @@ pub fn run() {
             cmd_delete_personal_vault_item,
             cmd_resolve_pending_proposal,
             cmd_upsert_calendar_day,
+            cmd_upsert_calendar_event,
+            cmd_delete_calendar_event,
+            cmd_link_tasks_to_calendar_event,
+            cmd_unlink_task_from_calendar_event,
+            cmd_create_task_for_calendar_event,
             cmd_upsert_method_playbook,
             cmd_delete_method_playbook,
             cmd_read_workspace_file,
+            cmd_read_knowledge_document_content,
+            cmd_read_raw_event_content,
             cmd_list_legacy_reprocess_candidates,
             cmd_backup_database_now,
             cmd_enqueue_legacy_reprocess

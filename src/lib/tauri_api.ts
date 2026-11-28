@@ -99,6 +99,8 @@ export interface WorkEntity {
   scheduled_slot?: string | null;
   due_date?: string | null;
   priority_score: number;
+  calendar_event_id?: string | null;
+  calendar_event_title?: string | null;
 }
 
 export interface SopRule {
@@ -217,6 +219,26 @@ export interface CalendarDay {
   updated_at: string;
 }
 
+export interface CalendarEvent {
+  id: string;
+  project_id?: string | null;
+  project_name?: string | null;
+  title: string;
+  event_type: "MEETING" | "DEADLINE" | "MILESTONE" | "FOCUS_BLOCK" | "REMINDER" | string;
+  event_date: string;
+  start_time: string;
+  end_time: string;
+  location_or_link: string;
+  notes: string;
+  status: "UPCOMING" | "DONE" | "CANCELLED" | string;
+  color_hex: string;
+  linked_tasks_count: number;
+  linked_completed_count: number;
+  linked_tasks: WorkEntity[];
+  created_at: string;
+  updated_at: string;
+}
+
 export interface PendingProposal {
   id: string;
   project_id?: string | null;
@@ -270,6 +292,7 @@ export interface PendingQueueItem {
   raw_event_id?: number | null;
   title_preview: string;
   source_type: string;
+  queue_kind?: "USER_COMMAND" | "BACKGROUND" | string;
   archived_path?: string | null;
   status: string;
   attempts: number;
@@ -277,6 +300,13 @@ export interface PendingQueueItem {
   priority_order?: number;
   created_at: string;
   updated_at: string;
+}
+
+export interface PendingBatchProcessOutcome {
+  dashboard: DashboardState;
+  processed_count: number;
+  processed_ids: number[];
+  error?: string | null;
 }
 
 export interface LlmConnectionStatus {
@@ -464,6 +494,8 @@ export interface DashboardState {
   active_chat_scope?: string;
   portfolio_projects?: ProjectPathSummary[];
   cross_project_priorities?: WorkEntity[];
+  calendar_events?: CalendarEvent[];
+  calendar_scheduled_tasks?: WorkEntity[];
 }
 
 export interface CommittedChatTurn {
@@ -696,6 +728,11 @@ export const CompassApi = {
   scanUnprocessedQueue: () => invoke<DashboardState>("cmd_scan_unprocessed_queue"),
   processPendingQueueItem: (queueId: number) =>
     invoke<PendingQueueProcessOutcome>("cmd_process_pending_queue_item", { queueId }),
+  processPendingBackgroundBatch: (batchLimit?: number, queueIds?: number[]) =>
+    invoke<PendingBatchProcessOutcome>("cmd_process_pending_background_batch", {
+      batchLimit: batchLimit ?? 20,
+      queueIds: queueIds ?? null,
+    }),
   dismissPendingQueueItem: (queueId: number) =>
     invoke<DashboardState>("cmd_dismiss_pending_queue_item", { queueId }),
   reorderPendingQueueItem: (queueId: number, direction: "TOP" | "UP" | "DOWN") =>
@@ -819,12 +856,64 @@ export const CompassApi = {
     dayNote: string;
     isOffDay: boolean;
   }) => invoke<DashboardState>("cmd_upsert_calendar_day", params),
+  upsertCalendarEvent: (params: {
+    eventId?: string | null;
+    projectId?: string | null;
+    title: string;
+    eventType: string;
+    eventDate: string;
+    startTime?: string;
+    endTime?: string;
+    locationOrLink?: string;
+    notes?: string;
+    status?: string;
+    colorHex?: string;
+  }) =>
+    invoke<DashboardState>("cmd_upsert_calendar_event", {
+      eventId: params.eventId ?? null,
+      projectId: params.projectId ?? null,
+      title: params.title,
+      eventType: params.eventType,
+      eventDate: params.eventDate,
+      startTime: params.startTime ?? "",
+      endTime: params.endTime ?? "",
+      locationOrLink: params.locationOrLink ?? "",
+      notes: params.notes ?? "",
+      status: params.status ?? "UPCOMING",
+      colorHex: params.colorHex ?? "#3B82F6",
+    }),
+  deleteCalendarEvent: (eventId: string) =>
+    invoke<DashboardState>("cmd_delete_calendar_event", { eventId }),
+  linkTasksToCalendarEvent: (params: {
+    eventId: string;
+    taskIds: string[];
+    syncDateToEvent?: boolean;
+  }) =>
+    invoke<DashboardState>("cmd_link_tasks_to_calendar_event", {
+      eventId: params.eventId,
+      taskIds: params.taskIds,
+      syncDateToEvent: params.syncDateToEvent ?? true,
+    }),
+  unlinkTaskFromCalendarEvent: (taskId: string) =>
+    invoke<DashboardState>("cmd_unlink_task_from_calendar_event", { taskId }),
+  createTaskForCalendarEvent: (params: {
+    projectId: string;
+    title: string;
+    category: string;
+    durationMinutes: number;
+    scheduledDate: string;
+    calendarEventId: string;
+  }) => invoke<DashboardState>("cmd_create_task_for_calendar_event", params),
   upsertMethodPlaybook: (input: MethodPlaybookInput) =>
     invoke<DashboardState>("cmd_upsert_method_playbook", { input }),
   deleteMethodPlaybook: (methodId: string) =>
     invoke<DashboardState>("cmd_delete_method_playbook", { methodId }),
   readWorkspaceFile: (filePath: string) =>
     invoke<string>("cmd_read_workspace_file", { filePath }),
+  readKnowledgeDocumentContent: (docId: number) =>
+    invoke<string>("cmd_read_knowledge_document_content", { docId }),
+  readRawEventContent: (eventId: number) =>
+    invoke<string>("cmd_read_raw_event_content", { eventId }),
   listLegacyReprocessCandidates: () =>
     invoke<LegacyReprocessCandidate[]>("cmd_list_legacy_reprocess_candidates"),
   backupDatabaseNow: () =>

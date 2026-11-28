@@ -820,3 +820,91 @@ export function buildWorkLineBpmn(workLine: WorkLine, tasks: WorkEntity[]): stri
 ${inner}  </bpmn:process>
 </bpmn:definitions>`;
 }
+
+export interface MethodDiagramDraftStep {
+  id?: string;
+  title: string;
+  description?: string;
+  element_type?: string;
+  role?: string;
+  condition_label?: string;
+  sub_steps?: Array<{ id?: string; title: string; description?: string; role?: string }>;
+}
+
+function renderMethodStepNodesXml(steps: MethodDiagramDraftStep[], prefix: string): string {
+  const startId = `${prefix}_Start`;
+  const endId = `${prefix}_End`;
+  const cleanSteps = steps.filter((s) => s.title.trim().length > 0);
+  if (cleanSteps.length === 0) {
+    return `    <bpmn:startEvent id="${startId}" name="شروع" />\n    <bpmn:endEvent id="${endId}" name="پایان" />\n    <bpmn:sequenceFlow id="${prefix}_F0" sourceRef="${startId}" targetRef="${endId}" />\n`;
+  }
+
+  let xml = `    <bpmn:startEvent id="${startId}" name="شروع" />\n`;
+  const nodeIds = cleanSteps.map((s, idx) =>
+    s.id?.trim() ? `${prefix}_${s.id.replace(/[^a-zA-Z0-9_]/g, "_")}` : `${prefix}_S${idx + 1}`
+  );
+
+  cleanSteps.forEach((step, idx) => {
+    const nid = nodeIds[idx];
+    const hasSub = step.sub_steps && step.sub_steps.length > 0;
+    const tag = hasSub
+      ? "subProcess"
+      : step.element_type === "serviceTask" ||
+        step.element_type === "exclusiveGateway" ||
+        step.element_type === "parallelGateway" ||
+        step.element_type === "userTask" ||
+        step.element_type === "subProcess"
+      ? step.element_type
+      : "userTask";
+
+    const docParts: string[] = [];
+    if (step.description?.trim()) docParts.push(step.description.trim());
+    if (step.role?.trim()) docParts.push(`نقش/مسئول: ${step.role.trim()}`);
+    const docTag =
+      docParts.length > 0
+        ? `\n      <bpmn:documentation>${xmlEscape(docParts.join("\n"))}</bpmn:documentation>`
+        : "";
+
+    if (tag === "subProcess") {
+      const inner = renderMethodStepNodesXml(
+        (step.sub_steps ?? []).map((ss, sidx) => ({
+          id: ss.id || `${idx + 1}_${sidx + 1}`,
+          title: ss.title,
+          description: ss.description,
+          role: ss.role || step.role,
+          element_type: "userTask",
+        })),
+        `${nid}_Sub`
+      );
+      xml += `    <bpmn:subProcess id="${nid}" name="${xmlEscape(step.title)}">${docTag}\n${inner}    </bpmn:subProcess>\n`;
+    } else {
+      xml += `    <bpmn:${tag} id="${nid}" name="${xmlEscape(step.title)}">${docTag}</bpmn:${tag}>\n`;
+    }
+  });
+
+  xml += `    <bpmn:endEvent id="${endId}" name="پایان" />\n`;
+  xml += `    <bpmn:sequenceFlow id="${prefix}_F_start" sourceRef="${startId}" targetRef="${nodeIds[0]}" />\n`;
+  cleanSteps.forEach((step, idx) => {
+    const src = nodeIds[idx];
+    const tgt = idx + 1 < nodeIds.length ? nodeIds[idx + 1] : endId;
+    const label = step.condition_label?.trim()
+      ? ` name="${xmlEscape(step.condition_label.trim())}"`
+      : "";
+    xml += `    <bpmn:sequenceFlow id="${prefix}_F_${idx}" sourceRef="${src}" targetRef="${tgt}"${label} />\n`;
+  });
+  return xml;
+}
+
+export function buildMethodStepsBpmn(
+  title: string,
+  steps: MethodDiagramDraftStep[],
+  objective?: string
+): string {
+  const inner = renderMethodStepNodesXml(steps, "Preview");
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" id="Defs_Preview">
+  <bpmn:process id="Process_Preview" name="${xmlEscape(title || "پیش‌نمایش دستورالعمل")}">
+    <bpmn:documentation>${xmlEscape(objective || title || "پیش‌نمایش دیاگرام")}</bpmn:documentation>
+${inner}  </bpmn:process>
+</bpmn:definitions>`;
+}

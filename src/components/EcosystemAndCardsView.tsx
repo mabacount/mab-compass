@@ -1,14 +1,16 @@
 import { useMemo, useState } from "react";
 import {
   BookMarked,
+  BookOpen,
   Brain,
   Calendar,
   Check,
   CheckCircle2,
   Compass,
+  Download,
   Edit3,
-  Eye,
-  EyeOff,
+  ExternalLink,
+  FileText,
   GitPullRequest,
   Plus,
   Search,
@@ -16,13 +18,15 @@ import {
   Sparkles,
   Target,
   Trash2,
+  Workflow,
   X,
 } from "lucide-react";
-import { DashboardState, Outcome } from "../lib/tauri_api";
-import { formatShortDate } from "../lib/formatters";
+import { DashboardState, Outcome, WrittenArtifactRef } from "../lib/tauri_api";
+import { formatShortDate, formatShortTime } from "../lib/formatters";
 import { MabSelect } from "./ui/MabSelect";
 
 type EcosystemTab = "CARDS" | "DOMAINS_OUTCOMES" | "PROPOSALS" | "CALENDAR";
+type DataOriginFilter = "ALL" | "CREATED" | "IMPORTED";
 
 interface EcosystemAndCardsViewProps {
   dash: DashboardState;
@@ -47,6 +51,8 @@ interface EcosystemAndCardsViewProps {
     dayNote: string;
     isOffDay: boolean;
   }) => Promise<void> | void;
+  onOpenArtifactTab: (artifact: WrittenArtifactRef) => void;
+  onInsertChatPrompt?: (text: string) => void;
 }
 
 const CARD_TYPE_META: Record<
@@ -54,10 +60,14 @@ const CARD_TYPE_META: Record<
   { label: string; colorClass: string }
 > = {
   MEMORY_CARD: {
-    label: "کارت حافظه",
+    label: "کارت دانش",
     colorClass: "bg-blue-500/15 border-blue-500/30 text-blue-300",
   },
   LESSON: {
+    label: "درس‌آموخته",
+    colorClass: "bg-amber-500/15 border-amber-500/30 text-amber-300",
+  },
+  LESSON_LEARNED: {
     label: "درس‌آموخته",
     colorClass: "bg-amber-500/15 border-amber-500/30 text-amber-300",
   },
@@ -69,6 +79,14 @@ const CARD_TYPE_META: Record<
     label: "نکته کلیدی",
     colorClass: "bg-purple-500/15 border-purple-500/30 text-purple-300",
   },
+  IDEA: {
+    label: "ایده",
+    colorClass: "bg-cyan-500/15 border-cyan-500/30 text-cyan-300",
+  },
+  BOOKMARK: {
+    label: "نشانک",
+    colorClass: "bg-indigo-500/15 border-indigo-500/30 text-indigo-300",
+  },
   INTEREST: {
     label: "علاقه / مطالعه",
     colorClass: "bg-pink-500/15 border-pink-500/30 text-pink-300",
@@ -76,11 +94,20 @@ const CARD_TYPE_META: Record<
 };
 
 const CARD_TYPE_OPTIONS = [
-  { value: "MEMORY_CARD", label: "کارت حافظه / دانش اتمیک" },
+  { value: "MEMORY_CARD", label: "کارت دانش / دانش اتمیک" },
   { value: "LESSON", label: "درس‌آموخته (Lesson Learned)" },
   { value: "INSTRUCTION", label: "دستورالعمل و روش اجرا" },
   { value: "NOTE", label: "نکته کلیدی و یادداشت" },
 ];
+
+function stripMarkdownPreview(md: string): string {
+  return (md || "")
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/[#>*_`~|-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 140);
+}
 
 export function EcosystemAndCardsView({
   dash,
@@ -91,14 +118,13 @@ export function EcosystemAndCardsView({
   onDeleteVaultCard,
   onResolveProposal,
   onUpsertCalendarDay,
+  onOpenArtifactTab,
+  onInsertChatPrompt,
 }: EcosystemAndCardsViewProps) {
   const [activeTab, setActiveTab] = useState<EcosystemTab>("CARDS");
   const [searchQuery, setSearchQuery] = useState("");
+  const [originFilter, setOriginFilter] = useState<DataOriginFilter>("ALL");
   const [cardTypeFilter, setCardTypeFilter] = useState<string>("ALL");
-  const [studyMode, setStudyMode] = useState(false);
-  const [revealedCards, setRevealedCards] = useState<Set<string>>(
-    () => new Set()
-  );
 
   // Manual Card creation form state
   const [showNewCardForm, setShowNewCardForm] = useState(false);
@@ -120,6 +146,10 @@ export function EcosystemAndCardsView({
   const [calIsOff, setCalIsOff] = useState(false);
 
   const cards = dash.personal_vault_items ?? [];
+  const methods = dash.methods_playbooks ?? [];
+  const decisions = dash.active_decisions ?? [];
+  const importedDocs = dash.knowledge_docs ?? [];
+  const rawInputs = dash.recent_raw_events ?? [];
   const domains = dash.domains ?? [];
   const outcomes = dash.outcomes ?? [];
   const proposals = dash.pending_proposals ?? [];
@@ -129,12 +159,22 @@ export function EcosystemAndCardsView({
     (p) => p.status === "PENDING"
   ).length;
 
+  const projectNameById = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const p of dash.projects) map.set(p.id, p.name);
+    return map;
+  }, [dash.projects]);
+
   const normalizedQuery = searchQuery.trim().toLowerCase();
 
   const filteredCards = useMemo(() => {
     return cards.filter((c) => {
-      if (cardTypeFilter !== "ALL" && c.item_type !== cardTypeFilter) {
-        return false;
+      if (cardTypeFilter !== "ALL") {
+        if (cardTypeFilter === "LESSON") {
+          if (c.item_type !== "LESSON" && c.item_type !== "LESSON_LEARNED") return false;
+        } else if (c.item_type !== cardTypeFilter) {
+          return false;
+        }
       }
       if (!normalizedQuery) return true;
       return (
@@ -145,12 +185,106 @@ export function EcosystemAndCardsView({
     });
   }, [cards, cardTypeFilter, normalizedQuery]);
 
-  const toggleRevealCard = (id: string) => {
-    setRevealedCards((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
+  const filteredMethods = useMemo(() => {
+    if (!normalizedQuery) return methods;
+    return methods.filter(
+      (m) =>
+        m.title.toLowerCase().includes(normalizedQuery) ||
+        m.summary.toLowerCase().includes(normalizedQuery)
+    );
+  }, [methods, normalizedQuery]);
+
+  const filteredDecisions = useMemo(() => {
+    if (!normalizedQuery) return decisions;
+    return decisions.filter(
+      (d) =>
+        d.title.toLowerCase().includes(normalizedQuery) ||
+        d.definition_of_done.toLowerCase().includes(normalizedQuery)
+    );
+  }, [decisions, normalizedQuery]);
+
+  const filteredImportedDocs = useMemo(() => {
+    if (!normalizedQuery) return importedDocs;
+    return importedDocs.filter(
+      (d) =>
+        d.title.toLowerCase().includes(normalizedQuery) ||
+        d.executive_summary.toLowerCase().includes(normalizedQuery) ||
+        d.original_filename.toLowerCase().includes(normalizedQuery)
+    );
+  }, [importedDocs, normalizedQuery]);
+
+  const filteredRawInputs = useMemo(() => {
+    if (!normalizedQuery) return rawInputs;
+    return rawInputs.filter(
+      (r) =>
+        r.snippet.toLowerCase().includes(normalizedQuery) ||
+        r.source_type.toLowerCase().includes(normalizedQuery)
+    );
+  }, [rawInputs, normalizedQuery]);
+
+  const createdTotalCount = cards.length + methods.length + decisions.length;
+  const importedTotalCount = importedDocs.length + rawInputs.length;
+
+  const openVaultCardAsDoc = (card: (typeof cards)[number]) => {
+    onOpenArtifactTab({
+      artifact_type: "VAULT_CARD",
+      entity_id: card.id,
+      title: card.title,
+      summary: stripMarkdownPreview(card.content_markdown),
+      file_path: card.archived_path ?? null,
+      action: "CREATED",
+      version: null,
+      project_id: card.project_id ?? undefined,
+    });
+  };
+
+  const openMethodAsDoc = (m: (typeof methods)[number]) => {
+    onOpenArtifactTab({
+      artifact_type: "METHOD_PLAYBOOK",
+      entity_id: m.id,
+      title: m.title,
+      summary: m.summary || m.objective,
+      file_path: m.archived_path,
+      action: "UPDATED",
+      version: m.version,
+      project_id: m.project_id,
+    });
+  };
+
+  const openDecisionAsDoc = (d: (typeof decisions)[number]) => {
+    onOpenArtifactTab({
+      artifact_type: "DECISION_ADR",
+      entity_id: d.id,
+      title: d.title,
+      summary: d.definition_of_done,
+      action: "CREATED",
+      version: null,
+      project_id: d.project_id,
+    });
+  };
+
+  const openImportedDocAsTab = (doc: (typeof importedDocs)[number]) => {
+    onOpenArtifactTab({
+      artifact_type: "KNOWLEDGE_DOC",
+      entity_id: String(doc.id),
+      title: doc.title,
+      summary: doc.executive_summary,
+      file_path: doc.archived_path,
+      action: "UPDATED",
+      version: null,
+      project_id: doc.project_id,
+    });
+  };
+
+  const openRawInputAsTab = (r: (typeof rawInputs)[number]) => {
+    onOpenArtifactTab({
+      artifact_type: "RAW_EVENT",
+      entity_id: String(r.id),
+      title: `ورودی خام #${r.id} (${r.source_type})`,
+      summary: r.snippet,
+      file_path: r.archived_path ?? null,
+      action: "UPDATED",
+      version: null,
     });
   };
 
@@ -282,56 +416,41 @@ export function EcosystemAndCardsView({
 
       {/* Main Scrollable Body */}
       <div className="flex-1 min-h-0 overflow-y-auto space-y-4 pb-4">
-        {/* ================= TAB 1: ATOMIC KNOWLEDGE & MEMORY CARDS ================= */}
+        {/* ================= TAB 1: SEPARATED KNOWLEDGE & DATA REPOSITORY ================= */}
         {activeTab === "CARDS" && (
           <div className="space-y-4">
-            {/* Filter & Action Toolbar */}
-            <div className="mab-card p-3 flex items-center justify-between gap-2.5 flex-wrap">
-              <div className="flex items-center gap-1.5 flex-wrap">
-                {[
-                  { id: "ALL", label: `همه (${cards.length})` },
-                  { id: "MEMORY_CARD", label: "کارت حافظه" },
-                  { id: "LESSON", label: "درس‌آموخته" },
-                  { id: "INSTRUCTION", label: "دستورالعمل" },
-                  { id: "NOTE", label: "نکته" },
-                ].map((f) => (
-                  <button
-                    key={f.id}
-                    type="button"
-                    onClick={() => setCardTypeFilter(f.id)}
-                    className={`px-2.5 py-1 rounded-lg text-[11.5px] font-medium transition border ${
-                      cardTypeFilter === f.id
-                        ? "bg-blue-500/20 border-blue-500/40 text-blue-300"
-                        : "bg-white/[0.03] border-mab-border text-mab-text-secondary hover:text-white"
-                    }`}
-                  >
-                    {f.label}
-                  </button>
-                ))}
-              </div>
-
-              <div className="flex items-center gap-2 flex-wrap">
-                <button
-                  type="button"
-                  onClick={() => {
-                    setStudyMode((v) => !v);
-                    setRevealedCards(new Set());
-                  }}
-                  className={`px-3 py-1.5 rounded-xl border text-[11.5px] font-semibold flex items-center gap-1.5 transition ${
-                    studyMode
-                      ? "bg-purple-500/20 border-purple-500/40 text-purple-300"
-                      : "bg-white/[0.04] border-mab-border text-white/75 hover:text-white"
-                  }`}
-                >
-                  {studyMode ? (
-                    <EyeOff className="w-3.5 h-3.5" />
-                  ) : (
-                    <Eye className="w-3.5 h-3.5" />
-                  )}
-                  <span>
-                    {studyMode ? "خروج از حالت مرور حافظه" : "حالت مرور کارت حافظه"}
-                  </span>
-                </button>
+            {/* Origin Separation & Action Toolbar */}
+            <div className="mab-card p-3 space-y-2.5">
+              <div className="flex items-center justify-between gap-2.5 flex-wrap">
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  {[
+                    {
+                      id: "ALL" as const,
+                      label: `همه داده‌ها (${createdTotalCount + importedTotalCount})`,
+                    },
+                    {
+                      id: "CREATED" as const,
+                      label: `✨ داده‌های خلق‌شده توسط اپ و مدل (${createdTotalCount})`,
+                    },
+                    {
+                      id: "IMPORTED" as const,
+                      label: `📥 داده‌های واردشده به اپ (${importedTotalCount})`,
+                    },
+                  ].map((tab) => (
+                    <button
+                      key={tab.id}
+                      type="button"
+                      onClick={() => setOriginFilter(tab.id)}
+                      className={`px-3 py-1.5 rounded-lg text-[11.5px] font-semibold transition border ${
+                        originFilter === tab.id
+                          ? "bg-blue-500/20 border-blue-500/45 text-blue-200"
+                          : "bg-white/[0.03] border-mab-border text-mab-text-secondary hover:text-white"
+                      }`}
+                    >
+                      {tab.label}
+                    </button>
+                  ))}
+                </div>
 
                 <button
                   type="button"
@@ -339,9 +458,34 @@ export function EcosystemAndCardsView({
                   className="px-3 py-1.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-[11.5px] font-semibold flex items-center gap-1.5 transition shadow-sm"
                 >
                   <Plus className="w-3.5 h-3.5" />
-                  <span>کارت دانش جدید</span>
+                  <span>سند / کارت دانش جدید</span>
                 </button>
               </div>
+
+              {originFilter !== "IMPORTED" && (
+                <div className="flex items-center gap-1.5 flex-wrap pt-1 border-t border-white/[0.06]">
+                  {[
+                    { id: "ALL", label: `همه کارت‌ها (${cards.length})` },
+                    { id: "MEMORY_CARD", label: "کارت دانش" },
+                    { id: "LESSON", label: "درس‌آموخته" },
+                    { id: "INSTRUCTION", label: "دستورالعمل" },
+                    { id: "NOTE", label: "نکته" },
+                  ].map((f) => (
+                    <button
+                      key={f.id}
+                      type="button"
+                      onClick={() => setCardTypeFilter(f.id)}
+                      className={`px-2.5 py-1 rounded-lg text-[11px] font-medium transition border ${
+                        cardTypeFilter === f.id
+                          ? "bg-emerald-500/15 border-emerald-500/40 text-emerald-200"
+                          : "bg-white/[0.02] border-mab-border text-mab-text-secondary hover:text-white"
+                      }`}
+                    >
+                      {f.label}
+                    </button>
+                  ))}
+                </div>
+              )}
             </div>
 
             {/* Collapsible New Card Form */}
@@ -350,7 +494,7 @@ export function EcosystemAndCardsView({
                 <div className="flex items-center justify-between">
                   <span className="text-[13px] font-bold text-white flex items-center gap-1.5">
                     <Sparkles className="w-4 h-4 text-blue-400" />
-                    <span>ثبت دستی کارت دانش / حافظه / درس‌آموخته</span>
+                    <span>ثبت دستی سند دانش / درس‌آموخته / دستورالعمل</span>
                   </span>
                   <button
                     type="button"
@@ -379,15 +523,15 @@ export function EcosystemAndCardsView({
                 <input
                   value={cardTitle}
                   onChange={(e) => setCardTitle(e.target.value)}
-                  placeholder="عنوان کارت یا سوال روی کارت حافظه..."
+                  placeholder="عنوان سند یا کارت دانش..."
                   className="w-full mab-input px-3 py-2 text-[12.5px] select-text"
                 />
 
                 <textarea
                   value={cardContent}
                   onChange={(e) => setCardContent(e.target.value)}
-                  rows={3}
-                  placeholder="پاسخ، توضیح اتمیک، درس‌آموخته یا گام‌های دستورالعمل..."
+                  rows={4}
+                  placeholder="متن کامل (Markdown پشتیبانی می‌شود)..."
                   className="w-full mab-input px-3 py-2 text-[12.5px] select-text resize-none"
                 />
 
@@ -406,107 +550,264 @@ export function EcosystemAndCardsView({
                     onClick={() => void handleSubmitCard()}
                     className="px-4 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-[12px] font-semibold transition disabled:opacity-40"
                   >
-                    {isCreatingCard ? "در حال ثبت..." : "ذخیره کارت"}
+                    {isCreatingCard ? "در حال ثبت..." : "ذخیره"}
                   </button>
                 </div>
               </div>
             )}
 
-            {/* Cards Grid */}
-            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
-              {filteredCards.map((card) => {
-                const meta = CARD_TYPE_META[card.item_type] || {
-                  label: card.item_type,
-                  colorClass: "bg-white/[0.08] border-mab-border text-white/75",
-                };
-                const isHiddenInStudy =
-                  studyMode && !revealedCards.has(card.id);
+            {/* SECTION 1: APP & AI CREATED KNOWLEDGE */}
+            {originFilter !== "IMPORTED" && (
+              <div className="space-y-2.5">
+                <div className="flex items-center justify-between gap-2 px-1">
+                  <h3 className="text-[13px] font-bold text-emerald-300 flex items-center gap-2">
+                    <Sparkles className="w-4 h-4" />
+                    <span>داده‌های خلق‌شده توسط اپ و مدل ({createdTotalCount})</span>
+                  </h3>
+                  <span className="text-[11px] text-white/50">
+                    برای مشاهده کامل محتوا و دیاگرام، روی عنوان هر مورد کلیک کنید تا مثل سند باز شود.
+                  </span>
+                </div>
 
-                return (
-                  <div
-                    key={card.id}
-                    className="mab-card p-4 flex flex-col justify-between gap-3 hover:border-white/[0.15] transition"
-                  >
-                    <div className="space-y-2">
-                      <div className="flex items-center justify-between gap-2">
-                        <div className="flex items-center gap-1.5 flex-wrap">
-                          <span
-                            className={`px-2 py-0.5 rounded-full border text-[10px] font-bold ${meta.colorClass}`}
-                          >
-                            {meta.label}
+                {filteredCards.length === 0 && filteredMethods.length === 0 && filteredDecisions.length === 0 ? (
+                  <div className="py-8 text-center mab-card space-y-1.5">
+                    <BookMarked className="w-7 h-7 text-blue-400/50 mx-auto" />
+                    <p className="text-[12.5px] font-semibold text-white">
+                      هنوز سند یا کارت دانشی با این فیلتر خلق نشده است
+                    </p>
+                  </div>
+                ) : (
+                  <div className="space-y-2">
+                    {/* Vault Cards as Clean Clickable Title Documents */}
+                    {filteredCards.map((card) => {
+                      const meta = CARD_TYPE_META[card.item_type] || {
+                        label: card.item_type,
+                        colorClass: "bg-white/[0.08] border-mab-border text-white/75",
+                      };
+                      const projLabel = card.project_id
+                        ? projectNameById.get(card.project_id) || card.project_id
+                        : "فراپروژه‌ای";
+                      const preview = stripMarkdownPreview(card.content_markdown);
+
+                      return (
+                        <div
+                          key={card.id}
+                          onClick={() => openVaultCardAsDoc(card)}
+                          className="mab-card px-4 py-3 flex items-center justify-between gap-3 cursor-pointer hover:bg-white/[0.04] hover:border-blue-400/40 transition group"
+                        >
+                          <div className="min-w-0 flex-1 space-y-1">
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <span
+                                className={`px-2 py-0.5 rounded-full border text-[10px] font-bold shrink-0 ${meta.colorClass}`}
+                              >
+                                {meta.label}
+                              </span>
+                              <h4 className="text-[13.5px] font-bold text-white group-hover:text-blue-300 transition truncate">
+                                {card.title}
+                              </h4>
+                              <span className="px-1.5 py-0.5 rounded bg-white/[0.06] text-[10px] text-white/65 shrink-0">
+                                {projLabel}
+                              </span>
+                            </div>
+
+                            {preview && (
+                              <p className="text-[11.5px] text-mab-text-muted truncate">
+                                {preview}
+                              </p>
+                            )}
+                          </div>
+
+                          <div className="flex items-center gap-2 shrink-0">
+                            <span className="font-timer text-[10px] text-white/45 hidden sm:inline">
+                              {formatShortDate(card.created_at)}
+                            </span>
+                            {onInsertChatPrompt && (
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  onInsertChatPrompt(
+                                    `برای «${card.title}» (${card.id}) دیاگرام و نقشه فرآیند BPMN 2.0 ترسیم کن.`
+                                  );
+                                }}
+                                title="رسم دیاگرام با مدل"
+                                className="px-2 py-1 rounded-lg bg-purple-500/15 hover:bg-purple-500/25 text-purple-200 text-[10.5px] hidden md:inline-flex items-center gap-1"
+                              >
+                                <Workflow className="w-3 h-3" />
+                                <span>دیاگرام</span>
+                              </button>
+                            )}
+                            <span className="px-2 py-1 rounded-lg bg-white/[0.05] group-hover:bg-blue-500/20 text-white/75 group-hover:text-blue-200 text-[11px] inline-flex items-center gap-1">
+                              <BookOpen className="w-3.5 h-3.5" />
+                              <span>باز کردن سند</span>
+                            </span>
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                onDeleteVaultCard(card.id);
+                              }}
+                              title="حذف"
+                              className="p-1.5 rounded-lg text-white/35 hover:text-rose-400 hover:bg-rose-500/10 transition"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+
+                    {/* Methods & Diagrams (BPMN) created for active project */}
+                    {filteredMethods.map((m) => (
+                      <div
+                        key={m.id}
+                        onClick={() => openMethodAsDoc(m)}
+                        className="mab-card px-4 py-3 flex items-center justify-between gap-3 cursor-pointer hover:bg-white/[0.04] hover:border-purple-400/40 transition group"
+                      >
+                        <div className="min-w-0 flex-1 space-y-1">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span className="px-2 py-0.5 rounded-full border bg-purple-500/15 border-purple-500/35 text-purple-200 text-[10px] font-bold shrink-0">
+                              دستورالعمل + دیاگرام BPMN
+                            </span>
+                            <h4 className="text-[13.5px] font-bold text-white group-hover:text-purple-200 transition truncate">
+                              {m.title}
+                            </h4>
+                            <span className="font-mono text-[10px] text-emerald-300 bg-emerald-500/10 px-1.5 py-0.5 rounded">
+                              v{m.version} • {m.steps.length} گام
+                            </span>
+                          </div>
+                          {(m.summary || m.objective) && (
+                            <p className="text-[11.5px] text-mab-text-muted truncate">
+                              {m.summary || m.objective}
+                            </p>
+                          )}
+                        </div>
+                        <span className="px-2.5 py-1 rounded-lg bg-purple-500/15 group-hover:bg-purple-500/25 text-purple-200 text-[11px] inline-flex items-center gap-1 shrink-0">
+                          <Workflow className="w-3.5 h-3.5" />
+                          <span>سند + دیاگرام</span>
+                        </span>
+                      </div>
+                    ))}
+
+                    {/* Architecture Decisions (ADRs) */}
+                    {filteredDecisions.map((d) => (
+                      <div
+                        key={d.id}
+                        onClick={() => openDecisionAsDoc(d)}
+                        className="mab-card px-4 py-3 flex items-center justify-between gap-3 cursor-pointer hover:bg-white/[0.04] hover:border-cyan-400/40 transition group"
+                      >
+                        <div className="min-w-0 flex-1 space-y-1">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span className="px-2 py-0.5 rounded-full border bg-cyan-500/15 border-cyan-500/30 text-cyan-200 text-[10px] font-bold shrink-0">
+                              تصمیم معماری (ADR)
+                            </span>
+                            <h4 className="text-[13.5px] font-bold text-white group-hover:text-cyan-200 transition truncate">
+                              {d.title}
+                            </h4>
+                          </div>
+                          {d.definition_of_done && (
+                            <p className="text-[11.5px] text-mab-text-muted truncate">
+                              {d.definition_of_done}
+                            </p>
+                          )}
+                        </div>
+                        <span className="px-2 py-1 rounded-lg bg-white/[0.05] text-white/75 text-[11px] inline-flex items-center gap-1 shrink-0">
+                          <ExternalLink className="w-3.5 h-3.5" />
+                          <span>باز کردن</span>
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* SECTION 2: DATA IMPORTED / INGESTED INTO THE APP */}
+            {originFilter !== "CREATED" && (
+              <div className="space-y-2.5 pt-2 border-t border-white/[0.07]">
+                <div className="flex items-center justify-between gap-2 px-1">
+                  <h3 className="text-[13px] font-bold text-amber-300 flex items-center gap-2">
+                    <Download className="w-4 h-4" />
+                    <span>داده‌های واردشده به اپ ({importedTotalCount})</span>
+                  </h3>
+                  <span className="text-[11px] text-white/50">
+                    شامل فایل‌ها/متون آپلودی و ورودی‌های همگام‌سازی‌شده
+                  </span>
+                </div>
+
+                {filteredImportedDocs.length === 0 && filteredRawInputs.length === 0 ? (
+                  <div className="py-6 text-center mab-card text-[12px] text-mab-text-muted">
+                    داده واردشده‌ای با این فیلتر یافت نشد.
+                  </div>
+                ) : (
+                  <div className="space-y-2">
+                    {filteredImportedDocs.map((doc) => (
+                      <div
+                        key={`doc-${doc.id}`}
+                        onClick={() => openImportedDocAsTab(doc)}
+                        className="mab-card px-4 py-3 flex items-center justify-between gap-3 cursor-pointer hover:bg-white/[0.04] hover:border-amber-400/40 transition group"
+                      >
+                        <div className="min-w-0 flex-1 space-y-1">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span className="px-2 py-0.5 rounded-full border bg-amber-500/15 border-amber-500/30 text-amber-200 text-[10px] font-bold shrink-0">
+                              سند واردشده ({doc.doc_type})
+                            </span>
+                            <h4 className="text-[13.5px] font-bold text-white group-hover:text-amber-200 transition truncate">
+                              {doc.title}
+                            </h4>
+                            <span className="text-[10px] font-mono text-white/50">
+                              {doc.original_filename}
+                            </span>
+                          </div>
+                          {doc.executive_summary && (
+                            <p className="text-[11.5px] text-mab-text-muted truncate">
+                              {doc.executive_summary}
+                            </p>
+                          )}
+                        </div>
+                        <div className="flex items-center gap-2 shrink-0">
+                          <span className="font-timer text-[10px] text-white/45 hidden sm:inline">
+                            {formatShortTime(doc.ingested_at)}
                           </span>
-                          <span className="font-mono text-[10px] text-white/45">
-                            {card.id}
+                          <span className="px-2 py-1 rounded-lg bg-white/[0.05] group-hover:bg-amber-500/20 text-white/75 group-hover:text-amber-200 text-[11px] inline-flex items-center gap-1">
+                            <FileText className="w-3.5 h-3.5" />
+                            <span>مشاهده محتوا</span>
                           </span>
                         </div>
-                        <button
-                          type="button"
-                          onClick={() => onDeleteVaultCard(card.id)}
-                          title="حذف کارت"
-                          className="p-1 rounded-md text-white/35 hover:text-rose-400 hover:bg-rose-500/10 transition"
-                        >
-                          <Trash2 className="w-3.5 h-3.5" />
-                        </button>
                       </div>
+                    ))}
 
-                      <h4 className="text-[13.5px] font-bold text-white leading-snug select-text">
-                        {card.title}
-                      </h4>
-
-                      {isHiddenInStudy ? (
-                        <button
-                          type="button"
-                          onClick={() => toggleRevealCard(card.id)}
-                          className="w-full py-5 rounded-xl border border-dashed border-purple-500/35 bg-purple-500/[0.06] hover:bg-purple-500/[0.12] text-purple-300 text-[12px] font-semibold transition flex items-center justify-center gap-2"
-                        >
-                          <Eye className="w-4 h-4" />
-                          <span>کلیک برای نمایش پاسخ کارت حافظه</span>
-                        </button>
-                      ) : (
-                        <p
-                          onClick={() =>
-                            studyMode ? toggleRevealCard(card.id) : undefined
-                          }
-                          className={`text-[12.5px] text-mab-text-secondary leading-relaxed whitespace-pre-wrap select-text ${
-                            studyMode ? "cursor-pointer" : ""
-                          }`}
-                        >
-                          {card.content_markdown}
-                        </p>
-                      )}
-                    </div>
-
-                    <div className="flex items-center justify-between gap-2 pt-2 border-t border-white/[0.05] flex-wrap">
-                      <div className="flex items-center gap-1 flex-wrap">
-                        {card.tags.map((tg) => (
-                          <span
-                            key={tg}
-                            className="px-1.5 py-0.5 rounded bg-white/[0.05] text-[10px] text-white/60"
-                          >
-                            #{tg}
+                    {filteredRawInputs.map((r) => (
+                      <div
+                        key={`raw-${r.id}`}
+                        onClick={() => openRawInputAsTab(r)}
+                        className="mab-card px-4 py-2.5 flex items-center justify-between gap-3 cursor-pointer hover:bg-white/[0.04] hover:border-white/25 transition group"
+                      >
+                        <div className="min-w-0 flex-1 space-y-0.5">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span className="px-2 py-0.5 rounded-full border bg-white/[0.07] border-white/15 text-white/80 text-[10px] font-semibold shrink-0">
+                              ورودی خام ({r.source_type})
+                            </span>
+                            <span className="text-[12.5px] font-semibold text-white truncate group-hover:text-blue-200">
+                              {r.snippet}
+                            </span>
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-2 shrink-0">
+                          <span className="font-timer text-[10px] text-white/45">
+                            {formatShortTime(r.created_at)}
                           </span>
-                        ))}
+                          <span className="px-2 py-1 rounded-lg bg-white/[0.05] text-white/75 text-[11px] inline-flex items-center gap-1">
+                            <FileText className="w-3.5 h-3.5" />
+                            <span>متن کامل</span>
+                          </span>
+                        </div>
                       </div>
-                      <span className="font-timer text-[10px] text-mab-text-muted">
-                        {formatShortDate(card.created_at)}
-                      </span>
-                    </div>
+                    ))}
                   </div>
-                );
-              })}
-
-              {filteredCards.length === 0 && (
-                <div className="col-span-full py-12 text-center mab-card space-y-2">
-                  <BookMarked className="w-8 h-8 text-blue-400/50 mx-auto" />
-                  <p className="text-[13px] font-semibold text-white">
-                    هنوز کارت دانش یا درس‌آموخته‌ای ثبت نشده است
-                  </p>
-                  <p className="text-[12px] text-mab-text-muted">
-                    با پردازش اسناد توسط هوش مصنوعی یا کلیک روی «کارت دانش جدید»، کارت‌های حافظه و درس‌آموخته‌ها اینجا جمع می‌شوند.
-                  </p>
-                </div>
-              )}
-            </div>
+                )}
+              </div>
+            )}
 
             {/* Active Learned Antipatterns (Guardrails) */}
             {dash.active_guardrails.length > 0 && (

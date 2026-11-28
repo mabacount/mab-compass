@@ -1,13 +1,19 @@
-import { useState, type ChangeEvent } from "react";
+import { useState, type ChangeEvent, type MouseEvent as ReactMouseEvent } from "react";
 import {
   Brain,
+  CalendarDays,
+  ChevronLeft,
+  ChevronRight,
   Compass,
   FileText,
   FolderArchive,
   FolderGit2,
+  GripVertical,
   Layers,
   Maximize2,
   Minimize2,
+  PanelRight,
+  PictureInPicture2,
   Plus,
   Settings,
   Terminal,
@@ -34,6 +40,7 @@ import { ProjectStudioView } from "./ProjectStudioView";
 import { SettingsView } from "./SettingsView";
 import { ArtifactViewerTab } from "./ArtifactViewerTab";
 import { SystemLogsPanel } from "./SystemLogsPanel";
+import { CalendarWorkspaceView } from "./CalendarWorkspaceView";
 
 export interface CanvasTab {
   id: string;
@@ -55,6 +62,14 @@ interface AntigravityRightCanvasProps {
   onOpenMethodTab: (method: MethodPlaybook) => void;
   onToggleMaximize: () => void;
   onCloseCanvas: () => void;
+  isFloating?: boolean;
+  onToggleFloating?: () => void;
+  canMoveLeft?: boolean;
+  canMoveRight?: boolean;
+  onMoveLeft?: () => void;
+  onMoveRight?: () => void;
+  onDragStartPane?: () => void;
+  onStartFloatingDrag?: (e: ReactMouseEvent<HTMLDivElement>) => void;
   // View-specific callbacks
   checkedGates: Record<number, boolean>;
   onToggleGate: (gateId: number, checked: boolean) => void;
@@ -96,6 +111,34 @@ interface AntigravityRightCanvasProps {
     dayNote: string;
     isOffDay: boolean;
   }) => Promise<void>;
+  onUpsertCalendarEvent: (params: {
+    eventId?: string;
+    projectId?: string;
+    title: string;
+    eventType: string;
+    eventDate: string;
+    startTime?: string;
+    endTime?: string;
+    locationOrLink?: string;
+    notes?: string;
+    status?: string;
+    colorHex?: string;
+  }) => Promise<void>;
+  onDeleteCalendarEvent: (eventId: string) => Promise<void>;
+  onLinkTasksToCalendarEvent: (params: {
+    eventId: string;
+    taskIds: string[];
+    syncDateToEvent?: boolean;
+  }) => Promise<void>;
+  onUnlinkTaskFromCalendarEvent: (taskId: string) => Promise<void>;
+  onCreateTaskForEvent: (params: {
+    projectId: string;
+    title: string;
+    category: string;
+    durationMinutes: number;
+    scheduledDate: string;
+    calendarEventId: string;
+  }) => Promise<void>;
   onSwitchProject: (projectId: string) => void;
   onCreateProject: (parentId?: string | null) => void;
   onUpdateProject: (payload: {
@@ -129,6 +172,8 @@ function getTabIcon(tab: CanvasTab) {
       return <Layers className="w-3.5 h-3.5 text-emerald-400 shrink-0" />;
     case "KNOWLEDGE_ARCHIVE":
       return <FolderArchive className="w-3.5 h-3.5 text-amber-400 shrink-0" />;
+    case "CALENDAR":
+      return <CalendarDays className="w-3.5 h-3.5 text-indigo-400 shrink-0" />;
     case "ECOSYSTEM_CARDS":
       return <Brain className="w-3.5 h-3.5 text-cyan-400 shrink-0" />;
     case "SETTINGS":
@@ -158,6 +203,14 @@ export function AntigravityRightCanvas({
   onOpenMethodTab,
   onToggleMaximize,
   onCloseCanvas,
+  isFloating,
+  onToggleFloating,
+  canMoveLeft,
+  canMoveRight,
+  onMoveLeft,
+  onMoveRight,
+  onDragStartPane,
+  onStartFloatingDrag,
   checkedGates,
   onToggleGate,
   allGatesPassed,
@@ -184,6 +237,11 @@ export function AntigravityRightCanvas({
   onDeleteVaultCard,
   onResolveProposal,
   onUpsertCalendarDay,
+  onUpsertCalendarEvent,
+  onDeleteCalendarEvent,
+  onLinkTasksToCalendarEvent,
+  onUnlinkTaskFromCalendarEvent,
+  onCreateTaskForEvent,
   onSwitchProject,
   onCreateProject,
   onUpdateProject,
@@ -210,18 +268,47 @@ export function AntigravityRightCanvas({
 
   return (
     <section className="flex flex-col h-full min-h-0 min-w-0 bg-[#0E0F12] overflow-hidden">
-      {/* Antigravity Multi-Tab Strip (Exact top-right tab bar) */}
+      {/* Antigravity Multi-Tab Strip (supports horizontal scroll, drag-to-reorder, & floating window drag) */}
       <div
         dir="ltr"
-        className="h-[38px] bg-[#121317] border-b border-white/[0.07] flex items-center justify-between pl-1 pr-2 shrink-0 select-none relative"
+        onMouseDown={(e) => {
+          if (
+            isFloating &&
+            onStartFloatingDrag &&
+            !(e.target as HTMLElement).closest("button,[data-tab-item='true']")
+          ) {
+            onStartFloatingDrag(e);
+          }
+        }}
+        className={`h-[38px] bg-[#121317] border-b border-white/[0.07] flex items-center justify-between pl-1.5 pr-2 shrink-0 select-none relative ${
+          isFloating ? "cursor-move" : ""
+        }`}
       >
+        {!isFloating && onDragStartPane && (
+          <span
+            draggable
+            onDragStart={onDragStartPane}
+            title="بکشید برای جابجایی پنجره بوم"
+            className="p-1 mr-0.5 rounded text-white/30 hover:text-white/75 cursor-grab active:cursor-grabbing shrink-0 hidden sm:inline-flex"
+          >
+            <GripVertical className="w-3.5 h-3.5" />
+          </span>
+        )}
         {/* Scrollable Tabs */}
-        <div className="flex items-center gap-0.5 overflow-x-auto min-w-0 flex-1 h-full scrollbar-none">
+        <div
+          onWheel={(e) => {
+            if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
+              e.currentTarget.scrollLeft += e.deltaY;
+            }
+          }}
+          className="flex items-center gap-0.5 overflow-x-auto min-w-0 flex-1 h-full scrollbar-none"
+        >
           {tabs.map((tab) => {
             const isActive = activeTab?.id === tab.id;
             return (
               <div
                 key={tab.id}
+                data-tab-item="true"
                 onClick={() => onSelectTab(tab.id)}
                 className={`group h-full px-3 flex items-center gap-2 text-[12px] cursor-pointer border-r border-white/[0.05] transition shrink-0 max-w-[210px] ${
                   isActive
@@ -283,8 +370,13 @@ export function AntigravityRightCanvas({
                         icon: FolderArchive,
                       },
                       {
+                        id: "CALENDAR",
+                        label: "تقویم، رویدادها و لینک کارها",
+                        icon: CalendarDays,
+                      },
+                      {
                         id: "ECOSYSTEM_CARDS",
-                        label: "اهداف، کارت‌ها و تقویم",
+                        label: "اهداف و کارت‌ها",
                         icon: Brain,
                       },
                       { id: "SETTINGS", label: "تنظیمات سیستم", icon: Settings },
@@ -311,6 +403,48 @@ export function AntigravityRightCanvas({
               </>
             )}
           </div>
+
+          {!isFloating && (canMoveLeft || canMoveRight) && (
+            <div className="hidden sm:flex items-center gap-0.5">
+              {canMoveLeft && onMoveLeft && (
+                <button
+                  type="button"
+                  onClick={onMoveLeft}
+                  title="انتقال پنجره بوم به چپ"
+                  className="w-6 h-6 rounded-md hover:bg-white/[0.07] text-white/50 hover:text-white flex items-center justify-center transition"
+                >
+                  <ChevronLeft className="w-3.5 h-3.5" />
+                </button>
+              )}
+              {canMoveRight && onMoveRight && (
+                <button
+                  type="button"
+                  onClick={onMoveRight}
+                  title="انتقال پنجره بوم به راست"
+                  className="w-6 h-6 rounded-md hover:bg-white/[0.07] text-white/50 hover:text-white flex items-center justify-center transition"
+                >
+                  <ChevronRight className="w-3.5 h-3.5" />
+                </button>
+              )}
+            </div>
+          )}
+
+          {onToggleFloating && (
+            <button
+              type="button"
+              onClick={onToggleFloating}
+              title={isFloating ? "قفل کردن پنجره در چیدمان" : "تبدیل به پنجره شناور (قابل جابجایی و تغییر اندازه)"}
+              className={`w-7 h-7 rounded-md hover:bg-white/[0.07] flex items-center justify-center transition ${
+                isFloating ? "text-blue-300 bg-blue-500/15" : "text-white/55 hover:text-white"
+              }`}
+            >
+              {isFloating ? (
+                <PanelRight className="w-3.5 h-3.5" />
+              ) : (
+                <PictureInPicture2 className="w-3.5 h-3.5" />
+              )}
+            </button>
+          )}
 
           <button
             type="button"
@@ -365,6 +499,13 @@ export function AntigravityRightCanvas({
                 className="px-3 py-1.5 rounded-lg bg-purple-500/20 hover:bg-purple-500/30 text-purple-200 text-[12px]"
               >
                 متدها و BPMN 2.0
+              </button>
+              <button
+                type="button"
+                onClick={() => onOpenBuiltinView("CALENDAR")}
+                className="px-3 py-1.5 rounded-lg bg-indigo-500/20 hover:bg-indigo-500/30 border border-indigo-500/30 text-indigo-200 text-[12px]"
+              >
+                تقویم و رویدادها
               </button>
             </div>
           </div>
@@ -430,6 +571,19 @@ export function AntigravityRightCanvas({
             onDashboardUpdated={onDashboardUpdated}
             onToast={onToast}
           />
+        ) : activeTab.kind === "CALENDAR" ? (
+          <CalendarWorkspaceView
+            dash={dash}
+            onQuickComplete={onQuickComplete}
+            onStartTask={onStartTask}
+            onUpsertCalendarDay={onUpsertCalendarDay}
+            onUpsertCalendarEvent={onUpsertCalendarEvent}
+            onDeleteCalendarEvent={onDeleteCalendarEvent}
+            onLinkTasksToCalendarEvent={onLinkTasksToCalendarEvent}
+            onUnlinkTaskFromCalendarEvent={onUnlinkTaskFromCalendarEvent}
+            onCreateTaskForEvent={onCreateTaskForEvent}
+            onInsertChatPrompt={onInsertChatPrompt}
+          />
         ) : activeTab.kind === "ECOSYSTEM_CARDS" ? (
           <div dir="rtl" className="h-full p-3.5 overflow-hidden">
             <EcosystemAndCardsView
@@ -441,6 +595,8 @@ export function AntigravityRightCanvas({
               onDeleteVaultCard={onDeleteVaultCard}
               onResolveProposal={onResolveProposal}
               onUpsertCalendarDay={onUpsertCalendarDay}
+              onOpenArtifactTab={onOpenArtifactTab}
+              onInsertChatPrompt={onInsertChatPrompt}
             />
           </div>
         ) : activeTab.kind === "SETTINGS" ? (
@@ -462,6 +618,7 @@ export function AntigravityRightCanvas({
             onOpenMethodTab={onOpenMethodTab}
             onStartTask={onStartTask}
             onQuickCompleteTask={onQuickComplete}
+            onInsertChatPrompt={onInsertChatPrompt}
           />
         ) : null}
       </div>

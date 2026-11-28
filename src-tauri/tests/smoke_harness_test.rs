@@ -351,3 +351,202 @@ fn test_cross_project_strategic_path_ahead_and_prioritization() {
     assert!(snap.contains("GERDALO"));
     assert!(snap.contains("P=98"));
 }
+
+#[test]
+fn test_calendar_event_creation_and_multi_task_linking() {
+    let mut conn = create_test_db();
+
+    let t1_res = call_mcp_tool(
+        &mut conn,
+        "create_work_entity",
+        json!({
+            "project_id": "GERDALO",
+            "title": "تهیه اسلاید گزارش عملکرد گردالو",
+            "status": "OPEN"
+        }),
+    )
+    .expect("create t1");
+    let t1_id = t1_res["open_tasks"][0]["id"]
+        .as_str()
+        .expect("t1 id")
+        .to_string();
+
+    let t2_res = call_mcp_tool(
+        &mut conn,
+        "create_work_entity",
+        json!({
+            "project_id": "IRANOIL",
+            "title": "بررسی فاکتورهای باز ایران‌اویل",
+            "status": "OPEN"
+        }),
+    )
+    .expect("create t2");
+    let t2_id = t2_res["open_tasks"][0]["id"]
+        .as_str()
+        .expect("t2 id")
+        .to_string();
+
+    let ev_res = call_mcp_tool(
+        &mut conn,
+        "upsert_calendar_event",
+        json!({
+            "title": "جلسه یکشنبه هماهنگی کلیدی",
+            "event_type": "MEETING",
+            "event_date": "2026-11-29",
+            "start_time": "10:00",
+            "end_time": "11:30",
+            "project_id": "ALL",
+            "task_ids": [t1_id, t2_id],
+            "new_tasks": [
+                {
+                    "title": "چاپ صورت‌جلسه و چک‌لیست نهایی",
+                    "project_id": "GERDALO",
+                    "duration_minutes": 20
+                },
+                {
+                    "title": "تایید زمان‌بندی فاز بعدی",
+                    "project_id": "IRANOIL",
+                    "duration_minutes": 30
+                }
+            ]
+        }),
+    )
+    .expect("upsert_calendar_event");
+
+    let ev_id = ev_res["event"]["id"]
+        .as_str()
+        .expect("event id")
+        .to_string();
+    assert_eq!(ev_res["linked_existing_count"], 2);
+    assert_eq!(ev_res["created_and_linked_count"], 2);
+    assert_eq!(ev_res["event"]["linked_tasks_count"], 4);
+
+    // Complete one of the linked tasks and verify completion rollup
+    call_mcp_tool(&mut conn, "complete_task", json!({ "task_id": t1_id }))
+        .expect("complete linked task");
+
+    let list_res = call_mcp_tool(
+        &mut conn,
+        "list_calendar_events",
+        json!({ "status": "UPCOMING" }),
+    )
+    .expect("list_calendar_events");
+    let ev = list_res["events"]
+        .as_array()
+        .expect("events array")
+        .iter()
+        .find(|e| e["id"].as_str() == Some(ev_id.as_str()))
+        .expect("created event present");
+    assert_eq!(ev["linked_tasks_count"], 4);
+    assert_eq!(ev["linked_completed_count"], 1);
+
+    let dash = mab_compass_lib::db::queries::get_dashboard_state_for_project(&conn, Some("GERDALO"))
+        .expect("dashboard state");
+    assert!(dash.calendar_events.iter().any(|e| e.id == ev_id && e.linked_tasks_count == 4));
+
+    let snap = mab_compass_lib::llm::prompts::build_cross_project_portfolio_snapshot(&conn);
+    assert!(snap.contains("UPCOMING CALENDAR EVENTS"));
+    assert!(snap.contains("جلسه یکشنبه هماهنگی کلیدی"));
+    assert!(snap.contains("linked=1/4 done"));
+}
+
+#[test]
+fn test_queue_track_separation_and_packed_background_batch_prompt() {
+    use mab_compass_lib::db::queries::classify_queue_kind;
+    use mab_compass_lib::llm::prompts::{
+        build_packed_background_batch_prompts, PackedBackgroundItemInput,
+    };
+
+    assert_eq!(classify_queue_kind("USER_CHAT", Some(42)), "USER_COMMAND");
+    assert_eq!(classify_queue_kind("COPILOT_FILE", Some(43)), "USER_COMMAND");
+    assert_eq!(classify_queue_kind("MAB_FOCUS_SYNC", None), "BACKGROUND");
+    assert_eq!(classify_queue_kind("LEGACY_REPROCESS", None), "BACKGROUND");
+    assert_eq!(classify_queue_kind("LEGACY_REPROCESS_DOC", None), "BACKGROUND");
+
+    let conn = create_test_db();
+    let dash = mab_compass_lib::db::queries::get_dashboard_state_for_project(&conn, Some("GERDALO"))
+        .expect("dash");
+
+    let packed: Vec<PackedBackgroundItemInput> = (1..=20)
+        .map(|i| PackedBackgroundItemInput {
+            queue_id: i,
+            project_id: if i % 2 == 0 {
+                "IRANOIL".to_string()
+            } else {
+                "GERDALO".to_string()
+            },
+            project_name: if i % 2 == 0 {
+                "ایران‌اویل".to_string()
+            } else {
+                "گردالو".to_string()
+            },
+            source_type: "MAB_FOCUS_SYNC".to_string(),
+            created_at: format!("2026-11-28T10:{:02}:00+03:30", i),
+            knowledge_doc_id: Some(100 + i),
+            title_preview: format!("گزارش خط {}", i),
+            content: format!("یادداشت یک‌خطی شماره {} برای همگام‌سازی زمینه", i),
+        })
+        .collect();
+
+    let (sys_prompt, user_prompt) = build_packed_background_batch_prompts(
+        &dash.active_project.id,
+        &packed,
+        &dash.open_tasks,
+        &dash.active_decisions,
+        &dash.active_sops,
+        &dash.methods_playbooks,
+        &dash.projects,
+        "",
+    );
+
+    assert!(sys_prompt.contains("PACKED BATCH of 20"));
+    assert!(user_prompt.contains("PACKED_ITEM #1 | queue_id=1"));
+    assert!(user_prompt.contains("PACKED_ITEM #20 | queue_id=20"));
+    assert!(user_prompt.contains("source_type=MAB_FOCUS_SYNC"));
+    assert!(user_prompt.contains("knowledge_doc_id=120"));
+}
+
+#[test]
+fn test_draw_instruction_diagram_or_bpmn_tool() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let vault = tmp.path().join("vault");
+    std::fs::create_dir_all(&vault).expect("vault dir");
+    let mut conn = mab_compass_lib::db::schema::init_database(
+        &tmp.path().join("smoke_bpmn.sqlite"),
+        &vault,
+    )
+    .expect("init_database");
+
+    let res = call_mcp_tool(
+        &mut conn,
+        "draw_instruction_diagram_or_bpmn",
+        json!({
+            "project_id": "GERDALO",
+            "title": "دستورالعمل بررسی و انتشار نسخه",
+            "category": "DEPLOY",
+            "objective": "تضمین انتشار امن همراه با تست",
+            "steps": [
+                { "title": "اجرای تست واحد", "element_type": "serviceTask", "role": "CI" },
+                { "title": "تایید تست‌ها؟", "element_type": "exclusiveGateway", "condition_label": "بله" },
+                { "title": "ساخت و انتشار", "element_type": "userTask", "role": "DevOps" }
+            ]
+        }),
+    )
+    .expect("draw_instruction_diagram_or_bpmn");
+
+    assert_eq!(res["status"], "ok");
+    assert_eq!(res["steps_count"], 3);
+    let mid = res["method_id"].as_str().expect("method_id");
+    assert!(mid.starts_with("MTH-"));
+
+    let dash = mab_compass_lib::db::queries::get_dashboard_state_for_project(&conn, Some("GERDALO"))
+        .expect("dash");
+    let m = dash
+        .methods_playbooks
+        .iter()
+        .find(|x| x.id == mid)
+        .expect("method persisted");
+    assert!(m.bpmn_xml.contains("bpmn:exclusiveGateway"));
+    assert!(std::path::Path::new(&m.archived_path).exists());
+    assert!(std::path::Path::new(&m.bpmn_file_path).exists());
+}
